@@ -28,7 +28,7 @@ static int enabled;
 static unsigned nworkers;
 static const char *phase_name[PH_COUNT] = {
     "links_parse", "event_parse", "link_unionfind", "dedup", "collect", "group_events",
-    "click_parse", "group_clicks", "sessionize", "attribute",
+    "click_parse", "group_clicks", "sessionize", "attribute", "partition",
 };
 
 typedef struct {

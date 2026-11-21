@@ -28,6 +28,9 @@
 
 #define MAX_WORKERS 64
 #define CPU_BUDGET 8      /* never run more than 8 worker threads */
+#ifndef DEDUP_PART
+#define DEDUP_PART 0      /* 1: partitioned, cache-local dedup; 0: one global CAS table (faster here) */
+#endif
 
 /* ------------------------------------------------------------- utilities */
 
@@ -198,6 +201,7 @@ typedef struct {
     const char *begin, *end;
     Cand *out;
     uint64_t count;
+    PartOut po;          /* dedup partition output (DEDUP_PART) */
 } ParseTask;
 
 typedef struct {
@@ -237,6 +241,8 @@ typedef struct {
    union-find + smallest-name pass while the other workers start parsing
    events; it joins the parse queue after.
    Still exactly the pool's threads: no extra thread, no oversubscription. */
+static uint32_t g_part_shift;   /* dedup partition = eid_h32 >> g_part_shift */
+
 typedef struct {
     Dict *dict;
     LinkBuild *lb;
@@ -271,8 +277,57 @@ static void job_parse(void *arg, unsigned wid)
     size_t i;
     while ((i = atomic_fetch_add_explicit(&q->next, 1, memory_order_relaxed)) < q->ntasks) {
         prof_begin(wid, PH_PARSE);
-        t[i].count = evx_parse_events(q->ctx, t[i].begin, t[i].end, t[i].out);
+        t[i].count = evx_parse_events(q->ctx, t[i].begin, t[i].end, t[i].out,
+                                      t[i].po.hist ? &t[i].po : NULL);
         prof_end(wid, PH_PARSE, t[i].count, 1);
+    }
+}
+
+/* ---- partitioned dedup (DEDUP_PART) ---------------------------------------- */
+typedef struct {
+    uint64_t *entries;          /* partition-major Cand references */
+    const uint64_t *part_off;   /* [P + 1] */
+    uint64_t **cursor;          /* per parse task: [P] write positions */
+    uint64_t **table;           /* per worker scratch table */
+    CollectCtx *wctx;           /* per worker collect ctx (dedup = its table) */
+    _Atomic int *overflow;
+} PartArgs;
+
+static void job_partition(void *arg, unsigned wid)
+{
+    Queue *q = arg;
+    ParseTask *t = q->tasks;
+    const PartArgs *a = q->ctx;
+    size_t i;
+    while ((i = atomic_fetch_add_explicit(&q->next, 1, memory_order_relaxed)) < q->ntasks) {
+        prof_begin(wid, PH_PARTITION);
+        evx_partition(t[i].po.ent, t[i].po.pid, t[i].count, a->cursor[i], a->entries);
+        prof_end(wid, PH_PARTITION, t[i].count, 1);
+    }
+}
+
+/* one partition: local dedup (no atomics, table in L1/L2), then collect over it */
+static void job_dedup_collect(void *arg, unsigned wid)
+{
+    Queue *q = arg;
+    CollectTask *t = q->tasks;
+    const PartArgs *a = q->ctx;
+    uint64_t *table = a->table[wid];
+    size_t i;
+    while ((i = atomic_fetch_add_explicit(&q->next, 1, memory_order_relaxed)) < q->ntasks) {
+        if (atomic_load_explicit(a->overflow, memory_order_relaxed))
+            break;
+        uint64_t n = a->part_off[i + 1] - a->part_off[i];
+        uint64_t tsize = n + n / 2 + 16;
+        memset(table, 0, tsize * sizeof *table);
+        prof_begin(wid, PH_DEDUP);
+        evx_dedup_local(table, tsize, a->entries + a->part_off[i], n);
+        prof_end(wid, PH_DEDUP, n, 1);
+        prof_begin(wid, PH_COLLECT);
+        t[i].count = evx_collect(&a->wctx[wid], 0, tsize, t[i].out, &t[i].occupied);
+        prof_end(wid, PH_COLLECT, t[i].occupied, 1);
+        if (t[i].count == UINT64_MAX)
+            atomic_store(a->overflow, 1);
     }
 }
 
@@ -523,6 +578,34 @@ int main(int argc, char **argv)
         }
     }
 
+    /* dedup partitions: ~4K rows each (estimated from bytes), so a
+       partition's private table (~1.5 x 8 B per row) stays in L1/L2 */
+    uint32_t pbits = 6;
+    while (pbits < 16 && ((uint64_t)1 << pbits) * 4096 < total_bytes / 48)
+        pbits++;
+    uint64_t nparts = (uint64_t)1 << pbits;
+    g_part_shift = 32 - pbits;
+    uint32_t *hist = NULL;
+    uint64_t *pent = NULL;
+    uint16_t *ppid = NULL;
+    size_t pcap = 0;
+    if (DEDUP_PART) {
+        for (size_t i = 0; i < nptasks; i++)
+            pcap += (size_t)(ptasks[i].end - ptasks[i].begin) / 8 + 1;
+        hist = big_alloc((nptasks ? nptasks : 1) * nparts * sizeof *hist);
+        pent = big_alloc((pcap ? pcap : 1) * sizeof *pent);
+        ppid = big_alloc((pcap ? pcap : 1) * sizeof *ppid);
+        if (!hist || !pent || !ppid) {
+            fprintf(stderr, "out of memory (partition histogram)\n");
+            return 1;
+        }
+        size_t off = 0;
+        for (size_t i = 0; i < nptasks; i++) {
+            ptasks[i].po = (PartOut){hist + i * nparts, pent + off, ppid + off, g_part_shift, 0};
+            off += (size_t)(ptasks[i].end - ptasks[i].begin) / 8 + 1;
+        }
+    }
+
     /* ---- P1: parse --------------------------------------------------------- */
     ParseCtx pctx = {
         .window_start = dict.window_start,
@@ -545,30 +628,67 @@ int main(int argc, char **argv)
     for (size_t i = 0; i < nptasks; i++)
         ncand += ptasks[i].count;
 
-    /* ---- P2: global dedup --------------------------------------------------
-     * Exact-size table, 1.5 slots per candidate (load <= 0.67), indexed by a
-     * multiply in asm, so it is not rounded up to a power of two. */
+    /* ---- P2: dedup ------------------------------------------------------------
+     * DEDUP_PART: partition-major references (counting sort by eid hash), then
+     * per partition a private table + collect in one job (P3). Otherwise one
+     * global CAS table (1.5 slots per candidate, multiply-indexed). */
     uint64_t dsize = ncand + ncand / 2 + 1024;
     if (dsize >= ((uint64_t)1 << 32)) {
         fprintf(stderr, "too many event rows for the 32-bit dedup index\n");
         return 1;
     }
-    uint64_t *dedup = big_alloc(dsize * sizeof(uint64_t));
-    size_t dt_cap = nptasks + ncand / 65536 + 16;
-    DedupTask *dtasks = calloc(dt_cap, sizeof *dtasks);
-    size_t ndt = 0;
-    for (size_t i = 0; i < nptasks; i++)
-        for (uint64_t o = 0; o < ptasks[i].count; o += 65536) {
-            uint64_t n = ptasks[i].count - o < 65536 ? ptasks[i].count - o : 65536;
-            dtasks[ndt++] = (DedupTask){ptasks[i].out + o, n};
+    uint64_t *dedup = NULL;
+    uint64_t *entries = NULL, *part_off = NULL, max_part = 0;
+    if (DEDUP_PART) {
+        entries = big_alloc((ncand ? ncand : 1) * sizeof *entries);
+        part_off = calloc(nparts + 1, sizeof *part_off);
+        uint64_t **cursor = calloc(nptasks ? nptasks : 1, sizeof *cursor);
+        uint64_t *curbuf = big_alloc((nptasks ? nptasks : 1) * nparts * sizeof *curbuf);
+        if (!entries || !part_off || !cursor || !curbuf) {
+            fprintf(stderr, "out of memory (partitions)\n");
+            return 1;
         }
-    if (!dedup || !dtasks) {
-        fprintf(stderr, "out of memory (dedup)\n");
-        return 1;
+        uint64_t run = 0;
+        for (uint64_t pp = 0; pp < nparts; pp++) {
+            part_off[pp] = run;
+            for (size_t t = 0; t < nptasks; t++) {
+                curbuf[t * nparts + pp] = run;
+                run += hist[t * nparts + pp];
+            }
+            uint64_t n = run - part_off[pp];
+            if (n > max_part)
+                max_part = n;
+        }
+        part_off[nparts] = run;
+        for (size_t t = 0; t < nptasks; t++)
+            cursor[t] = curbuf + t * nparts;
+        PartArgs pa = {.entries = entries, .cursor = cursor};
+        q = (Queue){.ntasks = nptasks, .tasks = ptasks, .ctx = &pa};
+        atomic_init(&q.next, 0);
+        pool_run(job_partition, &q);
+        big_free(curbuf, (nptasks ? nptasks : 1) * nparts * sizeof *curbuf);
+        big_free(hist, (nptasks ? nptasks : 1) * nparts * sizeof *hist);
+        big_free(pent, (pcap ? pcap : 1) * sizeof *pent);
+        big_free(ppid, (pcap ? pcap : 1) * sizeof *ppid);
+        free(cursor);
+    } else {
+        dedup = big_alloc(dsize * sizeof(uint64_t));
+        size_t dt_cap = nptasks + ncand / 65536 + 16;
+        DedupTask *dtasks = calloc(dt_cap, sizeof *dtasks);
+        size_t ndt = 0;
+        for (size_t i = 0; i < nptasks; i++)
+            for (uint64_t o = 0; o < ptasks[i].count; o += 65536) {
+                uint64_t n = ptasks[i].count - o < 65536 ? ptasks[i].count - o : 65536;
+                dtasks[ndt++] = (DedupTask){ptasks[i].out + o, n};
+            }
+        if (!dedup || !dtasks) {
+            fprintf(stderr, "out of memory (dedup)\n");
+            return 1;
+        }
+        q = (Queue){.ntasks = ndt, .tasks = dtasks, .ctx = &dsize, .ctx2 = dedup};
+        atomic_init(&q.next, 0);
+        pool_run(job_dedup, &q);
     }
-    q = (Queue){.ntasks = ndt, .tasks = dtasks, .ctx = &dsize, .ctx2 = dedup};
-    atomic_init(&q.next, 0);
-    pool_run(job_dedup, &q);
     uint64_t t_dedup = now_ns();
 
     /* ---- P3: collect valid winners, resolve + intern persons, count ---------
@@ -586,12 +706,22 @@ int main(int argc, char **argv)
         psize = pmax;
     Win *wins = big_alloc(dsize * sizeof(Win));
     const uint64_t CSLOTS = 65536;
-    size_t nct = (size_t)((dsize + CSLOTS - 1) / CSLOTS);
+    size_t nct = DEDUP_PART ? (size_t)nparts : (size_t)((dsize + CSLOTS - 1) / CSLOTS);
     CollectTask *ctasks = calloc(nct, sizeof *ctasks);
-    if (!wins || !ctasks) {
+    uint64_t **wtable = calloc(nw, sizeof *wtable);
+    CollectCtx *wctx = calloc(nw, sizeof *wctx);
+    if (!wins || !ctasks || !wtable || !wctx) {
         fprintf(stderr, "out of memory (collect)\n");
         return 1;
     }
+    if (DEDUP_PART)
+        for (unsigned w = 0; w < nw; w++) {
+            wtable[w] = big_alloc((max_part + max_part / 2 + 16) * sizeof(uint64_t));
+            if (!wtable[w]) {
+                fprintf(stderr, "out of memory (partition tables)\n");
+                return 1;
+            }
+        }
     PersonSlot *persons = NULL;
     uint32_t *counts = NULL;
     unsigned person_retries = 0;
@@ -603,9 +733,15 @@ int main(int argc, char **argv)
             return 1;
         }
         for (size_t i = 0; i < nct; i++) {
-            ctasks[i].slot_begin = i * CSLOTS;
-            ctasks[i].slot_end = (i + 1) * CSLOTS < dsize ? (i + 1) * CSLOTS : dsize;
-            ctasks[i].out = wins + ctasks[i].slot_begin;
+            if (DEDUP_PART) {
+                ctasks[i].slot_begin = 0;
+                ctasks[i].slot_end = 0;
+                ctasks[i].out = wins + part_off[i];
+            } else {
+                ctasks[i].slot_begin = i * CSLOTS;
+                ctasks[i].slot_end = (i + 1) * CSLOTS < dsize ? (i + 1) * CSLOTS : dsize;
+                ctasks[i].out = wins + ctasks[i].slot_begin;
+            }
             ctasks[i].count = 0;
             ctasks[i].occupied = 0;
         }
@@ -616,9 +752,21 @@ int main(int argc, char **argv)
             .link_slots = dict.link_slots, .link_mask = dict.link_mask,
             .claimed = &claimed, .claim_limit = psize / 2,
         };
-        q = (Queue){.ntasks = nct, .tasks = ctasks, .ctx = &cctx, .ctx2 = (void *)&overflow};
-        atomic_init(&q.next, 0);
-        pool_run(job_collect, &q);
+        if (DEDUP_PART) {
+            for (unsigned w = 0; w < nw; w++) {
+                wctx[w] = cctx;
+                wctx[w].dedup = wtable[w];
+            }
+            PartArgs pa = {.entries = entries, .part_off = part_off, .table = wtable,
+                           .wctx = wctx, .overflow = &overflow};
+            q = (Queue){.ntasks = nct, .tasks = ctasks, .ctx = &pa};
+            atomic_init(&q.next, 0);
+            pool_run(job_dedup_collect, &q);
+        } else {
+            q = (Queue){.ntasks = nct, .tasks = ctasks, .ctx = &cctx, .ctx2 = (void *)&overflow};
+            atomic_init(&q.next, 0);
+            pool_run(job_collect, &q);
+        }
         if (!atomic_load(&overflow))
             break;
         big_free(persons, psize * sizeof *persons);
@@ -670,7 +818,13 @@ int main(int argc, char **argv)
     }
     /* names now live in pnames (pointing into the input mappings): the
        candidate store, dedup table and person table are no longer needed */
-    big_free(dedup, dsize * sizeof(uint64_t));
+    if (dedup)
+        big_free(dedup, dsize * sizeof(uint64_t));
+    if (entries)
+        big_free(entries, (ncand ? ncand : 1) * sizeof *entries);
+    for (unsigned w = 0; w < nw; w++)
+        if (wtable[w])
+            big_free(wtable[w], (max_part + max_part / 2 + 16) * sizeof(uint64_t));
     big_free(cands, cand_bytes);
     /* the person table and counts[] (now slot -> dense remap) stay alive
        until the click parse has resolved every click's person */

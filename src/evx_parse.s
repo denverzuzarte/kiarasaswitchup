@@ -41,6 +41,9 @@
         .set    L_ING,   184
         .set    L_END,   192
         .set    L_PRICE, 200
+        .set    L_PO,    208            # PartOut* (NULL = off)
+        .set    L_ENT,   216            # next compact entry (u64)
+        .set    L_PID,   224            # next partition id (u16)
         .set    FRAME,   232
 
         .globl  evx_parse_events
@@ -54,6 +57,14 @@ evx_parse_events:
         push    r14
         push    r15
         sub     rsp, FRAME
+        mov     qword ptr [rsp + L_PO], r8
+        test    r8, r8
+        jz      .Lpo_off
+        mov     rax, qword ptr [r8 + 8]         # PartOut.ent
+        mov     qword ptr [rsp + L_ENT], rax
+        mov     rax, qword ptr [r8 + 16]        # PartOut.pid
+        mov     qword ptr [rsp + L_PID], rax
+.Lpo_off:
         mov     r12, rdi                # ctx
         mov     r13, rsi                # cursor (line start)
         mov     r14, rdx                # end
@@ -195,6 +206,24 @@ evx_parse_events:
         mov     rsi, rdx
         call    evx_khash
         mov     dword ptr [r15 + 52], eax       # eid_h32
+        mov     rdx, qword ptr [rsp + L_PO]
+        test    rdx, rdx
+        jz      .Lnohist
+        # compact dedup reference: (h32 & 0xFFFF) << 48 | Cand*, partition id
+        movzx   ecx, ax
+        shl     rcx, 48
+        or      rcx, r15
+        mov     r8, qword ptr [rsp + L_ENT]
+        mov     qword ptr [r8], rcx
+        add     qword ptr [rsp + L_ENT], 8
+        mov     ecx, dword ptr [rdx + 24]       # PartOut.shift
+        shr     eax, cl
+        mov     r8, qword ptr [rsp + L_PID]
+        mov     word ptr [r8], ax
+        add     qword ptr [rsp + L_PID], 2
+        mov     rdx, qword ptr [rdx]            # PartOut.hist
+        inc     dword ptr [rdx + rax*4]         # rows per dedup partition
+.Lnohist:
 
         # ---- ingest_ts (always F1 per rules; defensive) --------------------
         mov     rdi, qword ptr [rsp + F_ING]

@@ -127,6 +127,116 @@ evx_dedup_insert:
         .size   evx_dedup_insert, .-evx_dedup_insert
 
 # ---------------------------------------------------------------------------
+# void evx_partition(const uint64_t *ent /*rdi*/, const uint16_t *pid /*rsi*/,
+#                    uint64_t n /*rdx*/, uint64_t *cursor /*rcx*/, uint64_t *entries /*r8*/)
+# Counting-sort placement of the parser's compact dedup references
+# ((eid_h32 & 0xFFFF) << 48 | Cand*) into partition-major order. Reads 10
+# bytes per row instead of the 56-byte candidates.
+# ---------------------------------------------------------------------------
+        .globl  evx_partition
+        .type   evx_partition, @function
+        .p2align 5
+evx_partition:
+        lea     r10, [rdi + rdx*8]      # end
+.Lpt_loop:
+        cmp     rdi, r10
+        jae     .Lpt_done
+        movzx   eax, word ptr [rsi]
+        mov     r9, qword ptr [rcx + rax*8]
+        inc     qword ptr [rcx + rax*8]
+        mov     r11, qword ptr [rdi]
+        mov     qword ptr [r8 + r9*8], r11
+        add     rdi, 8
+        add     rsi, 2
+        jmp     .Lpt_loop
+.Lpt_done:
+        ret
+        .size   evx_partition, .-evx_partition
+
+# ---------------------------------------------------------------------------
+# void evx_dedup_local(uint64_t *table /*rdi*/, uint64_t tsize /*rsi*/,
+#                      const uint64_t *entries /*rdx*/, uint64_t n /*rcx*/)
+# Dedup of ONE partition into a zeroed table private to the calling worker
+# (sized to stay in L1/L2): plain loads and stores, no lock prefix, so no
+# full fences and no coherence traffic. Home slot = (tag16 * tsize) >> 16;
+# the smallest ingest wins, ties keep the resident copy.
+# ---------------------------------------------------------------------------
+        .globl  evx_dedup_local
+        .type   evx_dedup_local, @function
+        .p2align 5
+evx_dedup_local:
+        push    rbx
+        push    rbp
+        push    r12
+        push    r13
+        push    r14
+        push    r15
+        mov     rbx, rdi                # table
+        mov     r12, rsi                # tsize
+        mov     r13, rdx                # entry cursor
+        lea     r14, [rdx + rcx*8]      # end
+        movabs  rbp, PTRMASK
+.Ldl_next:
+        cmp     r13, r14
+        jae     .Ldl_done
+        mov     rdx, qword ptr [r13]    # new entry
+        add     r13, 8
+        mov     r15, rdx
+        shr     r15, 48
+        imul    r15, r12
+        shr     r15, 16                 # home slot
+.Ldl_probe:
+        mov     rax, qword ptr [rbx + r15*8]
+        test    rax, rax
+        jnz     .Ldl_occ
+        mov     qword ptr [rbx + r15*8], rdx
+        jmp     .Ldl_next
+.Ldl_occ:
+        mov     r8, rax
+        xor     r8, rdx
+        shr     r8, 48
+        jnz     .Ldl_pnext              # tag differs
+        mov     r9, rax
+        and     r9, rbp                 # resident Cand
+        mov     r10, rdx
+        and     r10, rbp                # new Cand
+        mov     r11, qword ptr [r10 + 8]
+        cmp     qword ptr [r9 + 8], r11
+        jne     .Ldl_pnext
+        push    rdx
+        push    rax
+        mov     rdi, qword ptr [r9]
+        mov     rsi, r11
+        mov     rdx, qword ptr [r10]
+        mov     rcx, r11
+        call    evx_keq                 # keeps r9, r10
+        mov     r8d, eax
+        pop     rax
+        pop     rdx
+        test    r8d, r8d
+        jz      .Ldl_pnext
+        mov     r8, qword ptr [r10 + 16]
+        cmp     r8, qword ptr [r9 + 16]
+        jge     .Ldl_next               # resident copy has smaller/equal ingest
+        mov     qword ptr [rbx + r15*8], rdx
+        jmp     .Ldl_next
+.Ldl_pnext:
+        inc     r15
+        cmp     r15, r12
+        jb      .Ldl_probe
+        xor     r15d, r15d
+        jmp     .Ldl_probe
+.Ldl_done:
+        pop     r15
+        pop     r14
+        pop     r13
+        pop     r12
+        pop     rbp
+        pop     rbx
+        ret
+        .size   evx_dedup_local, .-evx_dedup_local
+
+# ---------------------------------------------------------------------------
 # uint64_t evx_collect(const CollectCtx *ctx /*rdi*/, uint64_t slot_begin /*rsi*/,
 #                      uint64_t slot_end /*rdx*/, Win *out /*rcx*/,
 #                      uint64_t *occupied /*r8*/)
@@ -147,12 +257,15 @@ evx_dedup_insert:
 #   [32] occupied ptr, [40] batch size, [48] saved rbx, [56] loop index,
 #   [64 + 8i] Cand*, [576 + 8i] key k0, [1088 + 8i] key k1, [1600 + 8i] slot idx
 # ---------------------------------------------------------------------------
+.ifndef COLLECT_BATCH
+        .set    COLLECT_BATCH, 64
+.endif
+        .set    BATCH,  COLLECT_BATCH
         .set    B_C,    64
-        .set    B_K0,   576
-        .set    B_K1,   1088
-        .set    B_H,    1600
-        .set    BATCH,  64
-        .set    CFRAME, 2120
+        .set    B_K0,   B_C + 8*BATCH
+        .set    B_K1,   B_K0 + 8*BATCH
+        .set    B_H,    B_K1 + 8*BATCH
+        .set    CFRAME, B_H + 8*BATCH + 8       # keeps rsp 16-byte aligned at calls
 
         .globl  evx_collect
         .type   evx_collect, @function
@@ -371,6 +484,96 @@ evx_collect:
         .type   evx_scatter, @function
         .p2align 5
 evx_scatter:
+.ifndef SCATTER_SERIAL
+        # Batched: 16 records at a time. (1) prefetch each record's remap
+        # entry, (2) remap + prefetchw cursor line, (3) lock xadd + prefetchw
+        # destination, (4) store. The serial version waits on every miss.
+        push    rbx
+        push    rbp
+        push    r12
+        push    r13
+        sub     rsp, 136                # [0..127] 16 positions/ids, [128] pad
+        mov     r12, rdi                # cursor into Win[]
+        shl     rsi, 4
+        lea     r13, [rdi + rsi]        # end
+        mov     rbx, rdx                # remap
+        mov     rbp, rcx                # cursor[]
+.Lsb_batch:
+        mov     rax, r13
+        sub     rax, r12
+        shr     rax, 4
+        cmp     rax, 16
+        jb      .Lsb_tail
+        xor     ecx, ecx
+.Lsb_p1:
+        mov     rdx, rcx
+        shl     rdx, 4
+        mov     eax, dword ptr [r12 + rdx + 8]              # person slot
+        prefetcht0 [rbx + rax*4]
+        inc     ecx
+        cmp     ecx, 16
+        jb      .Lsb_p1
+        xor     ecx, ecx
+.Lsb_p2:
+        mov     rdx, rcx
+        shl     rdx, 4
+        mov     eax, dword ptr [r12 + rdx + 8]
+        mov     eax, dword ptr [rbx + rax*4]                # dense id
+        mov     qword ptr [rsp + rcx*8], rax
+        prefetchw [rbp + rax*8]
+        inc     ecx
+        cmp     ecx, 16
+        jb      .Lsb_p2
+        xor     ecx, ecx
+.Lsb_p3:
+        mov     rax, qword ptr [rsp + rcx*8]
+        mov     r9d, 1
+        lock xadd qword ptr [rbp + rax*8], r9
+        mov     qword ptr [rsp + rcx*8], r9                 # destination index
+        shl     r9, 4
+        prefetchw [r8 + r9]
+        inc     ecx
+        cmp     ecx, 16
+        jb      .Lsb_p3
+        xor     ecx, ecx
+.Lsb_p4:
+        mov     r9, qword ptr [rsp + rcx*8]
+        shl     r9, 4
+        mov     rdx, rcx
+        shl     rdx, 4
+        mov     r10, qword ptr [r12 + rdx]
+        mov     qword ptr [r8 + r9], r10
+        mov     r10d, dword ptr [r12 + rdx + 12]
+        mov     dword ptr [r8 + r9 + 8], r10d
+        mov     dword ptr [r8 + r9 + 12], 0
+        inc     ecx
+        cmp     ecx, 16
+        jb      .Lsb_p4
+        add     r12, 256
+        jmp     .Lsb_batch
+.Lsb_tail:
+        cmp     r12, r13
+        jae     .Lsb_done
+        mov     eax, dword ptr [r12 + 8]
+        mov     eax, dword ptr [rbx + rax*4]
+        mov     r9d, 1
+        lock xadd qword ptr [rbp + rax*8], r9
+        shl     r9, 4
+        mov     r10, qword ptr [r12]
+        mov     qword ptr [r8 + r9], r10
+        mov     r10d, dword ptr [r12 + 12]
+        mov     dword ptr [r8 + r9 + 8], r10d
+        mov     dword ptr [r8 + r9 + 12], 0
+        add     r12, 16
+        jmp     .Lsb_tail
+.Lsb_done:
+        add     rsp, 136
+        pop     r13
+        pop     r12
+        pop     rbp
+        pop     rbx
+        ret
+.else
         shl     rsi, 4
         add     rsi, rdi                    # end
 .Lsc_loop:
@@ -390,6 +593,7 @@ evx_scatter:
         jmp     .Lsc_loop
 .Lsc_done:
         ret
+.endif
         .size   evx_scatter, .-evx_scatter
 
         .section .note.GNU-stack,"",@progbits
