@@ -1,3 +1,4 @@
 dev
-fixtures  
-scripts
+
+src/*.elf
+src/*.o
