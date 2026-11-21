@@ -60,7 +60,7 @@ dev:
 
 # Run the pipeline on dev/ and time container execution.
 run-dev: build
-	rm -rf out && time env CPUS=2 MEM=6g scripts/docker_run.sh $(DEV) out
+	rm -rf out && time env CPUS=8 MEM=10g scripts/docker_run.sh $(DEV) out
 
 # Compare the previous run's Parquet output with dev-answer/.
 check-dev:
