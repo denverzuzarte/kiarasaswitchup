@@ -35,7 +35,7 @@ typedef struct {
 typedef struct {
     int64_t window_start;         /*  0 */
     int64_t window_end;           /*  8 */
-    const LookupEntry *link_slots;/* 16 (NULL when there are no links) */
+    const LookupEntry *link_slots;/* 16 unused by parse (links resolve in collect) */
     uint64_t link_mask;           /* 24 */
     const LookupEntry *prod_slots;/* 32 (NULL when there are no products) */
     uint64_t prod_mask;           /* 40 */
@@ -43,29 +43,41 @@ typedef struct {
     uint32_t pad;                 /* 52 */
 } ParseCtx;                       /* 56 */
 
-/* One structurally valid event row with a non-empty event_id. 64 bytes. */
-#define CAND_VALID 1u
+/*
+ * One structurally valid event row with a non-empty event_id. 48 bytes.
+ * Validation (incl. the late rule) is evaluated once at parse time; an invalid
+ * row has user_ptr == NULL but still competes in dedup. The person is resolved
+ * later, in evx_collect, and only for winning copies.
+ */
 typedef struct {
-    uint64_t eid_hash;    /*  0 */
-    const char *eid_ptr;  /*  8 */
-    uint32_t eid_len;     /* 16 */
-    uint32_t flags;       /* 20  bit0 = passes validation + late rule */
-    int64_t ingest;       /* 24  epoch ms */
-    int64_t ts_off;       /* 32  ts - window_start (valid rows only) */
-    const char *pname_ptr;/* 40  canonical person name (valid rows only) */
-    uint32_t pname_len;   /* 48 */
-    uint32_t pname_tag;   /* 52  evx_hash(name) >> 32 */
-    uint32_t price_cat;   /* 56  price (24 bits, 0 unless purchase) | cat << 24 */
-    uint32_t pad;         /* 60 */
+    const char *eid_ptr;  /*  0 */
+    uint32_t eid_len;     /*  8 */
+    uint32_t eid_h32;     /* 12  low 32 bits of evx_hash(event_id) */
+    int64_t ingest;       /* 16  epoch ms */
+    const char *user_ptr; /* 24  NULL = this copy fails validation */
+    uint32_t user_len;    /* 32 */
+    uint32_t price_cat;   /* 36  price (24 bits, 0 unless purchase) | cat << 24 */
+    int64_t ts_off;       /* 40  ts - window_start (valid rows only) */
 } Cand;
+
+/* Person table slot (16-byte aligned, claimed with lock cmpxchg16b). */
+typedef struct {
+    const char *name;     /*  0  canonical name; NULL = empty */
+    uint32_t len;         /*  8 */
+    uint32_t tag;         /* 12  evx_hash(name) >> 32 */
+} PersonSlot;
 
 /* Context for evx_collect. */
 typedef struct {
-    const uint64_t *dedup;   /*  0  slots: tag16 << 48 | Cand*  */
-    const Cand **persons;    /*  8  person table: Cand* defining the name */
-    uint64_t person_mask;    /* 16 */
-    uint32_t *counts;        /* 24  events per person slot */
-} CollectCtx;                /* 32 */
+    const uint64_t *dedup;        /*  0  slots: tag16 << 48 | Cand*  */
+    PersonSlot *persons;          /*  8 */
+    uint64_t person_mask;         /* 16 */
+    uint32_t *counts;             /* 24  events per person slot */
+    const LookupEntry *link_slots;/* 32  NULL when there are no links */
+    uint64_t link_mask;           /* 40 */
+    uint64_t *claimed;            /* 48  shared count of claimed person slots */
+    uint64_t claim_limit;         /* 56  > this many claims: table too small */
+} CollectCtx;                     /* 64 */
 
 /* Valid dedup winner, before grouping. 16 bytes. */
 typedef struct {
@@ -111,11 +123,15 @@ _Static_assert(offsetof(LookupEntry, val) == 16, "LookupEntry.val");
 _Static_assert(offsetof(LookupEntry, val_tag) == 28, "LookupEntry.val_tag");
 _Static_assert(sizeof(ParseCtx) == 56, "ParseCtx");
 _Static_assert(offsetof(ParseCtx, unknown_cat) == 48, "ParseCtx.unknown_cat");
-_Static_assert(sizeof(Cand) == 64, "Cand");
-_Static_assert(offsetof(Cand, ingest) == 24, "Cand.ingest");
-_Static_assert(offsetof(Cand, pname_ptr) == 40, "Cand.pname_ptr");
-_Static_assert(offsetof(Cand, price_cat) == 56, "Cand.price_cat");
-_Static_assert(sizeof(CollectCtx) == 32, "CollectCtx");
+_Static_assert(sizeof(Cand) == 48, "Cand");
+_Static_assert(offsetof(Cand, eid_h32) == 12, "Cand.eid_h32");
+_Static_assert(offsetof(Cand, ingest) == 16, "Cand.ingest");
+_Static_assert(offsetof(Cand, user_ptr) == 24, "Cand.user_ptr");
+_Static_assert(offsetof(Cand, price_cat) == 36, "Cand.price_cat");
+_Static_assert(offsetof(Cand, ts_off) == 40, "Cand.ts_off");
+_Static_assert(sizeof(PersonSlot) == 16, "PersonSlot");
+_Static_assert(sizeof(CollectCtx) == 64, "CollectCtx");
+_Static_assert(offsetof(CollectCtx, claim_limit) == 56, "CollectCtx.claim_limit");
 _Static_assert(sizeof(Win) == 16, "Win");
 _Static_assert(sizeof(Ev) == 16, "Ev");
 _Static_assert(offsetof(SessCtx, radix_passes) == 40, "SessCtx.radix_passes");
@@ -134,7 +150,10 @@ int evx_parse_ts(const char *p, size_t len, int64_t *out);
 /* Parse the event rows in [begin, end) (no header). Returns Cand count. */
 uint64_t evx_parse_events(const ParseCtx *ctx, const char *begin,
                           const char *end, Cand *out);
-void evx_dedup_insert(uint64_t *table, uint64_t mask, Cand *c, uint64_t n);
+/* table has `size` slots (any size < 2^32; index = (eid_h32 * size) >> 32) */
+void evx_dedup_insert(uint64_t *table, uint64_t size, Cand *c, uint64_t n);
+/* Returns the Win count, or UINT64_MAX when the person table passed
+   claim_limit (the caller enlarges it and reruns the whole phase). */
 uint64_t evx_collect(const CollectCtx *ctx, uint64_t slot_begin,
                      uint64_t slot_end, Win *out, uint64_t *occupied);
 void evx_scatter(const Win *w, uint64_t n, const uint32_t *remap,

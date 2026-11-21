@@ -31,7 +31,7 @@ PY       ?= python3
 
 export IMAGE CPUS MEM PLATFORM
 
-.PHONY: all build fixtures dev run-dev check-dev check-dev-events clean clean-out clean-dataset unit check-fixtures
+.PHONY: all build fixtures dev run-dev run-native fuzz-data check-reference check-dev check-dev-events clean clean-out clean-dataset unit check-fixtures
 
 # Plain `make` builds the native executable. `make build` also builds its image.
 all: $(TARGET)
@@ -76,6 +76,20 @@ check-dev:
 check-dev-events:
 	cd scripts && $(PY) check_events.py --compare ../out $(abspath $(ANSWER))
 
+# Run the native binary on $(DEV) (no Docker), output to out/.
+run-native: $(TARGET)
+	rm -rf out && time env DATA_DIR=$(DEV) OUTPUT_DIR=out NCPU=$(CPUS) ./$(TARGET)
+
+# Adversarial dataset for differential testing: make fuzz-data DEV=fz SEED=3 EVENTS=200000
+fuzz-data:
+	$(PY) scripts/fuzz_events.py $(DEV) $(SEED) $(EVENTS)
+
+# Independent Python implementation of the rules on $(DEV), compared with out/.
+check-reference:
+	rm -rf out-ref && mkdir -p out-ref
+	$(PY) scripts/reference_events.py $(DEV) out-ref/user_daily.csv
+	cd scripts && $(PY) check_events.py --compare ../out ../out-ref
+
 # Unit tests of the assembly primitives (not part of src/main).
 UNIT := src/tests/unit
 unit: $(ASM_OBJS) src/tests/unit.c src/evx.h
@@ -91,7 +105,7 @@ clean:
 	rm -rf src/*.c.o src/*.s.o
 
 clean-out:
-	rm -rf out
+	rm -rf out out-ref
 
 # Remove a generated dataset; refuses to delete the public dev/ set.
 clean-dataset:

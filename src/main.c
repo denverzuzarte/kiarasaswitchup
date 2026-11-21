@@ -240,10 +240,10 @@ static void job_dedup(void *arg, unsigned wid)
     (void)wid;
     Queue *q = arg;
     DedupTask *t = q->tasks;
-    const uint64_t *mask = q->ctx;
+    const uint64_t *size = q->ctx;
     size_t i;
     while ((i = atomic_fetch_add_explicit(&q->next, 1, memory_order_relaxed)) < q->ntasks)
-        evx_dedup_insert(q->ctx2, *mask, t[i].c, t[i].n);
+        evx_dedup_insert(q->ctx2, *size, t[i].c, t[i].n);
 }
 
 static void job_collect(void *arg, unsigned wid)
@@ -251,10 +251,16 @@ static void job_collect(void *arg, unsigned wid)
     (void)wid;
     Queue *q = arg;
     CollectTask *t = q->tasks;
+    _Atomic int *overflow = q->ctx2;
     size_t i;
-    while ((i = atomic_fetch_add_explicit(&q->next, 1, memory_order_relaxed)) < q->ntasks)
+    while ((i = atomic_fetch_add_explicit(&q->next, 1, memory_order_relaxed)) < q->ntasks) {
+        if (atomic_load_explicit(overflow, memory_order_relaxed))
+            break;                      /* the phase will be rerun anyway */
         t[i].count = evx_collect(q->ctx, t[i].slot_begin, t[i].slot_end, t[i].out,
                                  &t[i].occupied);
+        if (t[i].count == UINT64_MAX)
+            atomic_store(overflow, 1);
+    }
 }
 
 typedef struct {
@@ -413,9 +419,14 @@ int main(int argc, char **argv)
     for (size_t i = 0; i < nptasks; i++)
         ncand += ptasks[i].count;
 
-    /* ---- P2: global dedup -------------------------------------------------- */
-    uint64_t dsize = pow2_at_least(ncand * 2);
-    uint64_t dmask = dsize - 1;
+    /* ---- P2: global dedup --------------------------------------------------
+     * Exact-size table, 1.5 slots per candidate (load <= 0.67), indexed by a
+     * multiply in asm, so it is not rounded up to a power of two. */
+    uint64_t dsize = ncand + ncand / 2 + 1024;
+    if (dsize >= ((uint64_t)1 << 32)) {
+        fprintf(stderr, "too many event rows for the 32-bit dedup index\n");
+        return 1;
+    }
     uint64_t *dedup = big_alloc(dsize * sizeof(uint64_t));
     size_t dt_cap = nptasks + ncand / 65536 + 16;
     DedupTask *dtasks = calloc(dt_cap, sizeof *dtasks);
@@ -429,32 +440,66 @@ int main(int argc, char **argv)
         fprintf(stderr, "out of memory (dedup)\n");
         return 1;
     }
-    q = (Queue){.ntasks = ndt, .tasks = dtasks, .ctx = &dmask, .ctx2 = dedup};
+    q = (Queue){.ntasks = ndt, .tasks = dtasks, .ctx = &dsize, .ctx2 = dedup};
     atomic_init(&q.next, 0);
     pool_run(job_dedup, &q);
     uint64_t t_dedup = now_ns();
 
-    /* ---- P3: collect valid winners, intern persons, count ----------------- */
-    uint64_t psize = pow2_at_least(ncand * 2);
-    const Cand **persons = big_alloc(psize * sizeof *persons);
-    uint32_t *counts = big_alloc(psize * sizeof *counts);
+    /* ---- P3: collect valid winners, resolve + intern persons, count ---------
+     * The person table starts at ~1/8 of the candidates (people are a few %
+     * of events) and is enlarged and the phase rerun if more than half of it
+     * gets claimed. At pow2 >= 2 * ncand it can no longer overflow. */
+    uint64_t pmax = pow2_at_least(ncand * 2);
+    uint64_t psize = pow2_at_least(ncand / 8);
+    {
+        const char *env = getenv("EVX_PSIZE");    /* test hook: force retries */
+        if (env && *env)
+            psize = pow2_at_least(strtoull(env, NULL, 10));
+    }
+    if (psize > pmax)
+        psize = pmax;
     Win *wins = big_alloc(dsize * sizeof(Win));
     const uint64_t CSLOTS = 65536;
     size_t nct = (size_t)((dsize + CSLOTS - 1) / CSLOTS);
     CollectTask *ctasks = calloc(nct, sizeof *ctasks);
-    if (!persons || !counts || !wins || !ctasks) {
+    if (!wins || !ctasks) {
         fprintf(stderr, "out of memory (collect)\n");
         return 1;
     }
-    for (size_t i = 0; i < nct; i++) {
-        ctasks[i].slot_begin = i * CSLOTS;
-        ctasks[i].slot_end = (i + 1) * CSLOTS < dsize ? (i + 1) * CSLOTS : dsize;
-        ctasks[i].out = wins + ctasks[i].slot_begin;
+    PersonSlot *persons = NULL;
+    uint32_t *counts = NULL;
+    unsigned person_retries = 0;
+    for (;;) {
+        persons = big_alloc(psize * sizeof *persons);
+        counts = big_alloc(psize * sizeof *counts);
+        if (!persons || !counts) {
+            fprintf(stderr, "out of memory (persons)\n");
+            return 1;
+        }
+        for (size_t i = 0; i < nct; i++) {
+            ctasks[i].slot_begin = i * CSLOTS;
+            ctasks[i].slot_end = (i + 1) * CSLOTS < dsize ? (i + 1) * CSLOTS : dsize;
+            ctasks[i].out = wins + ctasks[i].slot_begin;
+            ctasks[i].count = 0;
+            ctasks[i].occupied = 0;
+        }
+        uint64_t claimed = 0;
+        _Atomic int overflow = 0;
+        CollectCtx cctx = {
+            .dedup = dedup, .persons = persons, .person_mask = psize - 1, .counts = counts,
+            .link_slots = dict.link_slots, .link_mask = dict.link_mask,
+            .claimed = &claimed, .claim_limit = psize / 2,
+        };
+        q = (Queue){.ntasks = nct, .tasks = ctasks, .ctx = &cctx, .ctx2 = (void *)&overflow};
+        atomic_init(&q.next, 0);
+        pool_run(job_collect, &q);
+        if (!atomic_load(&overflow))
+            break;
+        big_free(persons, psize * sizeof *persons);
+        big_free(counts, psize * sizeof *counts);
+        psize = psize * 8 < pmax ? psize * 8 : pmax;
+        person_retries++;
     }
-    CollectCtx cctx = {.dedup = dedup, .persons = persons, .person_mask = psize - 1, .counts = counts};
-    q = (Queue){.ntasks = nct, .tasks = ctasks, .ctx = &cctx};
-    atomic_init(&q.next, 0);
-    pool_run(job_collect, &q);
     uint64_t t_collect = now_ns();
 
     /* ---- P4: dense persons + prefix sums --------------------------------
@@ -481,7 +526,7 @@ int main(int argc, char **argv)
                 continue;
             offsets[k] = nvalid;
             cursor[k] = nvalid;
-            pnames[k] = (Slice){persons[p]->pname_ptr, persons[p]->pname_len, 0};
+            pnames[k] = (Slice){persons[p].name, persons[p].len, 0};
             nvalid += c;
             if (c > maxn)
                 maxn = c;
@@ -618,6 +663,8 @@ int main(int argc, char **argv)
     double cpu_s = (double)ru.ru_utime.tv_sec + ru.ru_utime.tv_usec / 1e6 +
                    (double)ru.ru_stime.tv_sec + ru.ru_stime.tv_usec / 1e6;
     double wall_s = (double)(t_end - t0) / 1e9;
+    fprintf(stderr, "evx: tables dedup_slots=%llu person_slots=%llu person_retries=%u\n",
+            (unsigned long long)dsize, (unsigned long long)psize, person_retries);
     fprintf(stderr, "evx: cpu user=%.2fs sys=%.2fs avg_cores=%.2f (worker threads=%u + 1 idle coordinator)\n",
             (double)ru.ru_utime.tv_sec + ru.ru_utime.tv_usec / 1e6,
             (double)ru.ru_stime.tv_sec + ru.ru_stime.tv_usec / 1e6, cpu_s / wall_s, nw);

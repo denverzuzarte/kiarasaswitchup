@@ -10,12 +10,13 @@
 #      block is a fault-suppressing masked load, so nothing past `end` is read.
 #   2. Exactly 6 commas, quote count == 2 * wrapped fields, else malformed.
 #   3. Empty event_id -> dropped (before dedup).
-#   4. Every other row becomes a 64-byte Cand. All validation (user, ts, window,
+#   4. Every other row becomes a 48-byte Cand. All validation (user, ts, window,
 #      type, product, price, late rule) is evaluated here, once, as a flag; the
 #      row still competes in dedup whatever the flag says (rules: dedup first).
 #   5. Hash lookups (links, products) run only for rows that are still valid,
 #      and the product lookup only for purchases (only purchases need a
-#      category). The canonical person name is resolved here.
+#      category). The person is NOT resolved here: only dedup winners need
+#      it, so evx_collect does the link lookup (fewer lookups, smaller Cand).
 #
 # Stack frame (rsp-relative):
 #    0 ..  55  comma pointers [7]
@@ -187,11 +188,11 @@ evx_parse_events:
         jz      .Lline                  # empty event_id: dropped before dedup
         mov     rdi, qword ptr [rsp + F_EID]
         call    evx_hash
-        mov     qword ptr [r15], rax
+        mov     dword ptr [r15 + 12], eax       # eid_h32
         mov     rax, qword ptr [rsp + F_EID]
-        mov     qword ptr [r15 + 8], rax
+        mov     qword ptr [r15], rax
         mov     eax, dword ptr [rsp + F_EID + 8]
-        mov     dword ptr [r15 + 16], eax
+        mov     dword ptr [r15 + 8], eax
 
         # ---- ingest_ts (always F1 per rules; defensive) --------------------
         mov     rdi, qword ptr [rsp + F_ING]
@@ -201,7 +202,7 @@ evx_parse_events:
         test    eax, eax
         jz      .Lbad_ingest
         mov     rax, qword ptr [rsp + L_ING]
-        mov     qword ptr [r15 + 24], rax
+        mov     qword ptr [r15 + 16], rax
 
         # ---- validation of this copy (applied only if it wins dedup) -------
         cmp     qword ptr [rsp + F_USER + 8], 0
@@ -219,12 +220,12 @@ evx_parse_events:
         jl      .Linvalid
         cmp     rax, qword ptr [r12 + 8]        # ts < window_end
         jge     .Linvalid
-        mov     rdx, qword ptr [r15 + 24]
+        mov     rdx, qword ptr [r15 + 16]
         sub     rdx, rax
         cmp     rdx, 86400000                   # late: ingest - ts > 24 h
         jg      .Linvalid
         sub     rax, qword ptr [r12]
-        mov     qword ptr [r15 + 32], rax       # ts_off
+        mov     qword ptr [r15 + 40], rax       # ts_off
 
         # event_type: compare the whole value as one 4- or 8-byte integer
         mov     rdi, qword ptr [rsp + F_TYPE]
@@ -269,7 +270,7 @@ evx_parse_events:
 
         # category (only purchases need one)
         mov     eax, dword ptr [r12 + 48]       # unknown_cat
-        mov     dword ptr [r15 + 56], eax
+        mov     dword ptr [r15 + 36], eax
         cmp     qword ptr [r12 + 32], 0
         je      .Lcat_done
         mov     rdi, qword ptr [rsp + F_PROD]
@@ -284,63 +285,41 @@ evx_parse_events:
         test    rax, rax
         jz      .Lcat_done
         mov     eax, dword ptr [rax + 24]
-        mov     dword ptr [r15 + 56], eax
+        mov     dword ptr [r15 + 36], eax
 .Lcat_done:
-        mov     eax, dword ptr [r15 + 56]
+        mov     eax, dword ptr [r15 + 36]
         shl     eax, 24
         or      eax, dword ptr [rsp + L_PRICE]
-        mov     dword ptr [r15 + 56], eax
-        jmp     .Lperson
+        mov     dword ptr [r15 + 36], eax
+        jmp     .Lvalid
 
 .Lnonpurchase:
-        mov     dword ptr [r15 + 56], 0
+        mov     dword ptr [r15 + 36], 0
 
-        # ---- canonical person: link table, else the raw id itself ----------
-.Lperson:
-        mov     rdi, qword ptr [rsp + F_USER]
-        mov     rsi, qword ptr [rsp + F_USER + 8]
-        call    evx_hash
-        mov     r8, rax
-        cmp     qword ptr [r12 + 16], 0
-        je      .Lself
-        mov     rdi, qword ptr [r12 + 16]
-        mov     rsi, qword ptr [r12 + 24]
-        mov     rdx, qword ptr [rsp + F_USER]
-        mov     rcx, qword ptr [rsp + F_USER + 8]
-        call    evx_lookup
-        test    rax, rax
-        jz      .Lself
-        mov     rdx, qword ptr [rax + 16]
-        mov     qword ptr [r15 + 40], rdx
-        mov     edx, dword ptr [rax + 24]
-        mov     dword ptr [r15 + 48], edx
-        mov     edx, dword ptr [rax + 28]
-        mov     dword ptr [r15 + 52], edx
-        jmp     .Lvalid
-.Lself:
-        mov     rdx, qword ptr [rsp + F_USER]
-        mov     qword ptr [r15 + 40], rdx
-        mov     edx, dword ptr [rsp + F_USER + 8]
-        mov     dword ptr [r15 + 48], edx
-        shr     r8, 32
-        mov     dword ptr [r15 + 52], r8d
+        # ---- valid: keep the raw user id; the person is resolved in collect,
+        #      for winning copies only -----------------------------------------
 .Lvalid:
-        mov     dword ptr [r15 + 20], 1
-        add     r15, 64
+        mov     rdx, qword ptr [rsp + F_USER]
+        mov     qword ptr [r15 + 24], rdx
+        mov     edx, dword ptr [rsp + F_USER + 8]
+        mov     dword ptr [r15 + 32], edx
+        add     r15, 48
         jmp     .Lline
 
 .Lbad_ingest:
         movabs  rax, 0x7FFFFFFFFFFFFFFF         # never beats a real copy
-        mov     qword ptr [r15 + 24], rax
+        mov     qword ptr [r15 + 16], rax
 .Linvalid:
-        mov     dword ptr [r15 + 20], 0
-        add     r15, 64
+        mov     qword ptr [r15 + 24], 0         # user_ptr NULL = invalid copy
+        add     r15, 48
         jmp     .Lline
 
 .Ldone:
         mov     rax, r15
         sub     rax, rbx
-        shr     rax, 6
+        xor     edx, edx
+        mov     ecx, 48
+        div     rcx                     # Cand count
         add     rsp, FRAME
         pop     r15
         pop     r14
