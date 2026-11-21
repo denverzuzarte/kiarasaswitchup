@@ -1,6 +1,6 @@
 # evx_click.s - click engine and attribution (GNU as, Intel syntax).
 #
-#   evx_canon           raw user id -> canonical person name (shared with
+#   evx_canon           raw user Key16 -> canonical person Key16 (shared with
 #                       evx_collect so events and clicks agree bit for bit)
 #   evx_memcmp          byte-wise order (click_id tie-break)
 #   evx_sort16          16-byte records by u64 key (insertion / LSD radix)
@@ -18,49 +18,37 @@
 
 # ---------------------------------------------------------------------------
 # evx_canon (internal ABI)
-#   in : rdi = user id, rsi = len, rdx = link slots (NULL = no links), rcx = link mask
-#   out: rax = canonical name, rdx = len, rcx = tag (evx_hash(name) >> 32)
-#   clobbers all caller-saved GPRs, k1, k2, zmm16, zmm17
+#   in : rdi:rsi = raw user id as Key16, rdx = link slots (NULL = no links),
+#        rcx = link mask
+#   out: rax:rdx = canonical person name as Key16 (the link component's
+#        smallest id, or the raw id itself)
+#   clobbers rcx, rsi, rdi, r8 - r11 and what evx_lookup clobbers
 # ---------------------------------------------------------------------------
         .globl  evx_canon
         .type   evx_canon, @function
         .p2align 5
 evx_canon:
-        push    rbx
-        push    r12
-        push    r13
-        push    r14
-        sub     rsp, 8
-        mov     rbx, rdi
-        mov     r12, rsi
-        mov     r13, rdx
-        mov     r14, rcx
-        call    evx_hash
-        mov     r8, rax
-        test    r13, r13
+        test    rdx, rdx
         jz      .Lcn_self
-        mov     rdi, r13
-        mov     rsi, r14
-        mov     rdx, rbx
-        mov     rcx, r12
+        push    rdi
+        push    rsi
+        mov     r8, rdx
+        mov     r9, rcx
+        mov     rdx, rdi
+        mov     rcx, rsi
+        mov     rdi, r8
+        mov     rsi, r9
         call    evx_lookup
+        pop     rsi
+        pop     rdi
         test    rax, rax
         jz      .Lcn_self
-        mov     edx, dword ptr [rax + 24]
-        mov     ecx, dword ptr [rax + 28]
+        mov     rdx, qword ptr [rax + 24]
         mov     rax, qword ptr [rax + 16]
-        jmp     .Lcn_out
+        ret
 .Lcn_self:
-        mov     rax, rbx
-        mov     rdx, r12
-        mov     rcx, r8
-        shr     rcx, 32
-.Lcn_out:
-        add     rsp, 8
-        pop     r14
-        pop     r13
-        pop     r12
-        pop     rbx
+        mov     rax, rdi
+        mov     rdx, rsi
         ret
         .size   evx_canon, .-evx_canon
 
@@ -426,18 +414,19 @@ evx_parse_clicks:
         cmp     qword ptr [rsp + K_USER + 8], 0
         je      .Lk_line
         # campaign must be in campaigns.csv (exact bytes)
+        cmp     qword ptr [rsp + K_CAMP + 8], 0
+        je      .Lk_line
         mov     rdi, qword ptr [rsp + K_CAMP]
         mov     rsi, qword ptr [rsp + K_CAMP + 8]
-        call    evx_hash
-        mov     r8, rax
+        call    evx_key16
+        mov     rcx, rdx
+        mov     rdx, rax
         mov     rdi, qword ptr [r12 + 32]
         mov     rsi, qword ptr [r12 + 40]
-        mov     rdx, qword ptr [rsp + K_CAMP]
-        mov     rcx, qword ptr [rsp + K_CAMP + 8]
         call    evx_lookup
         test    rax, rax
         jz      .Lk_line
-        mov     eax, dword ptr [rax + 24]
+        mov     eax, dword ptr [rax + 16]       # val.k0 = campaign id
         mov     dword ptr [r15 + 12], eax
         # ts valid and in the click window [cw_start, cw_end)
         mov     rdi, qword ptr [rsp + K_TS]
@@ -456,26 +445,38 @@ evx_parse_clicks:
         # person: canonical name -> events person table -> dense id
         mov     rdi, qword ptr [rsp + K_USER]
         mov     rsi, qword ptr [rsp + K_USER + 8]
+        call    evx_key16                       # from the hot line
+        mov     rdi, rax
+        mov     rsi, rdx
         mov     rdx, qword ptr [r12 + 16]
         mov     rcx, qword ptr [r12 + 24]
         call    evx_canon
-        mov     rsi, rax                        # name
-        mov     r10, rcx
-        shl     r10, 32
-        or      r10, rdx                        # tag << 32 | len
-        mov     r9, rcx
+        mov     rsi, rax                        # person key k0
+        mov     r10, rdx                        # person key k1
+        mov     rdi, rax
+        push    rsi
+        mov     rsi, rdx
+        call    evx_khash
+        pop     rsi
+        mov     r9, rax
         and     r9, qword ptr [r12 + 56]
         mov     r8, qword ptr [r12 + 48]
 .Lk_pf:
         mov     rax, r9
         shl     rax, 4
         add     rax, r8
-        mov     rdi, qword ptr [rax]
+        mov     rdi, qword ptr [rax + 8]
         test    rdi, rdi
         jz      .Lk_line                        # no surviving events: drop
-        cmp     qword ptr [rax + 8], r10
+        cmp     rdi, r10
         jne     .Lk_pfn
-        call    evx_memeq                       # keeps rdx, rsi, r8-r10
+        mov     rdi, qword ptr [rax]
+        mov     rdx, rsi
+        mov     rcx, r10
+        push    rsi
+        mov     rsi, r10
+        call    evx_keq                         # keeps r8 - r10
+        pop     rsi
         test    eax, eax
         jnz     .Lk_pfound
 .Lk_pfn:

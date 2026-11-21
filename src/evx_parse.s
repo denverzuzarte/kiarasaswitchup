@@ -10,7 +10,8 @@
 #      block is a fault-suppressing masked load, so nothing past `end` is read.
 #   2. Exactly 6 commas, quote count == 2 * wrapped fields, else malformed.
 #   3. Empty event_id -> dropped (before dedup).
-#   4. Every other row becomes a 48-byte Cand. All validation (user, ts, window,
+#   4. Every other row becomes a 56-byte Cand with event_id and user_id as
+#      inline 16-byte keys (built while the line is in L1). All validation (user, ts, window,
 #      type, product, price, late rule) is evaluated here, once, as a flag; the
 #      row still competes in dedup whatever the flag says (rules: dedup first).
 #   5. Hash lookups (links, products) run only for rows that are still valid,
@@ -187,12 +188,13 @@ evx_parse_events:
         test    rsi, rsi
         jz      .Lline                  # empty event_id: dropped before dedup
         mov     rdi, qword ptr [rsp + F_EID]
-        call    evx_hash
-        mov     dword ptr [r15 + 12], eax       # eid_h32
-        mov     rax, qword ptr [rsp + F_EID]
+        call    evx_key16                       # inline key from the hot line
         mov     qword ptr [r15], rax
-        mov     eax, dword ptr [rsp + F_EID + 8]
-        mov     dword ptr [r15 + 8], eax
+        mov     qword ptr [r15 + 8], rdx
+        mov     rdi, rax
+        mov     rsi, rdx
+        call    evx_khash
+        mov     dword ptr [r15 + 52], eax       # eid_h32
 
         # ---- ingest_ts (always F1 per rules; defensive) --------------------
         mov     rdi, qword ptr [rsp + F_ING]
@@ -270,55 +272,55 @@ evx_parse_events:
 
         # category (only purchases need one)
         mov     eax, dword ptr [r12 + 48]       # unknown_cat
-        mov     dword ptr [r15 + 36], eax
+        mov     dword ptr [r15 + 48], eax
         cmp     qword ptr [r12 + 32], 0
         je      .Lcat_done
         mov     rdi, qword ptr [rsp + F_PROD]
         mov     rsi, qword ptr [rsp + F_PROD + 8]
-        call    evx_hash
-        mov     r8, rax
+        call    evx_key16
+        mov     rcx, rdx
+        mov     rdx, rax
         mov     rdi, qword ptr [r12 + 32]
         mov     rsi, qword ptr [r12 + 40]
-        mov     rdx, qword ptr [rsp + F_PROD]
-        mov     rcx, qword ptr [rsp + F_PROD + 8]
         call    evx_lookup
         test    rax, rax
         jz      .Lcat_done
-        mov     eax, dword ptr [rax + 24]
-        mov     dword ptr [r15 + 36], eax
+        mov     eax, dword ptr [rax + 16]       # val.k0 = category id
+        mov     dword ptr [r15 + 48], eax
 .Lcat_done:
-        mov     eax, dword ptr [r15 + 36]
+        mov     eax, dword ptr [r15 + 48]
         shl     eax, 24
         or      eax, dword ptr [rsp + L_PRICE]
-        mov     dword ptr [r15 + 36], eax
+        mov     dword ptr [r15 + 48], eax
         jmp     .Lvalid
 
 .Lnonpurchase:
-        mov     dword ptr [r15 + 36], 0
+        mov     dword ptr [r15 + 48], 0
 
         # ---- valid: keep the raw user id; the person is resolved in collect,
         #      for winning copies only -----------------------------------------
 .Lvalid:
-        mov     rdx, qword ptr [rsp + F_USER]
-        mov     qword ptr [r15 + 24], rdx
-        mov     edx, dword ptr [rsp + F_USER + 8]
-        mov     dword ptr [r15 + 32], edx
-        add     r15, 48
+        mov     rdi, qword ptr [rsp + F_USER]
+        mov     rsi, qword ptr [rsp + F_USER + 8]
+        call    evx_key16                       # never null for a non-empty id
+        mov     qword ptr [r15 + 24], rax
+        mov     qword ptr [r15 + 32], rdx
+        add     r15, 56
         jmp     .Lline
 
 .Lbad_ingest:
         movabs  rax, 0x7FFFFFFFFFFFFFFF         # never beats a real copy
         mov     qword ptr [r15 + 16], rax
 .Linvalid:
-        mov     qword ptr [r15 + 24], 0         # user_ptr NULL = invalid copy
-        add     r15, 48
+        mov     qword ptr [r15 + 32], 0         # user.k1 == 0: invalid copy
+        add     r15, 56
         jmp     .Lline
 
 .Ldone:
         mov     rax, r15
         sub     rax, rbx
         xor     edx, edx
-        mov     ecx, 48
+        mov     ecx, 56
         div     rcx                     # Cand count
         add     rsp, FRAME
         pop     r15

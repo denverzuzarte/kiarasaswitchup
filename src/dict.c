@@ -30,23 +30,21 @@ static uint64_t table_size_for(size_t n)
     return s;
 }
 
-/* Insert into a LookupEntry table; returns the entry (existing or new). */
+/* Insert a key into a LookupEntry table; returns the entry (existing or new).
+   Keys are the same Key16 encoding the asm engine probes with. */
 static LookupEntry *table_put(LookupEntry *slots, uint64_t mask,
                               const char *key, uint32_t len, int *inserted)
 {
-    uint64_t h = evx_hash(key, len);
-    uint64_t i = h & mask;
-    uint32_t tag = (uint32_t)(h >> 32);
+    Key16 k = evx_key16(key, len);
+    uint64_t i = evx_khash(k.k0, k.k1) & mask;
     for (;;) {
         LookupEntry *e = &slots[i];
-        if (!e->key) {
-            e->key = key;
-            e->key_len = len;
-            e->key_tag = tag;
+        if (!e->key.k1) {
+            e->key = k;
             *inserted = 1;
             return e;
         }
-        if (e->key_tag == tag && e->key_len == len && memcmp(e->key, key, len) == 0) {
+        if (evx_keq(e->key.k0, e->key.k1, k.k0, k.k1)) {
             *inserted = 0;
             return e;
         }
@@ -188,7 +186,7 @@ int load_products(const char *data_dir, Dict *d)
         int ins;
         LookupEntry *e = table_put(d->prod_slots, d->prod_mask, f[0].ptr, f[0].len, &ins);
         if (ins)
-            e->val_len = (uint32_t)find_cat(d, f[1].ptr, f[1].len);
+            e->val.k0 = (uint64_t)find_cat(d, f[1].ptr, f[1].len);
     }
     return 0;
 }
@@ -226,7 +224,7 @@ static int ids_grow_index(Ids *s)
     for (size_t i = 0; i < s->n; i++) {
         int ins;
         LookupEntry *e = table_put(s->index, s->mask, s->ptr[i], s->len[i], &ins);
-        e->val_len = (uint32_t)i;
+        e->val.k0 = i;
     }
     return 0;
 }
@@ -261,13 +259,13 @@ static int ids_intern(Ids *s, const char *p, uint32_t len, uint32_t *out)
     LookupEntry *e = table_put(s->index, s->mask, p, len, &ins);
     if (ins) {
         uint32_t id = (uint32_t)s->n++;
-        e->val_len = id;
+        e->val.k0 = id;
         s->ptr[id] = p;
         s->len[id] = len;
         s->parent[id] = id;
         s->size[id] = 1;
     }
-    *out = e->val_len;
+    *out = (uint32_t)e->val.k0;
     return 0;
 }
 
@@ -349,9 +347,7 @@ int load_links(const char *data_dir, Dict *d)
         uint32_t m = minid[dsu_find(s.parent, (uint32_t)i)];
         int ins;
         LookupEntry *e = table_put(d->link_slots, d->link_mask, s.ptr[i], s.len[i], &ins);
-        e->val = s.ptr[m];
-        e->val_len = s.len[m];
-        e->val_tag = (uint32_t)(evx_hash(s.ptr[m], s.len[m]) >> 32);
+        e->val = evx_key16(s.ptr[m], s.len[m]);   /* canonical name as a Key16 */
     }
     free(minid);
     free(s.ptr);
@@ -397,7 +393,7 @@ int load_campaigns(const char *data_dir, Dict *d)
         LookupEntry *e = table_put(d->camp_slots, d->camp_mask, f[0].ptr, f[0].len, &ins);
         if (!ins)
             continue;                    /* campaign_id is unique; keep first */
-        e->val_len = d->ncamp;
+        e->val.k0 = d->ncamp;
         d->camp_ids[d->ncamp] = f[0];
         d->camp_channels[d->ncamp] = f[1];
         d->ncamp++;

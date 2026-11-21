@@ -11,7 +11,8 @@
 #   workers insert concurrently without locks. A slot only ever changes from 0
 #   to a key, or between copies of the same key, so there is no ABA hazard.
 #
-# Person table: 16-byte slots {name, len, tag} claimed with `lock cmpxchg16b`.
+# Person table: 16-byte slots holding the canonical name as a Key16, claimed
+#   with `lock cmpxchg16b`; a match is two word compares, no pointer chase.
 #   The slot index *is* the person id. It is sized from an estimate (people are
 #   a few % of events); every claim bumps a shared counter, and past
 #   claim_limit (half the table) evx_collect returns UINT64_MAX so the C side
@@ -22,7 +23,7 @@
         .text
 
         .set    PTRMASK, 0x0000FFFFFFFFFFFF
-        .set    CAND,    48
+        .set    CAND,    56
 
 # ---------------------------------------------------------------------------
 # void evx_dedup_insert(uint64_t *table /*rdi*/, uint64_t size /*rsi*/,
@@ -54,12 +55,12 @@ evx_dedup_insert:
         lea     rax, [r13 + 8*CAND]     # 8 candidates ahead
         cmp     rax, r14
         jae     .Ldi_nopf
-        mov     eax, dword ptr [rax + 12]
+        mov     eax, dword ptr [rax + 52]
         imul    rax, r12
         shr     rax, 32
         prefetchw [rbx + rax*8]
 .Ldi_nopf:
-        mov     eax, dword ptr [r13 + 12]   # eid_h32
+        mov     eax, dword ptr [r13 + 52]   # eid_h32
         mov     r15, rax
         imul    r15, r12
         shr     r15, 32                 # home slot
@@ -80,15 +81,18 @@ evx_dedup_insert:
         jnz     .Ldi_pnext              # tag differs: different id
         mov     r9, rax
         and     r9, rbp                 # resident Cand
-        mov     r10d, dword ptr [r9 + 8]
-        cmp     r10d, dword ptr [r13 + 8]
+        mov     r10, qword ptr [r13 + 8]
+        cmp     qword ptr [r9 + 8], r10 # k1: length + bytes 8..14 (or long tag)
         jne     .Ldi_pnext
-        mov     r8, rax                 # keep slot value (memeq keeps r8)
+        mov     r8, rax                 # keep slot value (keq keeps r8)
         push    rdx
+        push    rcx
         mov     rdi, qword ptr [r9]
-        mov     rsi, qword ptr [r13]
-        mov     rdx, r10
-        call    evx_memeq
+        mov     rsi, r10
+        mov     rdx, qword ptr [r13]
+        mov     rcx, r10
+        call    evx_keq                 # short key: one word compare
+        pop     rcx
         pop     rdx
         test    eax, eax
         mov     rax, r8
@@ -170,30 +174,30 @@ evx_collect:
         movabs  rax, PTRMASK
         and     rcx, rax                    # winner Cand
         mov     qword ptr [rsp + 40], rcx
-        mov     rdi, qword ptr [rcx + 24]   # user_ptr
-        test    rdi, rdi
-        jz      .Lco_slot                   # kept copy is invalid: event dropped
-        mov     esi, dword ptr [rcx + 32]
+        cmp     qword ptr [rcx + 32], 0     # user.k1 == 0: kept copy invalid
+        je      .Lco_slot
+        mov     rdi, qword ptr [rcx + 24]
+        mov     rsi, qword ptr [rcx + 32]
         mov     rdx, qword ptr [rbp + 32]   # link table (may be NULL)
         mov     rcx, qword ptr [rbp + 40]
         call    evx_canon                   # shared with evx_parse_clicks
-        mov     rsi, rax                    # canonical name
-        mov     r11, rcx                    # tag; rdx = len
-.Lco_intern:
-        # rsi = name, edx = len, r11d = tag
-        mov     r10, r11
-        shl     r10, 32
-        or      r10, rdx                    # slot qword 2: tag << 32 | len
-        mov     r9d, r11d
+        mov     rsi, rax                    # person key k0
+        mov     r10, rdx                    # person key k1
+        mov     rdi, rax
+        push    rsi
+        mov     rsi, rdx
+        call    evx_khash
+        pop     rsi
+        mov     r9, rax
         and     r9, r13                     # home slot
 .Lco_probe:
         mov     rax, r9
         shl     rax, 4
         add     rax, r12
-        mov     rdi, qword ptr [rax]
+        mov     rdi, qword ptr [rax + 8]
         test    rdi, rdi
         jnz     .Lco_cmp
-        # claim the empty slot: {0,0} -> {name, tag|len}
+        # claim the empty slot: {0,0} -> {k0, k1}
         mov     r8, rax
         mov     qword ptr [rsp + 48], rbx
         mov     rbx, rsi
@@ -203,12 +207,17 @@ evx_collect:
         lock cmpxchg16b xmmword ptr [r8]
         mov     rbx, qword ptr [rsp + 48]
         jz      .Lco_claimed
-        mov     edx, r10d                   # lost the race: retry this slot
-        jmp     .Lco_probe
+        jmp     .Lco_probe                  # lost the race: re-read this slot
 .Lco_cmp:
-        cmp     qword ptr [rax + 8], r10
+        cmp     rdi, r10
         jne     .Lco_pnext
-        call    evx_memeq                   # (slot name, name, len): keeps rdx..r10
+        mov     rdi, qword ptr [rax]
+        mov     rdx, rsi
+        mov     rcx, r10
+        push    rsi
+        mov     rsi, r10
+        call    evx_keq                     # short key: one word compare
+        pop     rsi
         test    eax, eax
         jnz     .Lco_found
 .Lco_pnext:
@@ -228,7 +237,7 @@ evx_collect:
         mov     rax, qword ptr [rcx + 40]   # ts_off
         mov     qword ptr [r15], rax
         mov     dword ptr [r15 + 8], r9d
-        mov     eax, dword ptr [rcx + 36]   # price_cat
+        mov     eax, dword ptr [rcx + 48]   # price_cat
         mov     dword ptr [r15 + 12], eax
         add     r15, 16
         jmp     .Lco_slot

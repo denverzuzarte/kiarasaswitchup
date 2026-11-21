@@ -173,6 +173,31 @@ int main(void)
         CHECK(evx_memeq(a, b, 64) == 1, "memeq exactly 64");
     }
 
+    /* ---- Key16: inline keys exact, long keys by pointer + hash + bytes */
+    {
+        Key16 a = evx_key16("u1", 2), b = evx_key16(at_page_end("u1"), 2);
+        CHECK(a.k0 == b.k0 && a.k1 == b.k1, "key16 position independent");
+        CHECK((a.k1 >> 56) == 2 && memcmp(&a, "u1", 2) == 0, "key16 holds bytes + len");
+        Key16 c = evx_key16("u1 ", 3), d = evx_key16("u1\0", 3);
+        CHECK(!evx_keq(a.k0, a.k1, c.k0, c.k1), "key16 trailing space differs");
+        CHECK(!evx_keq(c.k0, c.k1, d.k0, d.k1), "key16 NUL vs space differs");
+        Key16 e = evx_key16("abcdefghijklmno", 15), f = evx_key16("abcdefghijklmnp", 15);
+        CHECK(!KEY_LONG(e.k1) && !evx_keq(e.k0, e.k1, f.k0, f.k1), "key16 15 bytes inline, last byte counts");
+        char l1[100], l2[100];
+        memset(l1, 'L', 100);
+        memset(l2, 'L', 100);
+        Key16 g = evx_key16(l1, 100), h = evx_key16(l2, 100);
+        CHECK(KEY_LONG(g.k1) && g.k0 != h.k0, "key16 long keeps pointer");
+        CHECK(evx_keq(g.k0, g.k1, h.k0, h.k1), "key16 long equal by bytes");
+        CHECK(evx_khash(g.k0, g.k1) == evx_khash(h.k0, h.k1), "khash long ignores pointer");
+        l2[99] = 'M';
+        h = evx_key16(l2, 100);
+        CHECK(!evx_keq(g.k0, g.k1, h.k0, h.k1), "key16 long differs");
+        Key16 i16 = evx_key16("abcdefghijklmnop", 16);
+        CHECK(KEY_LONG(i16.k1), "key16 16 bytes is long");
+        CHECK(evx_khash(a.k0, a.k1) != evx_khash(c.k0, c.k1), "khash differs");
+    }
+
     /* ---- evx_memcmp: byte-wise order, shorter prefix first, unsigned bytes */
     {
 #define SGN(x) ((x) > 0 ? 1 : (x) < 0 ? -1 : 0)

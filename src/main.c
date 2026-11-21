@@ -580,7 +580,8 @@ int main(int argc, char **argv)
     uint64_t *offsets = big_alloc((npersons + 1) * sizeof(uint64_t));
     uint64_t *cursor = big_alloc((npersons ? npersons : 1) * sizeof(uint64_t));
     Slice *pnames = malloc((npersons ? npersons : 1) * sizeof *pnames);
-    if (!offsets || !cursor || !pnames) {
+    Key16 *pkeys = malloc((npersons ? npersons : 1) * sizeof *pkeys);
+    if (!offsets || !cursor || !pnames || !pkeys) {
         fprintf(stderr, "out of memory (offsets)\n");
         return 1;
     }
@@ -592,7 +593,14 @@ int main(int argc, char **argv)
                 continue;
             offsets[k] = nvalid;
             cursor[k] = nvalid;
-            pnames[k] = (Slice){persons[p].name, persons[p].len, 0};
+            /* output name: an inline key holds its own bytes (length in byte
+               15); a long key points into the input mapping */
+            pkeys[k] = persons[p];
+            if (KEY_LONG(pkeys[k].k1))
+                pnames[k] = (Slice){(const char *)pkeys[k].k0,
+                                    (uint32_t)((pkeys[k].k1 >> 32) & 0xFFFFFF), 0};
+            else
+                pnames[k] = (Slice){(const char *)&pkeys[k], (uint32_t)(pkeys[k].k1 >> 56), 0};
             nvalid += c;
             if (c > maxn)
                 maxn = c;

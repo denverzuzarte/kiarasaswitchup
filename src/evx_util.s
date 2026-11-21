@@ -3,7 +3,10 @@
 #   evx_hash        64-bit hash of a byte string
 #   evx_memeq       byte equality (internal convention: preserves every GPR
 #                   except rax/r11; clobbers k1, k2, zmm16, zmm17)
-#   evx_lookup      probe of a C-built LookupEntry table
+#   evx_key16       ID -> 16-byte inline key (exact; pointer only for len >= 16)
+#   evx_khash       index hash of a Key16
+#   evx_keq         exact Key16 equality
+#   evx_lookup      probe of a C-built LookupEntry table by Key16
 #   evx_split_line  CSV dialect: split + unquote + validate one line
 #   evx_parse_ts    F1 / F2 / F3 timestamp -> epoch ms
 #
@@ -127,55 +130,164 @@ evx_memeq:
         .size   evx_memeq, .-evx_memeq
 
 # ---------------------------------------------------------------------------
+# Key16 evx_key16(const void *p /*rdi*/, size_t len /*rsi*/) -> rax = k0, rdx = k1
+#   len <= 15: one fault-suppressing masked 16-byte load (bytes stay exact),
+#              length in the top byte of k1.
+#   len >= 16: k0 = pointer, k1 = 0xFF << 56 | len24 << 32 | hash32.
+#   Clobbers rcx, rsi, r8, k1, xmm16 (and rdi on the long path).
+# ---------------------------------------------------------------------------
+        .globl  evx_key16
+        .type   evx_key16, @function
+        .p2align 5
+evx_key16:
+        cmp     rsi, 15
+        ja      .Lk16_long
+        mov     rax, -1
+        bzhi    rax, rax, rsi
+        kmovq   k1, rax
+        vmovdqu8 xmm16{k1}{z}, xmmword ptr [rdi]
+        vmovq   rax, xmm16
+        vpextrq rdx, xmm16, 1
+        shl     rsi, 56
+        or      rdx, rsi
+        ret
+.Lk16_long:
+        push    rdi
+        push    rsi
+        call    evx_hash
+        pop     rsi
+        pop     rdi
+        mov     edx, eax                # hash32
+        mov     ecx, 0xFFFFFF
+        cmp     rsi, rcx
+        cmova   rsi, rcx                # len24
+        shl     rsi, 32
+        or      rdx, rsi
+        movabs  rcx, 0xFF00000000000000
+        or      rdx, rcx
+        mov     rax, rdi
+        ret
+        .size   evx_key16, .-evx_key16
+
+# ---------------------------------------------------------------------------
+# uint64_t evx_khash(uint64_t k0 /*rdi*/, uint64_t k1 /*rsi*/)
+#   Table index hash of a Key16: fmix64(k0 * K ^ k1); a long key hashes k1
+#   only (k0 is a pointer, so equal long ids at different addresses must hash
+#   alike). Clobbers rax and r11 only.
+# ---------------------------------------------------------------------------
+        .globl  evx_khash
+        .type   evx_khash, @function
+        .p2align 5
+evx_khash:
+        mov     rax, rsi
+        shr     rax, 56
+        cmp     eax, 0xFF
+        mov     rax, rdi
+        jne     .Lkh_mix
+        xor     eax, eax
+.Lkh_mix:
+        movabs  r11, 0x9E3779B97F4A7C15
+        imul    rax, r11
+        xor     rax, rsi
+        mov     r11, rax
+        shr     r11, 33
+        xor     rax, r11
+        movabs  r11, 0xFF51AFD7ED558CCD
+        imul    rax, r11
+        mov     r11, rax
+        shr     r11, 33
+        xor     rax, r11
+        movabs  r11, 0xC4CEB9FE1A85EC53
+        imul    rax, r11
+        mov     r11, rax
+        shr     r11, 33
+        xor     rax, r11
+        ret
+        .size   evx_khash, .-evx_khash
+
+# ---------------------------------------------------------------------------
+# int evx_keq(a0 /*rdi*/, a1 /*rsi*/, b0 /*rdx*/, b1 /*rcx*/)
+#   Exact Key16 equality. Preserves every GPR except rax / r11.
+# ---------------------------------------------------------------------------
+        .globl  evx_keq
+        .type   evx_keq, @function
+        .p2align 5
+evx_keq:
+        xor     eax, eax
+        cmp     rsi, rcx
+        jne     .Lkq_out
+        mov     r11, rsi
+        shr     r11, 56
+        cmp     r11d, 0xFF
+        je      .Lkq_long
+        cmp     rdi, rdx
+        sete    al
+.Lkq_out:
+        ret
+.Lkq_long:
+        push    rsi
+        push    rdx
+        mov     r11, rsi
+        shr     r11, 32
+        and     r11d, 0xFFFFFF
+        mov     rsi, rdx
+        mov     rdx, r11
+        call    evx_memeq               # (a ptr, b ptr, len24)
+        pop     rdx
+        pop     rsi
+        ret
+        .size   evx_keq, .-evx_keq
+
+# ---------------------------------------------------------------------------
 # const LookupEntry *evx_lookup(const LookupEntry *slots /*rdi*/, uint64_t mask /*rsi*/,
-#                               const char *key /*rdx*/, size_t len /*rcx*/,
-#                               uint64_t hash /*r8*/)
-#   Linear probing from hash & mask; an entry matches on tag (hash >> 32),
-#   length and bytes. Returns NULL when an empty slot is reached.
-#   Clobbers rax, r9, r10, r11, k1, k2, zmm16, zmm17. Preserves rdi..r8.
+#                               uint64_t k0 /*rdx*/, uint64_t k1 /*rcx*/)
+#   Linear probing from evx_khash & mask. A short key matches with two word
+#   compares inside the 32-byte entry (no pointer chase); a long key falls back
+#   to evx_keq. Returns NULL at an empty slot.
+#   Preserves rdx, rcx; clobbers rax, rdi, rsi, r8 - r11.
 # ---------------------------------------------------------------------------
         .globl  evx_lookup
         .type   evx_lookup, @function
         .p2align 5
 evx_lookup:
-        push    rdi
-        push    rsi
-        push    rdx
-        mov     r9, r8
-        and     r9, rsi                 # idx
-        mov     r10, r8
-        shr     r10, 32                 # tag
-        mov     r11, rdi                # slots
-        mov     rdi, rdx                # key  -> memeq arg a? (b below)
-        mov     rdx, rcx                # len
+        mov     r8, rdi                 # slots
+        mov     r9, rsi                 # mask
+        mov     rdi, rdx
+        mov     rsi, rcx
+        call    evx_khash
+        mov     r10, rax
+        and     r10, r9                 # idx
 .Llk_loop:
-        mov     rax, r9
+        mov     rax, r10
         shl     rax, 5
-        add     rax, r11                # entry
-        cmp     qword ptr [rax], 0
-        je      .Llk_miss
-        cmp     dword ptr [rax + 8], ecx
+        add     rax, r8
+        mov     r11, qword ptr [rax + 8]
+        test    r11, r11
+        jz      .Llk_miss
+        cmp     r11, rcx
         jne     .Llk_next
-        cmp     dword ptr [rax + 12], r10d
-        jne     .Llk_next
+        shr     r11, 56
+        cmp     r11d, 0xFF
+        je      .Llk_longcmp
+        cmp     qword ptr [rax], rdx
+        je      .Llk_hit
+        jmp     .Llk_next
+.Llk_longcmp:
         push    rax
-        push    r11
-        mov     rsi, qword ptr [rax]    # entry key
-        call    evx_memeq               # (key, entry key, len)
-        pop     r11
-        test    eax, eax
+        mov     rdi, qword ptr [rax]
+        mov     rsi, rcx
+        call    evx_keq                 # (entry k0, k1, probe k0, k1)
+        mov     r11d, eax
         pop     rax
+        test    r11d, r11d
         jnz     .Llk_hit
 .Llk_next:
-        inc     r9
-        and     r9, qword ptr [rsp + 8] # mask (saved rsi)
+        inc     r10
+        and     r10, r9
         jmp     .Llk_loop
 .Llk_miss:
         xor     eax, eax
 .Llk_hit:
-        pop     rdx
-        pop     rsi
-        pop     rdi
         ret
         .size   evx_lookup, .-evx_lookup
 

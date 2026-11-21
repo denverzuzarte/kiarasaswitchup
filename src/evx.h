@@ -17,18 +17,30 @@ typedef struct {
 } Slice;
 
 /*
- * Read-only open-addressing table entry built by C, probed by asm.
- * Index = hash & mask, tag = hash >> 32, linear probing, key == NULL is empty.
- *   links:    key = raw user id, val = canonical (smallest) id, val_tag = hash(val) >> 32
- *   products: key = product id,  val_len = category id
+ * Key16: every ID (event, user, product, campaign) as 16 bytes, compared as
+ * two machine words instead of chasing a pointer into the CSV text.
+ *   len <= 15: k0 = bytes 0..7, k1 = bytes 8..14 | len << 56   (exact, inline)
+ *   len >= 16: k0 = pointer to the bytes, k1 = 0xFF << 56 | min(len, 2^24-1) << 32
+ *              | evx_hash32; equality = equal k1 and evx_memeq of the bytes (exact)
+ * k1 == 0 never occurs for a non-empty ID (it marks empty slots / invalid rows).
+ * In memory an inline key holds the name bytes at offset 0 and the length in
+ * byte 15, so output can point straight at it.
  */
 typedef struct {
-    const char *key;      /*  0 */
-    uint32_t key_len;     /*  8 */
-    uint32_t key_tag;     /* 12 */
-    const char *val;      /* 16 */
-    uint32_t val_len;     /* 24 */
-    uint32_t val_tag;     /* 28 */
+    uint64_t k0;
+    uint64_t k1;
+} Key16;
+#define KEY_LONG(k1) (((k1) >> 56) == 0xFF)
+
+/*
+ * Read-only open-addressing table entry built by C, probed by asm.
+ * Index = evx_khash(key) & mask, linear probing, k1 == 0 is empty.
+ *   links:     key = raw user id, val = canonical (smallest) id as a Key16
+ *   products:  val.k0 = category id;  campaigns: val.k0 = campaign id
+ */
+typedef struct {
+    Key16 key;            /*  0 */
+    Key16 val;            /* 16 */
 } LookupEntry;            /* 32 */
 
 /* Context for evx_parse_events (read-only, shared by all workers). */
@@ -44,28 +56,22 @@ typedef struct {
 } ParseCtx;                       /* 56 */
 
 /*
- * One structurally valid event row with a non-empty event_id. 48 bytes.
+ * One structurally valid event row with a non-empty event_id. 56 bytes.
  * Validation (incl. the late rule) is evaluated once at parse time; an invalid
- * row has user_ptr == NULL but still competes in dedup. The person is resolved
+ * row has user.k1 == 0 but still competes in dedup. The person is resolved
  * later, in evx_collect, and only for winning copies.
  */
 typedef struct {
-    const char *eid_ptr;  /*  0 */
-    uint32_t eid_len;     /*  8 */
-    uint32_t eid_h32;     /* 12  low 32 bits of evx_hash(event_id) */
+    Key16 eid;            /*  0 */
     int64_t ingest;       /* 16  epoch ms */
-    const char *user_ptr; /* 24  NULL = this copy fails validation */
-    uint32_t user_len;    /* 32 */
-    uint32_t price_cat;   /* 36  price (24 bits, 0 unless purchase) | cat << 24 */
+    Key16 user;           /* 24  user.k1 == 0: this copy fails validation */
     int64_t ts_off;       /* 40  ts - window_start (valid rows only) */
+    uint32_t price_cat;   /* 48  price (24 bits, 0 unless purchase) | cat << 24 */
+    uint32_t eid_h32;     /* 52  low 32 bits of evx_khash(eid) */
 } Cand;
 
-/* Person table slot (16-byte aligned, claimed with lock cmpxchg16b). */
-typedef struct {
-    const char *name;     /*  0  canonical name; NULL = empty */
-    uint32_t len;         /*  8 */
-    uint32_t tag;         /* 12  evx_hash(name) >> 32 */
-} PersonSlot;
+/* Person table slot: the canonical name as a Key16 (claimed with cmpxchg16b). */
+typedef Key16 PersonSlot;
 
 /* Context for evx_collect. */
 typedef struct {
@@ -118,17 +124,17 @@ typedef struct {
 } Row;
 
 _Static_assert(sizeof(Slice) == 16, "Slice");
+_Static_assert(sizeof(Key16) == 16, "Key16");
 _Static_assert(sizeof(LookupEntry) == 32, "LookupEntry");
 _Static_assert(offsetof(LookupEntry, val) == 16, "LookupEntry.val");
-_Static_assert(offsetof(LookupEntry, val_tag) == 28, "LookupEntry.val_tag");
 _Static_assert(sizeof(ParseCtx) == 56, "ParseCtx");
 _Static_assert(offsetof(ParseCtx, unknown_cat) == 48, "ParseCtx.unknown_cat");
-_Static_assert(sizeof(Cand) == 48, "Cand");
-_Static_assert(offsetof(Cand, eid_h32) == 12, "Cand.eid_h32");
+_Static_assert(sizeof(Cand) == 56, "Cand");
 _Static_assert(offsetof(Cand, ingest) == 16, "Cand.ingest");
-_Static_assert(offsetof(Cand, user_ptr) == 24, "Cand.user_ptr");
-_Static_assert(offsetof(Cand, price_cat) == 36, "Cand.price_cat");
+_Static_assert(offsetof(Cand, user) == 24, "Cand.user");
 _Static_assert(offsetof(Cand, ts_off) == 40, "Cand.ts_off");
+_Static_assert(offsetof(Cand, price_cat) == 48, "Cand.price_cat");
+_Static_assert(offsetof(Cand, eid_h32) == 52, "Cand.eid_h32");
 _Static_assert(sizeof(PersonSlot) == 16, "PersonSlot");
 _Static_assert(sizeof(CollectCtx) == 64, "CollectCtx");
 _Static_assert(offsetof(CollectCtx, claim_limit) == 56, "CollectCtx.claim_limit");
@@ -223,6 +229,9 @@ _Static_assert(offsetof(AttrCtx, hist) == 112, "AttrCtx.hist");
 
 /* ---- assembly entry points (System V AMD64) ---- */
 uint64_t evx_hash(const void *p, size_t len);
+Key16 evx_key16(const void *p, size_t len);        /* returned in rax:rdx */
+uint64_t evx_khash(uint64_t k0, uint64_t k1);       /* table index hash of a Key16 */
+int evx_keq(uint64_t a0, uint64_t a1, uint64_t b0, uint64_t b1);
 int evx_memeq(const void *a, const void *b, size_t len);
 /* 1 = valid line with exactly nfields fields (out[] filled), 0 = malformed */
 int evx_split_line(const char *p, size_t len, uint32_t nfields, Slice *out);
@@ -233,6 +242,7 @@ int evx_parse_ts(const char *p, size_t len, int64_t *out);
 uint64_t evx_parse_events(const ParseCtx *ctx, const char *begin,
                           const char *end, Cand *out);
 /* table has `size` slots (any size < 2^32; index = (eid_h32 * size) >> 32) */
+const LookupEntry *evx_lookup(const LookupEntry *slots, uint64_t mask, uint64_t k0, uint64_t k1);
 void evx_dedup_insert(uint64_t *table, uint64_t size, Cand *c, uint64_t n);
 /* Returns the Win count, or UINT64_MAX when the person table passed
    claim_limit (the caller enlarges it and reruns the whole phase). */
