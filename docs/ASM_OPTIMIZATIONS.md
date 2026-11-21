@@ -84,6 +84,19 @@ A log of every low-level choice in `src/evx_*.s`, why it was made, and what was 
 | 6b.11 | **Per-worker dense (campaign + organic) × day tables**, reduced in C. | No contended atomics on whale campaigns / `organic`. |
 | 6b.12 | `evx_memcmp`: 64-byte masked compares, first difference via `tzcnt` of the not-equal mask, unsigned byte subtract. | Byte-wise `click_id` order without a byte loop. |
 
+## 6c. Round 2: removing the memory stalls (profile-driven)
+
+The profile at 48M showed 45% of user CPU in `evx_memeq` + `evx_lookup`. The cause was not the compares but the pointer chases into the 4 GB of CSV text that each compare needed (cache + TLB misses).
+
+| # | Change | Effect (20M events + 5M clicks) |
+|---|---|---|
+| 6c.1 | **Key16 inline keys** (`evx_key16`, `evx_khash`, `evx_keq`): every ID ≤ 15 bytes is two words (bytes + length in byte 15), exact; ≥ 16 bytes keeps a pointer + len + hash32 and compares bytes (still exact). Used by dedup, collect, the person table, link/product/campaign tables and the click parse. Output names point straight at the inline key. | memeq left the profile; 1.70–1.96 s → 1.41–1.50 s |
+| 6c.2 | **Parallel links build:** all workers parse and intern link IDs into the final lookup table (CAS on `k1` with a BUSY state, dense id per new ID); union-find + smallest name run on dense-id arrays on worker 0 *while the other workers parse events*. | links off the critical path; → 1.21–1.24 s, 7.5 of 8 cores busy |
+| 6c.3 | **Software-pipelined `evx_collect`:** batches of 64 winners in four stages (prefetch Cand → user key + prefetch link entry → canonical key + prefetch person slot and counter → intern/count/emit). | collect 340 → 245 ms; → 1.12–1.17 s |
+| 6c.4 | Tried, no gain, reverted: reusing the dead candidate buffer for `Ev`/rows (kernel time unchanged: only ~60K minor faults, THP + fault-around already work); dedup prefetch distance 16/32 (each `lock cmpxchg` is a full fence, which caps memory-level parallelism). | — |
+
+Next candidates: a partitioned dedup table (each worker owns a cache-sized slice, no atomics); pipelined link/person probes in `evx_parse_clicks`; group events by person earlier to drop the `evx_scatter` pass.
+
 ## 7. OS and memory (C side, in support of the asm)
 
 - **Lazily committed** `MAP_NORESERVE` anonymous buffers sized by worst-case bounds (≥ 8 bytes per candidate row). Untouched pages cost nothing, so no growth or realloc logic is needed in asm.
@@ -112,6 +125,8 @@ A log of every low-level choice in `src/evx_*.s`, why it was made, and what was 
 | dev 1M + 250K clicks (both tables), `make run-dev` | 1.07M + 252K | 117,038 + 27,400 | 93 ms | 24 | 7 | 26 | 1 | 4 | 6 | 6 | 0.4 GiB |
 
 At 48M with clicks, click parse is 470–602 ms and click grouping is 67–142 ms.
+| dev20m 20M events + 5M clicks, Docker 24g, before round 2 | 21.4M cand + 5M clicks | 2.21M + ~28K | 1.70–1.96 s (container 1.83–2.33) | 182–201 | 193–201 | 525–712 | 10–13 | 116–124 | 119–123 | 71–75 | 4.8 GiB |
+| dev20m, after round 2 | same | same | **1.12–1.17 s (container 1.26 s)** | 209–216 | 182–185 | 240–255 | 10–14 | 114–119 | 112–118 | 49–56 | 4.1 GiB |
 
 Worker threads are hard-capped at 8 (`CPU_BUDGET` in `main.c`); average busy cores measured 5.2–6.4. At 20M, kernel time (sys 6–10 s) exceeds user time (8.7–9.2 s): first-touch page faults on the large lazily committed buffers dominate. Pre-faulting per worker or reusing buffers across phases is the next candidate.
 

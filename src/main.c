@@ -1029,6 +1029,7 @@ int main(int argc, char **argv)
             (unsigned long long)sum_user_rev, (unsigned long long)bad_rows);
     fprintf(stderr, "evx: tables dedup_slots=%llu person_slots=%llu person_retries=%u\n",
             (unsigned long long)dsize, (unsigned long long)psize, person_retries);
+    fprintf(stderr, "evx: page faults minor=%ld major=%ld\n", ru.ru_minflt, ru.ru_majflt);
     fprintf(stderr, "evx: cpu user=%.2fs sys=%.2fs avg_cores=%.2f (worker threads=%u + 1 idle coordinator)\n",
             (double)ru.ru_utime.tv_sec + ru.ru_utime.tv_usec / 1e6,
             (double)ru.ru_stime.tv_sec + ru.ru_stime.tv_usec / 1e6, cpu_s / wall_s, nw);
