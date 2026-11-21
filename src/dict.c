@@ -420,6 +420,13 @@ int load_campaigns(const char *data_dir, Dict *d)
  *     val = its component's smallest key.
  */
 #define LINK_BUSY 1ull
+#ifndef LINK_IDBLOCK
+#define LINK_IDBLOCK 1      /* 1: per-thread id blocks; 0: one shared counter */
+#endif
+#define ID_BLOCK 4096
+#if LINK_IDBLOCK
+static __thread uint32_t tl_next, tl_end;   /* this thread's current id block */
+#endif
 
 struct LinkBuild {
     Mapped *files;
@@ -447,7 +454,16 @@ static uint32_t link_intern(LinkBuild *lb, const char *p, uint32_t len)
         if (cur == 0) {
             uint64_t zero = 0;
             if (atomic_compare_exchange_strong(k1p, &zero, LINK_BUSY)) {
+#if LINK_IDBLOCK
+                if (tl_next == tl_end) {    /* one shared atomic per 4096 ids */
+                    tl_next = atomic_fetch_add_explicit(&lb->next_id, ID_BLOCK,
+                                                        memory_order_relaxed);
+                    tl_end = tl_next + ID_BLOCK;
+                }
+                uint32_t id = tl_next++;
+#else
                 uint32_t id = atomic_fetch_add_explicit(&lb->next_id, 1, memory_order_relaxed);
+#endif
                 lb->slots[i].key.k0 = k.k0;
                 lb->slots[i].val.k1 = id;            /* temporary: dense id */
                 lb->dslot[id] = (uint32_t)i;
@@ -522,11 +538,13 @@ int links_plan(const char *data_dir, unsigned workers, LinkBuild **out)
     lb->pairs = big_alloc((pair_off ? pair_off : 1) * sizeof *lb->pairs);
     uint64_t size = table_size_for(lines * 2 + 1);   /* <= 2 ids per line, load <= 0.5 */
     lb->slots = big_alloc(size * sizeof(LookupEntry));
-    lb->dslot = big_alloc((lines * 2 + 1) * sizeof *lb->dslot);
-    lb->dkey = big_alloc((lines * 2 + 1) * sizeof *lb->dkey);
+    /* id space: <= 2 ids per line plus one partly used block per thread */
+    size_t idcap = lines * 2 + 1 + (size_t)(workers + 1) * ID_BLOCK;
+    lb->dslot = big_alloc(idcap * sizeof *lb->dslot);
+    lb->dkey = big_alloc(idcap * sizeof *lb->dkey);
     if (!lb->pairs || !lb->slots || !lb->dslot || !lb->dkey)
         return -1;
-    if (lines * 2 + 1 >= UINT32_MAX)
+    if (idcap >= UINT32_MAX)
         return -1;
     lb->mask = size - 1;
     *out = lb;
@@ -569,6 +587,7 @@ static Slice key_bytes(const Key16 *k)
 int links_finish(LinkBuild *lb, Dict *d)
 {
     /* everything below works on dense ids: arrays of a few MB, cache-friendly */
+    /* with id blocks the id space has gaps (unused block tails): dkey.k1 == 0 */
     uint32_t ids = atomic_load(&lb->next_id);
     uint32_t *parent = malloc(((size_t)ids + 1) * sizeof *parent);
     uint32_t *aux = malloc(((size_t)ids + 1) * sizeof *aux);   /* size, then min id */
@@ -595,8 +614,11 @@ int links_finish(LinkBuild *lb, Dict *d)
     for (uint32_t i = 0; i < ids; i++)
         if (parent[i] == i)
             aux[i] = UINT32_MAX;
-    size_t comps = 0;
+    size_t comps = 0, used = 0;
     for (uint32_t i = 0; i < ids; i++) {
+        if (!lb->dkey[i].k1)
+            continue;                   /* gap */
+        used++;
         uint32_t r = dsu_find(parent, i);
         if (aux[r] == UINT32_MAX) {
             aux[r] = i;
@@ -608,10 +630,11 @@ int links_finish(LinkBuild *lb, Dict *d)
             aux[r] = i;
     }
     for (uint32_t i = 0; i < ids; i++)
-        lb->slots[lb->dslot[i]].val = lb->dkey[aux[dsu_find(parent, i)]];
+        if (lb->dkey[i].k1)
+            lb->slots[lb->dslot[i]].val = lb->dkey[aux[dsu_find(parent, i)]];
     free(parent);
     free(aux);
-    d->link_ids = ids;
+    d->link_ids = used;
     d->link_lines = atomic_load(&lb->lines);
     d->link_dropped = atomic_load(&lb->dropped);
     d->link_components = comps;
@@ -621,3 +644,5 @@ int links_finish(LinkBuild *lb, Dict *d)
     d->nlink_files = lb->nfiles;
     return 0;
 }
+
+uint64_t links_task_pairs(const LinkBuild *lb, size_t task) { return lb->tasks[task].npairs; }

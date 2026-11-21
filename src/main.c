@@ -24,6 +24,7 @@
 #include <unistd.h>
 
 #include "app.h"
+#include "prof.h"
 
 #define MAX_WORKERS 64
 #define CPU_BUDGET 8      /* never run more than 8 worker threads */
@@ -245,12 +246,14 @@ typedef struct {
 
 static void job_links(void *arg, unsigned wid)
 {
-    (void)wid;
     Queue *q = arg;
     LinkBuild *lb = (LinkBuild *)q->ctx;
     size_t i;
-    while ((i = atomic_fetch_add_explicit(&q->next, 1, memory_order_relaxed)) < q->ntasks)
+    while ((i = atomic_fetch_add_explicit(&q->next, 1, memory_order_relaxed)) < q->ntasks) {
+        prof_begin(wid, PH_LINKS);
         links_parse_task(lb, i);
+        prof_end(wid, PH_LINKS, links_task_pairs(lb, i), 1);
+    }
 }
 
 static void job_parse(void *arg, unsigned wid)
@@ -260,28 +263,34 @@ static void job_parse(void *arg, unsigned wid)
     LinkJob *lj = q->ctx2;
     if (wid == 0 && lj) {
         uint64_t a = now_ns();
+        prof_begin(wid, PH_UNIONFIND);
         lj->rc = links_finish(lj->lb, lj->dict);
+        prof_end(wid, PH_UNIONFIND, lj->dict->link_ids, 1);
         lj->ns = now_ns() - a;
     }
     size_t i;
-    while ((i = atomic_fetch_add_explicit(&q->next, 1, memory_order_relaxed)) < q->ntasks)
+    while ((i = atomic_fetch_add_explicit(&q->next, 1, memory_order_relaxed)) < q->ntasks) {
+        prof_begin(wid, PH_PARSE);
         t[i].count = evx_parse_events(q->ctx, t[i].begin, t[i].end, t[i].out);
+        prof_end(wid, PH_PARSE, t[i].count, 1);
+    }
 }
 
 static void job_dedup(void *arg, unsigned wid)
 {
-    (void)wid;
     Queue *q = arg;
     DedupTask *t = q->tasks;
     const uint64_t *size = q->ctx;
     size_t i;
-    while ((i = atomic_fetch_add_explicit(&q->next, 1, memory_order_relaxed)) < q->ntasks)
+    while ((i = atomic_fetch_add_explicit(&q->next, 1, memory_order_relaxed)) < q->ntasks) {
+        prof_begin(wid, PH_DEDUP);
         evx_dedup_insert(q->ctx2, *size, t[i].c, t[i].n);
+        prof_end(wid, PH_DEDUP, t[i].n, 1);
+    }
 }
 
 static void job_collect(void *arg, unsigned wid)
 {
-    (void)wid;
     Queue *q = arg;
     CollectTask *t = q->tasks;
     _Atomic int *overflow = q->ctx2;
@@ -289,8 +298,10 @@ static void job_collect(void *arg, unsigned wid)
     while ((i = atomic_fetch_add_explicit(&q->next, 1, memory_order_relaxed)) < q->ntasks) {
         if (atomic_load_explicit(overflow, memory_order_relaxed))
             break;                      /* the phase will be rerun anyway */
+        prof_begin(wid, PH_COLLECT);
         t[i].count = evx_collect(q->ctx, t[i].slot_begin, t[i].slot_end, t[i].out,
                                  &t[i].occupied);
+        prof_end(wid, PH_COLLECT, t[i].occupied, 1);
         if (t[i].count == UINT64_MAX)
             atomic_store(overflow, 1);
     }
@@ -304,13 +315,15 @@ typedef struct {
 
 static void job_scatter(void *arg, unsigned wid)
 {
-    (void)wid;
     Queue *q = arg;
     CollectTask *t = q->tasks;
     const ScatterArgs *a = q->ctx;
     size_t i;
-    while ((i = atomic_fetch_add_explicit(&q->next, 1, memory_order_relaxed)) < q->ntasks)
+    while ((i = atomic_fetch_add_explicit(&q->next, 1, memory_order_relaxed)) < q->ntasks) {
+        prof_begin(wid, PH_GROUP);
         evx_scatter(t[i].out, t[i].count, a->remap, a->cursor, a->ev);
+        prof_end(wid, PH_GROUP, t[i].count, 1);
+    }
 }
 
 /* P6: sessionize a block, then attribute it while its events are hot */
@@ -322,19 +335,26 @@ static void job_session(void *arg, unsigned wid)
     AttrCtx *actx = &((AttrCtx *)q->ctx)[wid];
     size_t i;
     while ((i = atomic_fetch_add_explicit(&q->next, 1, memory_order_relaxed)) < q->ntasks) {
+        uint64_t nev = ctx->offsets[t[i].pend] - ctx->offsets[t[i].pbegin];
+        prof_begin(wid, PH_SESSION);
         t[i].count = evx_sessionize(ctx, t[i].pbegin, t[i].pend, t[i].out);
+        prof_end(wid, PH_SESSION, nev, 1);
+        prof_begin(wid, PH_ATTR);
         t[i].credits = evx_attribute(actx, t[i].pbegin, t[i].pend);
+        prof_end(wid, PH_ATTR, nev + (actx->coffsets[t[i].pend] - actx->coffsets[t[i].pbegin]), 1);
     }
 }
 
 static void job_parse_clicks(void *arg, unsigned wid)
 {
-    (void)wid;
     Queue *q = arg;
     ClickTask *t = q->tasks;
     size_t i;
-    while ((i = atomic_fetch_add_explicit(&q->next, 1, memory_order_relaxed)) < q->ntasks)
+    while ((i = atomic_fetch_add_explicit(&q->next, 1, memory_order_relaxed)) < q->ntasks) {
+        prof_begin(wid, PH_CPARSE);
         t[i].count = evx_parse_clicks(q->ctx, t[i].begin, t[i].end, t[i].out);
+        prof_end(wid, PH_CPARSE, t[i].count, 1);
+    }
 }
 
 typedef struct {
@@ -345,13 +365,15 @@ typedef struct {
 
 static void job_scatter_clicks(void *arg, unsigned wid)
 {
-    (void)wid;
     Queue *q = arg;
     ClickTask *t = q->tasks;
     const ClickScatterArgs *a = q->ctx;
     size_t i;
-    while ((i = atomic_fetch_add_explicit(&q->next, 1, memory_order_relaxed)) < q->ntasks)
+    while ((i = atomic_fetch_add_explicit(&q->next, 1, memory_order_relaxed)) < q->ntasks) {
+        prof_begin(wid, PH_CGROUP);
         evx_scatter_clicks(t[i].out, t[i].count, a->cursor, a->dst, a->base);
+        prof_end(wid, PH_CGROUP, t[i].count, 1);
+    }
 }
 
 static int64_t floor_div(int64_t a, int64_t b)
@@ -423,6 +445,7 @@ int main(int argc, char **argv)
     if (load_manifest(data_dir, &dict) || load_products(data_dir, &dict) ||
         load_campaigns(data_dir, &dict))
         return 1;
+    prof_init(nw);
     if (pool_init(nw) != 0) {
         fprintf(stderr, "thread pool init failed\n");
         return 1;
@@ -1029,6 +1052,20 @@ int main(int argc, char **argv)
             (unsigned long long)sum_user_rev, (unsigned long long)bad_rows);
     fprintf(stderr, "evx: tables dedup_slots=%llu person_slots=%llu person_retries=%u\n",
             (unsigned long long)dsize, (unsigned long long)psize, person_retries);
+    {
+        double wall[PH_COUNT] = {0};
+        wall[PH_LINKS] = ms(t0, t_dict);
+        wall[PH_PARSE] = ms(t_p1, t_parse);
+        wall[PH_UNIONFIND] = (double)ljob.ns / 1e6;
+        wall[PH_DEDUP] = ms(t_parse, t_dedup);
+        wall[PH_COLLECT] = ms(t_dedup, t_collect);
+        wall[PH_GROUP] = ms(t_prefix, t_scatter);
+        wall[PH_CPARSE] = ms(t_scatter, t_cparse);
+        wall[PH_CGROUP] = ms(t_cparse, t_cgroup);
+        wall[PH_SESSION] = ms(t_cgroup, t_session);
+        wall[PH_ATTR] = 0;
+        prof_report(wall);
+    }
     fprintf(stderr, "evx: page faults minor=%ld major=%ld\n", ru.ru_minflt, ru.ru_majflt);
     fprintf(stderr, "evx: cpu user=%.2fs sys=%.2fs avg_cores=%.2f (worker threads=%u + 1 idle coordinator)\n",
             (double)ru.ru_utime.tv_sec + ru.ru_utime.tv_usec / 1e6,

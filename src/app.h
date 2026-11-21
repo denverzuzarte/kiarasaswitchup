@@ -67,6 +67,7 @@ typedef struct {
 typedef struct LinkBuild LinkBuild;
 int links_plan(const char *data_dir, unsigned workers, LinkBuild **out);
 size_t links_ntasks(const LinkBuild *lb);
+uint64_t links_task_pairs(const LinkBuild *lb, size_t task);
 void links_parse_task(LinkBuild *lb, size_t task);
 int links_finish(LinkBuild *lb, Dict *d);
 

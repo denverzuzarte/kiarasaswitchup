@@ -272,7 +272,13 @@ evx_sort16:
         .set    K_TS,   112
         .set    K_TSV,  128
         .set    K_END,  136
-        .set    KFRAME, 232
+        .set    K_N,    240             # rows in the current batch
+        .set    K_I,    248             # stage loop index
+        .set    K_B0,   256             # [64] key k0 (user, then person)
+        .set    K_B1,   768             # [64] key k1
+        .set    K_BH,   1280            # [64] person slot (-1 = drop)
+        .set    KBATCH, 64
+        .set    KFRAME, 1800
 
         .globl  evx_parse_clicks
         .type   evx_parse_clicks, @function
@@ -290,6 +296,7 @@ evx_parse_clicks:
         mov     r14, rdx                # end
         mov     r15, rcx                # out cursor
         mov     rbx, rcx                # out base
+        mov     qword ptr [rsp + K_N], 0
         mov     eax, 0x0A
         vpbroadcastb zmm20, eax
         mov     eax, 0x2C
@@ -442,24 +449,93 @@ evx_parse_clicks:
         jge     .Lk_line
         sub     rax, qword ptr [r12]
         mov     qword ptr [r15], rax            # k
-        # person: canonical name -> events person table -> dense id
+        # ---- valid row: stage it in the batch; resolve the person later ----
         mov     rdi, qword ptr [rsp + K_USER]
         mov     rsi, qword ptr [rsp + K_USER + 8]
         call    evx_key16                       # from the hot line
+        mov     rcx, qword ptr [rsp + K_N]
+        mov     qword ptr [rsp + K_B0 + rcx*8], rax
+        mov     qword ptr [rsp + K_B1 + rcx*8], rdx
+        mov     r8, qword ptr [r12 + 16]        # link slots
+        test    r8, r8
+        jz      .Lk_nolinkpf
         mov     rdi, rax
         mov     rsi, rdx
+        call    evx_khash
+        and     rax, qword ptr [r12 + 24]
+        shl     rax, 5
+        add     rax, qword ptr [r12 + 16]
+        prefetcht0 [rax]                        # link entry, needed at flush
+.Lk_nolinkpf:
+        mov     rax, qword ptr [rsp + K_CID]
+        mov     qword ptr [r15 + 16], rax
+        mov     eax, dword ptr [rsp + K_CID + 8]
+        mov     dword ptr [r15 + 24], eax
+        mov     dword ptr [r15 + 28], 0
+        add     r15, 32
+        inc     qword ptr [rsp + K_N]
+        cmp     qword ptr [rsp + K_N], KBATCH
+        jb      .Lk_line
+        call    .Lk_flush
+        jmp     .Lk_line
+.Lk_done:
+        cmp     qword ptr [rsp + K_N], 0
+        je      .Lk_done2
+        call    .Lk_flush
+.Lk_done2:
+        mov     rax, r15
+        sub     rax, rbx
+        shr     rax, 5
+        add     rsp, KFRAME
+        pop     r15
+        pop     r14
+        pop     r13
+        pop     r12
+        pop     rbp
+        pop     rbx
+        ret
+
+# local: resolve the staged batch [r15 - n*32, r15) in three stages so the
+# person-table and remap misses of all rows overlap, then compact the kept
+# rows in place. rbp = caller frame (this call pushed a return address).
+# Preserves rbx, r12, r13, r14; updates r15 and K_N.
+.Lk_flush:
+        lea     rbp, [rsp + 8]
+        # stage A: canonical person key; prefetch its person-table slot
+        mov     qword ptr [rbp + K_I], 0
+.Lk_fa:
+        mov     rcx, qword ptr [rbp + K_I]
+        cmp     rcx, qword ptr [rbp + K_N]
+        jae     .Lk_fa_done
+        mov     rdi, qword ptr [rbp + K_B0 + rcx*8]
+        mov     rsi, qword ptr [rbp + K_B1 + rcx*8]
         mov     rdx, qword ptr [r12 + 16]
         mov     rcx, qword ptr [r12 + 24]
         call    evx_canon
-        mov     rsi, rax                        # person key k0
-        mov     r10, rdx                        # person key k1
+        mov     rcx, qword ptr [rbp + K_I]
+        mov     qword ptr [rbp + K_B0 + rcx*8], rax
+        mov     qword ptr [rbp + K_B1 + rcx*8], rdx
         mov     rdi, rax
-        push    rsi
         mov     rsi, rdx
         call    evx_khash
-        pop     rsi
-        mov     r9, rax
-        and     r9, qword ptr [r12 + 56]
+        mov     rcx, qword ptr [rbp + K_I]
+        and     rax, qword ptr [r12 + 56]
+        mov     qword ptr [rbp + K_BH + rcx*8], rax
+        shl     rax, 4
+        add     rax, qword ptr [r12 + 48]
+        prefetcht0 [rax]
+        inc     qword ptr [rbp + K_I]
+        jmp     .Lk_fa
+.Lk_fa_done:
+        # stage B: probe the person table; prefetch the slot's remap entry
+        mov     qword ptr [rbp + K_I], 0
+.Lk_fb:
+        mov     rcx, qword ptr [rbp + K_I]
+        cmp     rcx, qword ptr [rbp + K_N]
+        jae     .Lk_fb_done
+        mov     rsi, qword ptr [rbp + K_B0 + rcx*8]     # person key k0
+        mov     r10, qword ptr [rbp + K_B1 + rcx*8]     # person key k1
+        mov     r9, qword ptr [rbp + K_BH + rcx*8]
         mov     r8, qword ptr [r12 + 48]
 .Lk_pf:
         mov     rax, r9
@@ -467,7 +543,7 @@ evx_parse_clicks:
         add     rax, r8
         mov     rdi, qword ptr [rax + 8]
         test    rdi, rdi
-        jz      .Lk_line                        # no surviving events: drop
+        jz      .Lk_pmiss                       # no surviving events: drop
         cmp     rdi, r10
         jne     .Lk_pfn
         mov     rdi, qword ptr [rax]
@@ -483,30 +559,46 @@ evx_parse_clicks:
         inc     r9
         and     r9, qword ptr [r12 + 56]
         jmp     .Lk_pf
+.Lk_pmiss:
+        mov     r9, -1
+        jmp     .Lk_pstore
 .Lk_pfound:
         mov     rax, qword ptr [r12 + 64]
+        prefetcht0 [rax + r9*4]
+.Lk_pstore:
+        mov     rcx, qword ptr [rbp + K_I]
+        mov     qword ptr [rbp + K_BH + rcx*8], r9
+        inc     qword ptr [rbp + K_I]
+        jmp     .Lk_fb
+.Lk_fb_done:
+        # stage C: dense id, count, compact kept rows in place
+        mov     rax, qword ptr [rbp + K_N]
+        shl     rax, 5
+        mov     rsi, r15
+        sub     rsi, rax                        # batch start (read)
+        mov     rdi, rsi                        # write cursor
+        xor     ecx, ecx
+.Lk_fc:
+        cmp     rcx, qword ptr [rbp + K_N]
+        jae     .Lk_fc_done
+        mov     r9, qword ptr [rbp + K_BH + rcx*8]
+        cmp     r9, -1
+        je      .Lk_fc_next
+        mov     rax, qword ptr [r12 + 64]
         mov     eax, dword ptr [rax + r9*4]     # dense person id
-        mov     dword ptr [r15 + 8], eax
-        mov     rcx, qword ptr [r12 + 72]
-        lock inc dword ptr [rcx + rax*4]
-        mov     rax, qword ptr [rsp + K_CID]
-        mov     qword ptr [r15 + 16], rax
-        mov     eax, dword ptr [rsp + K_CID + 8]
-        mov     dword ptr [r15 + 24], eax
-        mov     dword ptr [r15 + 28], 0
-        add     r15, 32
-        jmp     .Lk_line
-.Lk_done:
-        mov     rax, r15
-        sub     rax, rbx
-        shr     rax, 5
-        add     rsp, KFRAME
-        pop     r15
-        pop     r14
-        pop     r13
-        pop     r12
-        pop     rbp
-        pop     rbx
+        mov     r8, qword ptr [r12 + 72]
+        lock inc dword ptr [r8 + rax*4]
+        vmovdqu64 ymm16, ymmword ptr [rsi]
+        vmovdqu64 ymmword ptr [rdi], ymm16
+        mov     dword ptr [rdi + 8], eax
+        add     rdi, 32
+.Lk_fc_next:
+        add     rsi, 32
+        inc     rcx
+        jmp     .Lk_fc
+.Lk_fc_done:
+        mov     r15, rdi
+        mov     qword ptr [rbp + K_N], 0
         ret
         .size   evx_parse_clicks, .-evx_parse_clicks
 
