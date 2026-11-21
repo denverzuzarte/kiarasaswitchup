@@ -2,3 +2,10 @@ dev
 
 src/*.elf
 src/*.o
+src/*.d
+src/tests/unit
+out/
+scripts/__pycache__/
+dev30m/
+dev20m/
+dev48m/
