@@ -16,6 +16,7 @@
 #include <stdlib.h>
 #include <string.h>
 #include <sys/ioctl.h>
+#include <sys/resource.h>
 #include <sys/syscall.h>
 #include <unistd.h>
 
@@ -35,12 +36,21 @@ typedef struct {
     uint64_t v[NEV];
     uint64_t items;
     uint64_t calls;
+    uint64_t sys_us;      /* kernel time of this thread inside the phase */
 } Acc;
 
 static Acc acc[MAXW][PH_COUNT];
 static __thread int grp_fd = -1;
 static __thread int grp_ok;
 static __thread uint64_t start_v[NEV];
+static __thread uint64_t start_sys;
+
+static uint64_t thread_sys_us(void)
+{
+    struct rusage ru;
+    getrusage(RUSAGE_THREAD, &ru);
+    return (uint64_t)ru.ru_stime.tv_sec * 1000000u + (uint64_t)ru.ru_stime.tv_usec;
+}
 
 static long perf_open(struct perf_event_attr *a, int group)
 {
@@ -100,6 +110,7 @@ void prof_begin(unsigned wid, int phase)
         open_group();
     if (grp_ok)
         read_group(start_v);
+    start_sys = thread_sys_us();
 }
 
 void prof_end(unsigned wid, int phase, uint64_t items, uint64_t calls)
@@ -112,6 +123,7 @@ void prof_end(unsigned wid, int phase, uint64_t items, uint64_t calls)
     for (int i = 0; i < NEV; i++)
         acc[wid][phase].v[i] += v[i] - start_v[i];
     acc[wid][phase].items += items;
+    acc[wid][phase].sys_us += thread_sys_us() - start_sys;
     acc[wid][phase].calls += calls;
 }
 
@@ -121,26 +133,27 @@ void prof_report(const double *wall_ms)
         return;
     fprintf(stderr,
             "\nevx profile (user-space core counters, summed over %u threads)\n"
-            "%-15s %9s %12s %11s %13s %6s %10s %10s %11s %8s\n",
+            "%-15s %9s %12s %11s %13s %6s %10s %10s %11s %8s %9s\n",
             nworkers, "phase", "wall_ms", "items", "cyc/item", "Mcycles", "IPC",
-            "miss/item", "brmiss/it", "max_thr_Mc", "imbal");
+            "miss/item", "brmiss/it", "max_thr_Mc", "imbal", "sys_ms");
     for (int p = 0; p < PH_COUNT; p++) {
-        uint64_t t[NEV] = {0}, items = 0, mx = 0;
+        uint64_t t[NEV] = {0}, items = 0, mx = 0, sys = 0;
         for (unsigned w = 0; w < nworkers; w++) {
             for (int i = 0; i < NEV; i++)
                 t[i] += acc[w][p].v[i];
             items += acc[w][p].items;
+            sys += acc[w][p].sys_us;
             if (acc[w][p].v[0] > mx)
                 mx = acc[w][p].v[0];
         }
         if (!t[0])
             continue;
         double avg = (double)t[0] / nworkers;
-        fprintf(stderr, "%-15s %9.1f %12llu %11.1f %13.1f %6.2f %10.3f %10.3f %11.1f %8.2f\n",
+        fprintf(stderr, "%-15s %9.1f %12llu %11.1f %13.1f %6.2f %10.3f %10.3f %11.1f %8.2f %9.1f\n",
                 phase_name[p], wall_ms ? wall_ms[p] : 0.0, (unsigned long long)items,
                 items ? (double)t[0] / (double)items : 0.0, (double)t[0] / 1e6,
                 (double)t[1] / (double)t[0], items ? (double)t[2] / (double)items : 0.0,
                 items ? (double)t[3] / (double)items : 0.0, (double)mx / 1e6,
-                avg > 0 ? (double)mx / avg : 0.0);
+                avg > 0 ? (double)mx / avg : 0.0, (double)sys / 1000.0);
     }
 }

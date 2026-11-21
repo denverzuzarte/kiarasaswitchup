@@ -57,7 +57,11 @@ int map_file(const char *path, Mapped *m)
         return -1;
     }
     if (st.st_size > 0) {
+#ifdef INPUT_POPULATE
+        void *p = mmap(NULL, (size_t)st.st_size, PROT_READ, MAP_PRIVATE | MAP_POPULATE, fd, 0);
+#else
         void *p = mmap(NULL, (size_t)st.st_size, PROT_READ, MAP_PRIVATE, fd, 0);
+#endif
         if (p == MAP_FAILED) {
             perror(path);
             close(fd);
@@ -87,7 +91,9 @@ void *big_alloc(size_t bytes)
                    MAP_PRIVATE | MAP_ANONYMOUS | MAP_NORESERVE, -1, 0);
     if (p == MAP_FAILED)
         return NULL;
+#ifndef NO_HUGEPAGE
     madvise(p, bytes, MADV_HUGEPAGE);
+#endif
     return p;
 }
 
