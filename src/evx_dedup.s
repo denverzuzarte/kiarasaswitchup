@@ -130,15 +130,30 @@ evx_dedup_insert:
 # uint64_t evx_collect(const CollectCtx *ctx /*rdi*/, uint64_t slot_begin /*rsi*/,
 #                      uint64_t slot_end /*rdx*/, Win *out /*rcx*/,
 #                      uint64_t *occupied /*r8*/)
-# Walks dedup slots [begin, end) sequentially (hardware prefetch friendly) and
-# counts occupied slots (= unique event ids) into *occupied. For each winner
-# that passed validation: resolve the person (link table, else the raw id),
-# intern the canonical name in the person table, `lock inc` its count, and
-# emit a 16-byte Win. Returns the Win count, or UINT64_MAX on table overflow.
+# Walks dedup slots [begin, end) and counts occupied slots (= unique event
+# ids) into *occupied. Every winner that passed validation gets its person
+# resolved (link table, else the raw id), interned in the person table,
+# counted (`lock inc`) and emitted as a 16-byte Win. Returns the Win count, or
+# UINT64_MAX on person-table overflow.
 #
-# Frame: [rsp] slot idx, [8] slot end, [16] out base, [24] occupied count,
-#        [32] occupied ptr, [40] current Cand, [48] saved rbx.
+# Software-pipelined in batches of up to 64 winners, so the random misses of
+# many events are in flight together instead of one dependent chain per event:
+#   stage 1  scan slots, prefetch each winner's Cand
+#   stage 2  read the user key, prefetch its link-table entry
+#   stage 3  resolve the person key, prefetch the person slot and its counter
+#   stage 4  intern (CAS claim / compare), count, emit
+#
+# Frame: [0] slot idx, [8] slot end, [16] out base, [24] occupied count,
+#   [32] occupied ptr, [40] batch size, [48] saved rbx, [56] loop index,
+#   [64 + 8i] Cand*, [576 + 8i] key k0, [1088 + 8i] key k1, [1600 + 8i] slot idx
 # ---------------------------------------------------------------------------
+        .set    B_C,    64
+        .set    B_K0,   576
+        .set    B_K1,   1088
+        .set    B_H,    1600
+        .set    BATCH,  64
+        .set    CFRAME, 2120
+
         .globl  evx_collect
         .type   evx_collect, @function
         .p2align 5
@@ -149,7 +164,7 @@ evx_collect:
         push    r13
         push    r14
         push    r15
-        sub     rsp, 56
+        sub     rsp, CFRAME
         mov     rbp, rdi                    # ctx
         mov     rbx, qword ptr [rdi]        # dedup table
         mov     r12, qword ptr [rdi + 8]    # person table
@@ -161,35 +176,113 @@ evx_collect:
         mov     qword ptr [rsp + 16], rcx
         mov     qword ptr [rsp + 24], 0
         mov     qword ptr [rsp + 32], r8
-.Lco_slot:
+
+.Lco_batch:
+        # ---- stage 1: gather up to 64 winners, prefetch their Cands --------
+        xor     ecx, ecx                    # n
         mov     rax, qword ptr [rsp]
-        cmp     rax, qword ptr [rsp + 8]
-        jae     .Lco_done
-        mov     rcx, qword ptr [rbx + rax*8]
+        mov     rdx, qword ptr [rsp + 8]
+        movabs  r8, PTRMASK
+.Lco_s1:
+        cmp     ecx, BATCH
+        jae     .Lco_s1_done
+        cmp     rax, rdx
+        jae     .Lco_s1_done
+        mov     r9, qword ptr [rbx + rax*8]
         inc     rax
-        mov     qword ptr [rsp], rax
-        test    rcx, rcx
-        jz      .Lco_slot
+        test    r9, r9
+        jz      .Lco_s1
         inc     qword ptr [rsp + 24]
-        movabs  rax, PTRMASK
-        and     rcx, rax                    # winner Cand
+        and     r9, r8
+        prefetcht0 [r9 + 24]
+        prefetcht0 [r9 + 51]
+        mov     qword ptr [rsp + B_C + rcx*8], r9
+        inc     ecx
+        jmp     .Lco_s1
+.Lco_s1_done:
+        mov     qword ptr [rsp], rax
         mov     qword ptr [rsp + 40], rcx
-        cmp     qword ptr [rcx + 32], 0     # user.k1 == 0: kept copy invalid
-        je      .Lco_slot
-        mov     rdi, qword ptr [rcx + 24]
-        mov     rsi, qword ptr [rcx + 32]
-        mov     rdx, qword ptr [rbp + 32]   # link table (may be NULL)
+        test    ecx, ecx
+        jz      .Lco_done
+
+        # ---- stage 2: user key; prefetch its link entry (or person slot) ---
+        mov     qword ptr [rsp + 56], 0
+.Lco_s2:
+        mov     rcx, qword ptr [rsp + 56]
+        cmp     rcx, qword ptr [rsp + 40]
+        jae     .Lco_s2_done
+        mov     r9, qword ptr [rsp + B_C + rcx*8]
+        mov     rsi, qword ptr [r9 + 32]
+        test    rsi, rsi
+        jnz     .Lco_s2_valid
+        mov     qword ptr [rsp + B_C + rcx*8], 0    # kept copy invalid: dropped
+        jmp     .Lco_s2_next
+.Lco_s2_valid:
+        mov     rdi, qword ptr [r9 + 24]
+        mov     qword ptr [rsp + B_K0 + rcx*8], rdi
+        mov     qword ptr [rsp + B_K1 + rcx*8], rsi
+        call    evx_khash                   # clobbers rax, r11
+        mov     rcx, qword ptr [rsp + 56]
+        mov     rdx, qword ptr [rbp + 32]   # link slots
+        test    rdx, rdx
+        jz      .Lco_s2_nolink
+        and     rax, qword ptr [rbp + 40]
+        shl     rax, 5
+        prefetcht0 [rdx + rax]
+        jmp     .Lco_s2_next
+.Lco_s2_nolink:
+        and     rax, r13                    # person key = raw id
+        mov     qword ptr [rsp + B_H + rcx*8], rax
+        shl     rax, 4
+        prefetchw [r12 + rax]
+.Lco_s2_next:
+        inc     qword ptr [rsp + 56]
+        jmp     .Lco_s2
+.Lco_s2_done:
+
+        # ---- stage 3: canonical person key; prefetch person slot + counter -
+        cmp     qword ptr [rbp + 32], 0
+        je      .Lco_s3_done
+        mov     qword ptr [rsp + 56], 0
+.Lco_s3:
+        mov     rcx, qword ptr [rsp + 56]
+        cmp     rcx, qword ptr [rsp + 40]
+        jae     .Lco_s3_done
+        cmp     qword ptr [rsp + B_C + rcx*8], 0
+        je      .Lco_s3_next
+        mov     rdi, qword ptr [rsp + B_K0 + rcx*8]
+        mov     rsi, qword ptr [rsp + B_K1 + rcx*8]
+        mov     rdx, qword ptr [rbp + 32]
         mov     rcx, qword ptr [rbp + 40]
-        call    evx_canon                   # shared with evx_parse_clicks
-        mov     rsi, rax                    # person key k0
-        mov     r10, rdx                    # person key k1
+        call    evx_canon                   # entry prefetched in stage 2
+        mov     rcx, qword ptr [rsp + 56]
+        mov     qword ptr [rsp + B_K0 + rcx*8], rax
+        mov     qword ptr [rsp + B_K1 + rcx*8], rdx
         mov     rdi, rax
-        push    rsi
         mov     rsi, rdx
         call    evx_khash
-        pop     rsi
-        mov     r9, rax
-        and     r9, r13                     # home slot
+        mov     rcx, qword ptr [rsp + 56]
+        and     rax, r13
+        mov     qword ptr [rsp + B_H + rcx*8], rax
+        prefetchw [r14 + rax*4]
+        shl     rax, 4
+        prefetchw [r12 + rax]
+.Lco_s3_next:
+        inc     qword ptr [rsp + 56]
+        jmp     .Lco_s3
+.Lco_s3_done:
+
+        # ---- stage 4: intern, count, emit ---------------------------------
+        mov     qword ptr [rsp + 56], 0
+.Lco_s4:
+        mov     rcx, qword ptr [rsp + 56]
+        cmp     rcx, qword ptr [rsp + 40]
+        jae     .Lco_batch
+        cmp     qword ptr [rsp + B_C + rcx*8], 0
+        je      .Lco_s4_next
+        mov     rsi, qword ptr [rsp + B_K0 + rcx*8]     # person key k0
+        mov     r10, qword ptr [rsp + B_K1 + rcx*8]     # person key k1
+        mov     r9, qword ptr [rsp + B_H + rcx*8]       # home slot
 .Lco_probe:
         mov     rax, r9
         shl     rax, 4
@@ -233,14 +326,18 @@ evx_collect:
         ja      .Lco_overflow
 .Lco_found:
         lock inc dword ptr [r14 + r9*4]
-        mov     rcx, qword ptr [rsp + 40]
+        mov     rcx, qword ptr [rsp + 56]
+        mov     rcx, qword ptr [rsp + B_C + rcx*8]
         mov     rax, qword ptr [rcx + 40]   # ts_off
         mov     qword ptr [r15], rax
         mov     dword ptr [r15 + 8], r9d
         mov     eax, dword ptr [rcx + 48]   # price_cat
         mov     dword ptr [r15 + 12], eax
         add     r15, 16
-        jmp     .Lco_slot
+.Lco_s4_next:
+        inc     qword ptr [rsp + 56]
+        jmp     .Lco_s4
+
 .Lco_overflow:
         mov     r15, -1
 .Lco_done:
@@ -253,7 +350,7 @@ evx_collect:
         sub     rax, qword ptr [rsp + 16]
         shr     rax, 4
 .Lco_ret:
-        add     rsp, 56
+        add     rsp, CFRAME
         pop     r15
         pop     r14
         pop     r13
