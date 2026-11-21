@@ -58,6 +58,18 @@ int load_products(const char *data_dir, Dict *d);
 int load_links(const char *data_dir, Dict *d);
 int load_campaigns(const char *data_dir, Dict *d);
 
+/* Parallel links build (see dict.c): plan -> parse tasks on all workers ->
+   finish (union-find + smallest names) on one worker. */
+typedef struct {
+    const char *begin, *end;
+    uint64_t pair_off, npairs;
+} LinkTask;
+typedef struct LinkBuild LinkBuild;
+int links_plan(const char *data_dir, unsigned workers, LinkBuild **out);
+size_t links_ntasks(const LinkBuild *lb);
+void links_parse_task(LinkBuild *lb, size_t task);
+int links_finish(LinkBuild *lb, Dict *d);
+
 /* byte-wise comparison: memcmp, then shorter first */
 int bytes_cmp(const char *a, size_t al, const char *b, size_t bl);
 

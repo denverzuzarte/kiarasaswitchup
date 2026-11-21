@@ -7,6 +7,7 @@
  */
 #define _GNU_SOURCE
 
+#include <stdatomic.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
@@ -401,5 +402,222 @@ int load_campaigns(const char *data_dir, Dict *d)
     static const char ORGANIC[] = "organic";
     d->camp_ids[d->ncamp] = (Slice){ORGANIC, 7, 0};
     d->camp_channels[d->ncamp] = (Slice){ORGANIC, 7, 0};
+    return 0;
+}
+
+/* ------------------------------------------------------- parallel links
+ *
+ * L1 (all workers, byte-range tasks): split each line, drop malformed ones and
+ *     empty sides, intern both ids into one shared open-addressing table of
+ *     LookupEntry (the final link lookup table itself). A slot is claimed by
+ *     CAS on key.k1 from 0 to LINK_BUSY, then k0 is written and k1 published
+ *     with a release store; a reader that sees LINK_BUSY waits for it. A real
+ *     k1 is never 1 (its top byte is a length or 0xFF). Each task appends its
+ *     (slot a, slot b) pairs to its own buffer.
+ * L2 (one worker): union-find over the integer pairs (union by size, path
+ *     halving) on slot indices; no strings are touched.
+ * L3 (same worker): smallest name per component (byte-wise), then every slot's
+ *     val = its component's smallest key.
+ */
+#define LINK_BUSY 1ull
+
+struct LinkBuild {
+    Mapped *files;
+    int nfiles;
+    LinkTask *tasks;
+    size_t ntasks;
+    uint32_t (*pairs)[2];       /* dense ids */
+    LookupEntry *slots;
+    uint64_t mask;
+    _Atomic uint64_t lines, dropped;
+    _Atomic uint32_t next_id;   /* dense id counter */
+    uint32_t *dslot;            /* dense id -> slot */
+    Key16 *dkey;                /* dense id -> key (cache-friendly copy) */
+};
+
+/* Returns the id's dense number; the claimer assigns it (and records
+   slot + key) before publishing k1, so a finder always sees it. */
+static uint32_t link_intern(LinkBuild *lb, const char *p, uint32_t len)
+{
+    Key16 k = evx_key16(p, len);
+    uint64_t i = evx_khash(k.k0, k.k1) & lb->mask;
+    for (;;) {
+        _Atomic uint64_t *k1p = (_Atomic uint64_t *)&lb->slots[i].key.k1;
+        uint64_t cur = atomic_load_explicit(k1p, memory_order_acquire);
+        if (cur == 0) {
+            uint64_t zero = 0;
+            if (atomic_compare_exchange_strong(k1p, &zero, LINK_BUSY)) {
+                uint32_t id = atomic_fetch_add_explicit(&lb->next_id, 1, memory_order_relaxed);
+                lb->slots[i].key.k0 = k.k0;
+                lb->slots[i].val.k1 = id;            /* temporary: dense id */
+                lb->dslot[id] = (uint32_t)i;
+                lb->dkey[id] = k;
+                atomic_store_explicit(k1p, k.k1, memory_order_release);
+                return id;
+            }
+            cur = zero;
+        }
+        while (cur == LINK_BUSY)
+            cur = atomic_load_explicit(k1p, memory_order_acquire);
+        if (evx_keq(lb->slots[i].key.k0, cur, k.k0, k.k1))
+            return (uint32_t)lb->slots[i].val.k1;
+        i = (i + 1) & lb->mask;
+    }
+}
+
+int links_plan(const char *data_dir, unsigned workers, LinkBuild **out)
+{
+    char dir[4096], path[8192];
+    snprintf(dir, sizeof dir, "%s/links", data_dir);
+    LinkBuild *lb = calloc(1, sizeof *lb);
+    if (!lb)
+        return -1;
+    char **names = NULL;
+    int nf = list_csv(dir, &names);
+    if (nf < 0)
+        nf = 0;
+    lb->files = calloc((size_t)(nf ? nf : 1), sizeof(Mapped));
+    lb->nfiles = nf;
+    size_t bytes = 0, lines = 0;
+    for (int i = 0; i < nf; i++) {
+        snprintf(path, sizeof path, "%s/%s", dir, names[i]);
+        free(names[i]);
+        if (map_file(path, &lb->files[i]) != 0)
+            return -1;
+        bytes += lb->files[i].size;
+        const char *p = lb->files[i].data, *e = p + lb->files[i].size;
+        while (p && p < e) {
+            const char *nl = memchr(p, '\n', (size_t)(e - p));
+            lines++;
+            p = nl ? nl + 1 : e;
+        }
+    }
+    free(names);
+    size_t chunk = bytes / ((size_t)workers * 8) + 1;
+    if (chunk < ((size_t)1 << 18))
+        chunk = (size_t)1 << 18;
+    lb->tasks = calloc((size_t)nf + bytes / chunk + 16, sizeof(LinkTask));
+    size_t pair_off = 0;
+    for (int i = 0; i < nf; i++) {
+        const char *b = lb->files[i].data, *e = b + lb->files[i].size;
+        if (!b)
+            continue;
+        const char *nl = memchr(b, '\n', lb->files[i].size);
+        if (!nl)
+            continue;                        /* header only */
+        for (const char *p = nl + 1; p < e;) {
+            const char *q = p + chunk < e ? p + chunk : e;
+            if (q < e) {
+                const char *n2 = memchr(q, '\n', (size_t)(e - q));
+                q = n2 ? n2 + 1 : e;
+            }
+            LinkTask *t = &lb->tasks[lb->ntasks++];
+            t->begin = p;
+            t->end = q;
+            t->pair_off = pair_off;
+            pair_off += (size_t)(q - p) / 4 + 1;    /* a kept line is >= 4 bytes */
+            p = q;
+        }
+    }
+    lb->pairs = big_alloc((pair_off ? pair_off : 1) * sizeof *lb->pairs);
+    uint64_t size = table_size_for(lines * 2 + 1);   /* <= 2 ids per line, load <= 0.5 */
+    lb->slots = big_alloc(size * sizeof(LookupEntry));
+    lb->dslot = big_alloc((lines * 2 + 1) * sizeof *lb->dslot);
+    lb->dkey = big_alloc((lines * 2 + 1) * sizeof *lb->dkey);
+    if (!lb->pairs || !lb->slots || !lb->dslot || !lb->dkey)
+        return -1;
+    if (lines * 2 + 1 >= UINT32_MAX)
+        return -1;
+    lb->mask = size - 1;
+    *out = lb;
+    return 0;
+}
+
+size_t links_ntasks(const LinkBuild *lb) { return lb->ntasks; }
+
+void links_parse_task(LinkBuild *lb, size_t ti)
+{
+    LinkTask *t = &lb->tasks[ti];
+    const char *p = t->begin;
+    uint64_t n = 0, lines = 0, dropped = 0;
+    Slice f[2];
+    while (p < t->end) {
+        const char *nl = memchr(p, '\n', (size_t)(t->end - p));
+        const char *e = nl ? nl : t->end;
+        lines++;
+        if (!evx_split_line(p, (size_t)(e - p), 2, f) || f[0].len == 0 || f[1].len == 0) {
+            dropped++;
+        } else {
+            lb->pairs[t->pair_off + n][0] = link_intern(lb, f[0].ptr, f[0].len);
+            lb->pairs[t->pair_off + n][1] = link_intern(lb, f[1].ptr, f[1].len);
+            n++;
+        }
+        p = nl ? nl + 1 : t->end;
+    }
+    t->npairs = n;
+    atomic_fetch_add(&lb->lines, lines);
+    atomic_fetch_add(&lb->dropped, dropped);
+}
+
+static Slice key_bytes(const Key16 *k)
+{
+    if (KEY_LONG(k->k1))
+        return (Slice){(const char *)k->k0, (uint32_t)((k->k1 >> 32) & 0xFFFFFF), 0};
+    return (Slice){(const char *)k, (uint32_t)(k->k1 >> 56), 0};
+}
+
+int links_finish(LinkBuild *lb, Dict *d)
+{
+    /* everything below works on dense ids: arrays of a few MB, cache-friendly */
+    uint32_t ids = atomic_load(&lb->next_id);
+    uint32_t *parent = malloc(((size_t)ids + 1) * sizeof *parent);
+    uint32_t *aux = malloc(((size_t)ids + 1) * sizeof *aux);   /* size, then min id */
+    if (!parent || !aux)
+        return -1;
+    for (uint32_t i = 0; i < ids; i++) {
+        parent[i] = i;
+        aux[i] = 1;
+    }
+    for (size_t ti = 0; ti < lb->ntasks; ti++) {
+        const LinkTask *t = &lb->tasks[ti];
+        for (uint64_t j = 0; j < t->npairs; j++) {
+            uint32_t a = dsu_find(parent, lb->pairs[t->pair_off + j][0]);
+            uint32_t b = dsu_find(parent, lb->pairs[t->pair_off + j][1]);
+            if (a == b)
+                continue;
+            if (aux[a] < aux[b]) {
+                uint32_t x = a; a = b; b = x;
+            }
+            parent[b] = a;
+            aux[a] += aux[b];
+        }
+    }
+    for (uint32_t i = 0; i < ids; i++)
+        if (parent[i] == i)
+            aux[i] = UINT32_MAX;
+    size_t comps = 0;
+    for (uint32_t i = 0; i < ids; i++) {
+        uint32_t r = dsu_find(parent, i);
+        if (aux[r] == UINT32_MAX) {
+            aux[r] = i;
+            comps++;
+            continue;
+        }
+        Slice x = key_bytes(&lb->dkey[i]), m = key_bytes(&lb->dkey[aux[r]]);
+        if (bytes_cmp(x.ptr, x.len, m.ptr, m.len) < 0)
+            aux[r] = i;
+    }
+    for (uint32_t i = 0; i < ids; i++)
+        lb->slots[lb->dslot[i]].val = lb->dkey[aux[dsu_find(parent, i)]];
+    free(parent);
+    free(aux);
+    d->link_ids = ids;
+    d->link_lines = atomic_load(&lb->lines);
+    d->link_dropped = atomic_load(&lb->dropped);
+    d->link_components = comps;
+    d->link_slots = ids ? lb->slots : NULL;
+    d->link_mask = ids ? lb->mask : 0;
+    d->link_files = lb->files;
+    d->nlink_files = lb->nfiles;
     return 0;
 }

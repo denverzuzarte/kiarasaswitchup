@@ -232,11 +232,37 @@ typedef struct {
     void *ctx2;
 } Queue;
 
-static void job_parse(void *arg, unsigned wid)
+/* Links are only needed from P3 on, so worker 0 runs the (integer-only)
+   union-find + smallest-name pass while the other workers start parsing
+   events; it joins the parse queue after.
+   Still exactly the pool's threads: no extra thread, no oversubscription. */
+typedef struct {
+    Dict *dict;
+    LinkBuild *lb;
+    int rc;
+    uint64_t ns;
+} LinkJob;
+
+static void job_links(void *arg, unsigned wid)
 {
     (void)wid;
     Queue *q = arg;
+    LinkBuild *lb = (LinkBuild *)q->ctx;
+    size_t i;
+    while ((i = atomic_fetch_add_explicit(&q->next, 1, memory_order_relaxed)) < q->ntasks)
+        links_parse_task(lb, i);
+}
+
+static void job_parse(void *arg, unsigned wid)
+{
+    Queue *q = arg;
     ParseTask *t = q->tasks;
+    LinkJob *lj = q->ctx2;
+    if (wid == 0 && lj) {
+        uint64_t a = now_ns();
+        lj->rc = links_finish(lj->lb, lj->dict);
+        lj->ns = now_ns() - a;
+    }
     size_t i;
     while ((i = atomic_fetch_add_explicit(&q->next, 1, memory_order_relaxed)) < q->ntasks)
         t[i].count = evx_parse_events(q->ctx, t[i].begin, t[i].end, t[i].out);
@@ -395,8 +421,21 @@ int main(int argc, char **argv)
     /* ---- P0: manifest, products, links ---------------------------------- */
     static Dict dict;
     if (load_manifest(data_dir, &dict) || load_products(data_dir, &dict) ||
-        load_links(data_dir, &dict) || load_campaigns(data_dir, &dict))
+        load_campaigns(data_dir, &dict))
         return 1;
+    if (pool_init(nw) != 0) {
+        fprintf(stderr, "thread pool init failed\n");
+        return 1;
+    }
+    /* P0b: link files parsed and interned by all workers */
+    LinkBuild *lbuild = NULL;
+    if (links_plan(data_dir, nw, &lbuild) != 0)
+        return 1;
+    {
+        Queue lq = {.ntasks = links_ntasks(lbuild), .ctx = lbuild};
+        atomic_init(&lq.next, 0);
+        pool_run(job_links, &lq);
+    }
     uint64_t t_dict = now_ns();
 
     /* ---- event files -> newline-aligned byte-range tasks ----------------- */
@@ -461,11 +500,6 @@ int main(int argc, char **argv)
         }
     }
 
-    if (pool_init(nw) != 0) {
-        fprintf(stderr, "thread pool init failed\n");
-        return 1;
-    }
-
     /* ---- P1: parse --------------------------------------------------------- */
     ParseCtx pctx = {
         .window_start = dict.window_start,
@@ -476,10 +510,13 @@ int main(int argc, char **argv)
         .prod_mask = dict.prod_mask,
         .unknown_cat = dict.unknown_cat,
     };
-    Queue q = {.ntasks = nptasks, .tasks = ptasks, .ctx = &pctx};
+    LinkJob ljob = {.dict = &dict, .lb = lbuild};
+    Queue q = {.ntasks = nptasks, .tasks = ptasks, .ctx = &pctx, .ctx2 = &ljob};
     atomic_init(&q.next, 0);
     uint64_t t_p1 = now_ns();
     pool_run(job_parse, &q);
+    if (ljob.rc != 0)
+        return 1;
     uint64_t t_parse = now_ns();
     uint64_t ncand = 0;
     for (size_t i = 0; i < nptasks; i++)
@@ -964,7 +1001,7 @@ int main(int argc, char **argv)
             "evx: products=%zu categories=%u link_ids=%zu link_lines=%zu dropped=%zu components=%zu\n"
             "evx: candidates=%llu unique_ids=%llu duplicates=%llu valid_events=%llu persons=%llu max_person=%llu\n"
             "evx: sessions=%llu rows=%llu peak_rss=%ld MiB\n"
-            "evx: ms dict=%.1f map+plan=%.1f parse=%.1f dedup=%.1f collect=%.1f prefix=%.1f "
+            "evx: ms dict=%.1f (link union-find %.1f, overlapped with parse) map+plan=%.1f parse=%.1f dedup=%.1f collect=%.1f prefix=%.1f "
             "group=%.1f session=%.1f parquet=%.1f total=%.1f\n",
             nw, nfiles, total_bytes, nptasks, dict.product_count, dict.ncats, dict.link_ids,
             dict.link_lines, dict.link_dropped, dict.link_components,
@@ -972,7 +1009,7 @@ int main(int argc, char **argv)
             (unsigned long long)(ncand - nunique), (unsigned long long)nvalid,
             (unsigned long long)npersons, (unsigned long long)maxn,
             (unsigned long long)sum_sessions, (unsigned long long)nrows, ru.ru_maxrss / 1024,
-            ms(t0, t_dict), ms(t_dict, t_p1), ms(t_p1, t_parse), ms(t_parse, t_dedup),
+            ms(t0, t_dict), (double)ljob.ns / 1e6, ms(t_dict, t_p1), ms(t_p1, t_parse), ms(t_parse, t_dedup),
             ms(t_dedup, t_collect), ms(t_collect, t_prefix), ms(t_prefix, t_scatter),
             ms(t_cgroup, t_session), ms(t_session, t_end), ms(t0, t_end));
     double cpu_s = (double)ru.ru_utime.tv_sec + ru.ru_utime.tv_usec / 1e6 +
