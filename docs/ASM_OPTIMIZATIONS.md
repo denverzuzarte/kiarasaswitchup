@@ -97,6 +97,24 @@ The profile at 48M showed 45% of user CPU in `evx_memeq` + `evx_lookup`. The cau
 
 Next candidates: a partitioned dedup table (each worker owns a cache-sized slice, no atomics); pipelined link/person probes in `evx_parse_clicks`; group events by person earlier to drop the `evx_scatter` pass.
 
+## 6d. Round 3: per-segment cycle profiling and variant binaries
+
+Method: `EVX_PROFILE=1` (src/prof.c) reads per-thread user-space hardware counters around every task. `make variant NAME=x VDEFS=.. VASDEFS=..` builds alternative implementations of one segment from the same sources, and `make profile BIN=build/x/main DEV=..` profiles them. Host: AMD Ryzen 7 9700X (Zen 5). The scorer is Intel Cascade Lake, so absolute cycle counts there will differ.
+
+Cycles per item, summed over 8 threads (20M events / 5M clicks, and 60M / 15M):
+
+| Segment | Item | Before | Variant(s) tried | After (20M) | After (60M) | Kept |
+|---|---|---|---|---|---|---|
+| links parse | link line | 1,720–1,830 (10.8 misses) | per-thread ID blocks vs shared atomic counter | **673–884** (2.8 misses) | 671 | ID blocks |
+| click parse | valid click | 926–1,230 (IPC 0.48) | batch-64 pipeline (prefetch link entry → person slot → remap) vs serial | **532–584** (IPC 1.0–1.16) | 503 | pipeline |
+| dedup | candidate | 336 (IPC 0.10) | partitioned private L1/L2 tables, no atomics (`DEDUP_PART=1`) | local dedup 94, but partition pass +44 and parse +47 → wall 1,163 vs 1,136 ms | — | **global CAS** (faster here) |
+| group events | event | 180–217 (IPC 0.06) | batch-16: prefetch remap → prefetchw cursor → xadd → prefetchw dest | 152–187 | 237 | batched |
+| collect | winner | 350–466 | batch size 16 / 32 / 64 / 128 | 376–399, all within noise | 372 | 64 |
+| event parse | row | 238–258 (IPC 2.2–2.4) | — (compute-bound) | 252 | 237 | — |
+| sessionize / attribute | event | 77–86 / 74–90 | — | 77 / 74 | 67 / 63 | — |
+
+At 60M the wall times on this host are dominated by I/O: the 5.4 GB input doesn't stay in the 15 GB machine's page cache (major faults), so event parse waits on disk. The cycle counts are still valid.
+
 ## 7. OS and memory (C side, in support of the asm)
 
 - **Lazily committed** `MAP_NORESERVE` anonymous buffers sized by worst-case bounds (≥ 8 bytes per candidate row). Untouched pages cost nothing, so no growth or realloc logic is needed in asm.
