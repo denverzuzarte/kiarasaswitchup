@@ -1,10 +1,12 @@
 #!/usr/bin/env python3
 """
-Independent, deliberately naive Python implementation of the events-side rules
-(The rules.md), used only for differential testing of the asm engine.
+Independent, deliberately naive Python implementation of The rules.md (events,
+links, clicks with real dedup, credit, assists), used only for differential
+testing of the asm engine.
 
-  reference_events.py DATA_DIR OUT_CSV
+  reference_events.py DATA_DIR OUT_DIR     -> OUT_DIR/user_daily.csv, campaign_daily.csv
 """
+import bisect
 import calendar
 import os
 import re
@@ -144,16 +146,20 @@ def main():
         per.setdefault(person(user), []).append((t, cents, cat.get(prod, b"unknown")))
 
     rows = []
+    sessions = {}          # person -> [[start, revenue]]
     for p, evs in per.items():
         evs.sort(key=lambda e: e[0])
         days = {}
         prev = None
         cur = None
+        plist = sessions.setdefault(p, [])
         for t, cents, c in evs:
             if prev is None or t - prev > 1_800_000:
                 d = t // DAY
                 cur = days.setdefault(d, {"s": 0, "e": 0, "r": 0, "c": {}})
                 cur["s"] += 1
+                plist.append([t, 0])
+            plist[-1][1] += cents
             prev = t
             cur["e"] += 1
             if cents:
@@ -168,12 +174,69 @@ def main():
 
     import datetime
     epoch = datetime.date(1970, 1, 1)
-    with open(out, "w", encoding="utf-8", errors="surrogateescape", newline="") as f:
+    def q(x):
+        return '"' + x.replace('"', '""') + '"' if any(ch in x for ch in ',"\n\r') else x
+
+    os.makedirs(out, exist_ok=True)
+    with open(os.path.join(out, "user_daily.csv"), "w", encoding="utf-8",
+              errors="surrogateescape", newline="") as f:
         f.write("user_id,day,sessions,events,revenue_cents,top_category\n")
-        for u, d, s, e, r, top in rows:
-            def q(x):
-                return '"' + x.replace('"', '""') + '"' if any(ch in x for ch in ',"\n\r') else x
-            f.write(f"{q(u)},{epoch + datetime.timedelta(days=d)},{s},{e},{r},{q(top)}\n")
+        for u, d, s_, e, r, top in rows:
+            f.write(f"{q(u)},{epoch + datetime.timedelta(days=d)},{s_},{e},{r},{q(top)}\n")
+
+    # ---- clicks ---------------------------------------------------------------
+    camp = {}
+    for line in data_lines(os.path.join(data, "campaigns.csv")):
+        f = split(line, 2)
+        if f and f[0] not in camp:
+            camp[f[0]] = f[1]
+    W7 = 7 * DAY
+    seen = {}
+    for path in csvs(os.path.join(data, "clicks")):
+        for line in data_lines(path):
+            f = split(line, 4)
+            if not f or not f[0]:
+                continue
+            seen.setdefault(f[0], f)          # dedup: copies are identical, keep one
+    pclicks = {}
+    for cid, user, cmp_, ts in seen.values():
+        if not user or cmp_ not in camp:
+            continue
+        t = parse_ts(ts)
+        if t is None or not (ws - W7 <= t < we):
+            continue
+        pclicks.setdefault(person(user), []).append((t, cid, cmp_))
+    agg = {}
+
+    def cell(c, d):
+        return agg.setdefault((c, d), [0, 0, 0, 0])   # sessions, purchasing, revenue, assisted
+
+    for p, slist in sessions.items():
+        cl = sorted(pclicks.get(p, []))
+        keys = [c[0] for c in cl]
+        for start, revenue in slist:
+            d = start // DAY
+            lo = bisect.bisect_left(keys, start - W7)
+            hi = bisect.bisect_right(keys, start)
+            window = cl[lo:hi]
+            if window:
+                top_t = window[-1][0]
+                credited = min((c for c in window if c[0] == top_t), key=lambda c: c[1])[2]
+                for c in {c[2] for c in window}:
+                    cell(c, d)[3] += 1
+            else:
+                credited = b"organic"
+            x = cell(credited, d)
+            x[0] += 1
+            x[1] += revenue > 0
+            x[2] += revenue
+    with open(os.path.join(out, "campaign_daily.csv"), "w", encoding="utf-8",
+              errors="surrogateescape", newline="") as f:
+        f.write("campaign_id,channel,day,sessions,purchasing_sessions,revenue_cents,assisted_sessions\n")
+        for (c, d), (s_, pu, r, a) in agg.items():
+            ch = b"organic" if c == b"organic" else camp[c]
+            dec = lambda b: b.decode("utf-8", "surrogateescape")
+            f.write(f"{q(dec(c))},{q(dec(ch))},{epoch + datetime.timedelta(days=d)},{s_},{pu},{r},{a}\n")
 
 
 if __name__ == "__main__":

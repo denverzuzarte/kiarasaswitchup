@@ -173,6 +173,27 @@ int main(void)
         CHECK(evx_memeq(a, b, 64) == 1, "memeq exactly 64");
     }
 
+    /* ---- evx_memcmp: byte-wise order, shorter prefix first, unsigned bytes */
+    {
+#define SGN(x) ((x) > 0 ? 1 : (x) < 0 ? -1 : 0)
+        struct { const char *a, *b; int want; } mc[] = {
+            {"c10", "c9", -1}, {"C1", "c1", -1}, {" c", "c", -1}, {"c", "c1", -1},
+            {"c1", "c", 1}, {"abc", "abc", 0}, {"", "", 0}, {"", "a", -1},
+            {"\xc3\xa9", "z", 1}, {"\x7f", "\x80", -1}, {"k1", "k1 ", -1},
+        };
+        for (size_t i = 0; i < sizeof mc / sizeof mc[0]; i++) {
+            int r = evx_memcmp(mc[i].a, strlen(mc[i].a), mc[i].b, strlen(mc[i].b));
+            CHECK(SGN(r) == mc[i].want, "memcmp '%s' '%s' -> %d want %d", mc[i].a, mc[i].b, r, mc[i].want);
+        }
+        char a[200], b[200];
+        memset(a, 'x', 200);
+        memset(b, 'x', 200);
+        CHECK(evx_memcmp(a, 200, b, 200) == 0, "memcmp long eq");
+        b[130] = 'y';
+        CHECK(evx_memcmp(a, 200, b, 200) < 0, "memcmp long lt");
+        CHECK(evx_memcmp(a, 150, b, 120) > 0, "memcmp long prefix");
+    }
+
     printf("%d/%d checks passed\n", total - fails, total);
     return fails != 0;
 }

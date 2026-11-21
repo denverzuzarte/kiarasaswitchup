@@ -31,7 +31,7 @@ PY       ?= python3
 
 export IMAGE CPUS MEM PLATFORM
 
-.PHONY: all build fixtures dev run-dev run-native fuzz-data check-reference check-dev check-dev-events clean clean-out clean-dataset unit check-fixtures
+.PHONY: all build fixtures fixtures-native dev run-dev run-native fuzz-data check-reference check-dev check-dev-events clean clean-out clean-dataset unit check-fixtures
 
 # Plain `make` builds the native executable. `make build` also builds its image.
 all: $(TARGET)
@@ -57,7 +57,11 @@ build: $(TARGET)
 
 # Run all hand-written edge-case fixtures through the image.
 fixtures: build
-	python3 scripts/run_fixtures.py $(FIXTURES) -- scripts/docker_run.sh
+	$(PY) scripts/run_fixtures.py $(FIXTURES) -- scripts/docker_run.sh
+
+# Same official harness (both tables), native binary, no Docker.
+fixtures-native: $(TARGET)
+	$(PY) scripts/run_fixtures.py $(FIXTURES) -- ./$(TARGET)
 
 # Generate a dataset (requires `generate` on PATH). Defaults = the public 1M dev set;
 # e.g. `make dev DEV=dev30m EVENTS=30000000 CLICKS=7500000`.
@@ -70,7 +74,7 @@ run-dev: build
 
 # Compare the previous run's Parquet output with dev-answer/.
 check-dev:
-	python3 scripts/compare.py out $(ANSWER)
+	$(PY) scripts/compare.py out $(ANSWER)
 
 # Compare out/user_daily with $(ANSWER) (events-only build: no campaign_daily).
 check-dev-events:
@@ -86,9 +90,9 @@ fuzz-data:
 
 # Independent Python implementation of the rules on $(DEV), compared with out/.
 check-reference:
-	rm -rf out-ref && mkdir -p out-ref
-	$(PY) scripts/reference_events.py $(DEV) out-ref/user_daily.csv
-	cd scripts && $(PY) check_events.py --compare ../out ../out-ref
+	rm -rf out-ref
+	$(PY) scripts/reference_events.py $(DEV) out-ref
+	cd scripts && $(PY) compare.py ../out ../out-ref
 
 # Unit tests of the assembly primitives (not part of src/main).
 UNIT := src/tests/unit

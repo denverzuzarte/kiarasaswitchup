@@ -215,7 +215,14 @@ typedef struct {
     uint64_t pbegin, pend;
     Row *out;
     uint64_t count;
+    uint64_t credits;   /* sessions credited to a non-organic campaign */
 } SessTask;
+
+typedef struct {
+    const char *begin, *end;
+    ClickCand *out;
+    uint64_t count;
+} ClickTask;
 
 typedef struct {
     _Atomic size_t next;
@@ -280,14 +287,73 @@ static void job_scatter(void *arg, unsigned wid)
         evx_scatter(t[i].out, t[i].count, a->remap, a->cursor, a->ev);
 }
 
+/* P6: sessionize a block, then attribute it while its events are hot */
 static void job_session(void *arg, unsigned wid)
 {
     Queue *q = arg;
     SessTask *t = q->tasks;
     SessCtx *ctx = &((SessCtx *)q->ctx2)[wid];
+    AttrCtx *actx = &((AttrCtx *)q->ctx)[wid];
+    size_t i;
+    while ((i = atomic_fetch_add_explicit(&q->next, 1, memory_order_relaxed)) < q->ntasks) {
+        t[i].count = evx_sessionize(ctx, t[i].pbegin, t[i].pend, t[i].out);
+        t[i].credits = evx_attribute(actx, t[i].pbegin, t[i].pend);
+    }
+}
+
+static void job_parse_clicks(void *arg, unsigned wid)
+{
+    (void)wid;
+    Queue *q = arg;
+    ClickTask *t = q->tasks;
     size_t i;
     while ((i = atomic_fetch_add_explicit(&q->next, 1, memory_order_relaxed)) < q->ntasks)
-        t[i].count = evx_sessionize(ctx, t[i].pbegin, t[i].pend, t[i].out);
+        t[i].count = evx_parse_clicks(q->ctx, t[i].begin, t[i].end, t[i].out);
+}
+
+typedef struct {
+    uint64_t *cursor;
+    ClickEv *dst;
+    const ClickCand *base;
+} ClickScatterArgs;
+
+static void job_scatter_clicks(void *arg, unsigned wid)
+{
+    (void)wid;
+    Queue *q = arg;
+    ClickTask *t = q->tasks;
+    const ClickScatterArgs *a = q->ctx;
+    size_t i;
+    while ((i = atomic_fetch_add_explicit(&q->next, 1, memory_order_relaxed)) < q->ntasks)
+        evx_scatter_clicks(t[i].out, t[i].count, a->cursor, a->dst, a->base);
+}
+
+static int64_t floor_div(int64_t a, int64_t b)
+{
+    int64_t q = a / b;
+    return (a % b != 0 && (a < 0) != (b < 0)) ? q - 1 : q;
+}
+
+/* Map every *.csv in dir; returns file count (0 if the dir is missing). */
+static int map_dir(const char *dir, Mapped **out, size_t *total)
+{
+    char path[8192];
+    char **names = NULL;
+    int n = list_csv(dir, &names);
+    if (n < 0)
+        n = 0;
+    Mapped *files = calloc((size_t)(n ? n : 1), sizeof *files);
+    *total = 0;
+    for (int i = 0; i < n; i++) {
+        snprintf(path, sizeof path, "%s/%s", dir, names[i]);
+        free(names[i]);
+        if (map_file(path, &files[i]) != 0)
+            return -1;
+        *total += files[i].size;
+    }
+    free(names);
+    *out = files;
+    return n;
 }
 
 static unsigned worker_count(void)
@@ -329,7 +395,7 @@ int main(int argc, char **argv)
     /* ---- P0: manifest, products, links ---------------------------------- */
     static Dict dict;
     if (load_manifest(data_dir, &dict) || load_products(data_dir, &dict) ||
-        load_links(data_dir, &dict))
+        load_links(data_dir, &dict) || load_campaigns(data_dir, &dict))
         return 1;
     uint64_t t_dict = now_ns();
 
@@ -537,8 +603,9 @@ int main(int argc, char **argv)
     /* names now live in pnames (pointing into the input mappings): the
        candidate store, dedup table and person table are no longer needed */
     big_free(dedup, dsize * sizeof(uint64_t));
-    big_free((void *)persons, psize * sizeof *persons);
     big_free(cands, cand_bytes);
+    /* the person table and counts[] (now slot -> dense remap) stay alive
+       until the click parse has resolved every click's person */
     uint64_t t_prefix = now_ns();
 
     /* ---- P5: group events by person ---------------------------------------- */
@@ -552,9 +619,122 @@ int main(int argc, char **argv)
     atomic_init(&q.next, 0);
     pool_run(job_scatter, &q);
     big_free(wins, dsize * sizeof(Win));
-    big_free(counts, psize * sizeof *counts);
     big_free(cursor, (npersons ? npersons : 1) * sizeof(uint64_t));
     uint64_t t_scatter = now_ns();
+
+    /* ---- C1: parse clicks ----------------------------------------------------
+     * Every failing row is dropped at parse (copies of a click are identical,
+     * so no click dedup is needed); clicks of people without surviving events
+     * are dropped too (they have no sessions to credit or assist). */
+    const int64_t W7 = 604800000;
+    char ckdir[4096];
+    snprintf(ckdir, sizeof ckdir, "%s/clicks", data_dir);
+    Mapped *cfiles = NULL;
+    size_t click_bytes = 0;
+    int ncfiles = map_dir(ckdir, &cfiles, &click_bytes);
+    if (ncfiles < 0)
+        return 1;
+    size_t cchunk = click_bytes / ((size_t)nw * 16) + 1;
+    if (cchunk < ((size_t)1 << 20))
+        cchunk = (size_t)1 << 20;
+    ClickTask *ktasks = calloc((size_t)ncfiles + click_bytes / cchunk + 16, sizeof *ktasks);
+    size_t nkt = 0, kcap = 0;
+    for (int i = 0; i < ncfiles; i++) {
+        if (!cfiles[i].data)
+            continue;
+        const char *b = cfiles[i].data, *e = b + cfiles[i].size;
+        const char *nl = memchr(b, '\n', cfiles[i].size);
+        if (!nl)
+            continue;
+        for (const char *p = nl + 1; p < e;) {
+            const char *q2 = p + cchunk < e ? p + cchunk : e;
+            if (q2 < e) {
+                const char *n2 = memchr(q2, '\n', (size_t)(e - q2));
+                q2 = n2 ? n2 + 1 : e;
+            }
+            ktasks[nkt].begin = p;
+            ktasks[nkt].end = q2;
+            /* a click row that survives is >= 7 bytes ("c,u,k,t") */
+            kcap += (size_t)(q2 - p) / 7 + 1;
+            nkt++;
+            p = q2;
+        }
+    }
+    if (kcap >= ((uint64_t)1 << 32)) {
+        fprintf(stderr, "too many click rows for the 32-bit click index\n");
+        return 1;
+    }
+    ClickCand *kc = big_alloc((kcap ? kcap : 1) * sizeof(ClickCand));
+    uint32_t *ccount = big_alloc((npersons ? npersons : 1) * sizeof(uint32_t));
+    if (!kc || !ccount || !ktasks) {
+        fprintf(stderr, "out of memory (clicks)\n");
+        return 1;
+    }
+    {
+        size_t off = 0;
+        for (size_t i = 0; i < nkt; i++) {
+            ktasks[i].out = kc + off;
+            off += (size_t)(ktasks[i].end - ktasks[i].begin) / 7 + 1;
+        }
+    }
+    ClickParseCtx kctx = {
+        .cw_start = dict.window_start - W7,
+        .cw_end = dict.window_end,
+        .link_slots = dict.link_slots,
+        .link_mask = dict.link_mask,
+        .camp_slots = dict.camp_slots,
+        .camp_mask = dict.camp_mask,
+        .persons = persons,
+        .person_mask = psize - 1,
+        .remap = counts,
+        .ccount = ccount,
+    };
+    q = (Queue){.ntasks = nkt, .tasks = ktasks, .ctx = &kctx};
+    atomic_init(&q.next, 0);
+    pool_run(job_parse_clicks, &q);
+    big_free(persons, psize * sizeof *persons);
+    big_free(counts, psize * sizeof *counts);
+    uint64_t nclicks = 0;
+    for (size_t i = 0; i < nkt; i++)
+        nclicks += ktasks[i].count;
+    uint64_t t_cparse = now_ns();
+
+    /* ---- C2: click prefix sums ------------------------------------------------ */
+    uint64_t *coffsets = big_alloc((npersons + 1) * sizeof(uint64_t));
+    uint64_t *ccursor = big_alloc((npersons ? npersons : 1) * sizeof(uint64_t));
+    if (!coffsets || !ccursor) {
+        fprintf(stderr, "out of memory (click offsets)\n");
+        return 1;
+    }
+    uint64_t maxc = 0, cpersons = 0;
+    {
+        uint64_t run = 0;
+        for (uint64_t k = 0; k < npersons; k++) {
+            coffsets[k] = run;
+            ccursor[k] = run;
+            run += ccount[k];
+            if (ccount[k]) {
+                cpersons++;
+                if (ccount[k] > maxc)
+                    maxc = ccount[k];
+            }
+        }
+        coffsets[npersons] = run;
+    }
+    big_free(ccount, (npersons ? npersons : 1) * sizeof(uint32_t));
+
+    /* ---- C3: group clicks by person ------------------------------------------- */
+    ClickEv *kev = big_alloc((nclicks ? nclicks : 1) * sizeof(ClickEv));
+    if (!kev) {
+        fprintf(stderr, "out of memory (click events)\n");
+        return 1;
+    }
+    ClickScatterArgs ksa = {.cursor = ccursor, .dst = kev, .base = kc};
+    q = (Queue){.ntasks = nkt, .tasks = ktasks, .ctx = &ksa};
+    atomic_init(&q.next, 0);
+    pool_run(job_scatter_clicks, &q);
+    big_free(ccursor, (npersons ? npersons : 1) * sizeof(uint64_t));
+    uint64_t t_cgroup = now_ns();
 
     /* ---- P6: sessionize ------------------------------------------------------ */
     uint64_t span = (uint64_t)(dict.window_end - dict.window_start - 1);
@@ -581,8 +761,47 @@ int main(int argc, char **argv)
             return 1;
         }
     }
+    /* attribution state per worker */
+    const int64_t DAYMS = 86400000;
+    uint32_t ndays = (uint32_t)(floor_div(dict.window_end - 1, DAYMS) - day0 + 1);
+    uint64_t cspan = (uint64_t)(dict.window_end - (dict.window_start - W7) - 1);
+    uint32_t cpasses = 1;
+    while (cpasses < 8 && (cspan >> (8 * cpasses)) != 0)
+        cpasses++;
+    if (nvalid >= ((uint64_t)1 << 32)) {
+        fprintf(stderr, "too many events for 32-bit aggregate counters\n");
+        return 1;
+    }
+    size_t ncells = ((size_t)dict.ncamp + 1) * ndays;
+    AttrCtx *actx = big_alloc(nw * sizeof(AttrCtx));
+    if (!actx) {
+        fprintf(stderr, "out of memory (attribution ctx)\n");
+        return 1;
+    }
+    for (unsigned w = 0; w < nw; w++) {
+        AttrCtx *a = &actx[w];
+        a->offsets = offsets;
+        a->events = ev;
+        a->coffsets = coffsets;
+        a->clicks = kev;
+        a->ccands = kc;
+        a->cscratch = big_alloc((maxc ? maxc : 1) * sizeof(ClickEv));
+        a->sess = big_alloc((maxn ? maxn : 1) * sizeof(SessRec));
+        a->cnt = big_alloc(((size_t)dict.ncamp + 1) * sizeof(uint32_t));
+        a->enter = big_alloc(((size_t)dict.ncamp + 1) * sizeof(uint32_t));
+        a->day_first = big_alloc(((size_t)ndays + 2) * sizeof(uint32_t));
+        a->agg = big_alloc(ncells * sizeof(AggCell));
+        a->base_ms = (uint64_t)(dict.window_start - day0 * DAYMS);
+        a->ncamp = dict.ncamp;
+        a->ndays = ndays;
+        a->cpasses = cpasses;
+        if (!a->cscratch || !a->sess || !a->cnt || !a->enter || !a->day_first || !a->agg) {
+            fprintf(stderr, "out of memory (attribution)\n");
+            return 1;
+        }
+    }
     Row *rows = big_alloc((nvalid ? nvalid : 1) * sizeof(Row));
-    /* blocks of ~16K events (whales get a block of their own) */
+    /* blocks of ~16K events + clicks (whales get a block of their own) */
     size_t st_cap = npersons + 1;               /* every block has >= 1 person */
     SessTask *stasks = calloc(st_cap, sizeof *stasks);
     if (!rows || !stasks) {
@@ -592,7 +811,8 @@ int main(int argc, char **argv)
     size_t nst = 0;
     for (uint64_t k = 0; k < npersons;) {
         uint64_t e = k + 1;
-        while (e < npersons && e - k < 4096 && offsets[e + 1] - offsets[k] <= 16384)
+        while (e < npersons && e - k < 4096 &&
+               (offsets[e + 1] - offsets[k]) + (coffsets[e + 1] - coffsets[k]) <= 16384)
             e++;
         stasks[nst].pbegin = k;
         stasks[nst].pend = e;
@@ -600,7 +820,7 @@ int main(int argc, char **argv)
         nst++;
         k = e;
     }
-    q = (Queue){.ntasks = nst, .tasks = stasks, .ctx2 = sctx};
+    q = (Queue){.ntasks = nst, .tasks = stasks, .ctx = actx, .ctx2 = sctx};
     atomic_init(&q.next, 0);
     pool_run(job_session, &q);
     uint64_t t_session = now_ns();
@@ -637,9 +857,96 @@ int main(int argc, char **argv)
     if (ensure_dir(out_dir) || ensure_dir(odir))
         return 1;
     snprintf(opath, sizeof opath, "%s/part-00000.parquet", odir);
-    UserDailyColumns cols = {nrows, uid, day, sess, evs, rev, top};
-    if (write_user_daily_parquet(opath, &cols) != 0)
+    ColSpec ucols[6] = {
+        {"user_id", COL_STR, uid, NULL, NULL},
+        {"day", COL_DATE, NULL, day, NULL},
+        {"sessions", COL_I64, NULL, NULL, sess},
+        {"events", COL_I64, NULL, NULL, evs},
+        {"revenue_cents", COL_I64, NULL, NULL, rev},
+        {"top_category", COL_STR_OPT, top, NULL, NULL},
+    };
+    if (write_parquet(opath, nrows, 6, ucols) != 0)
         return 1;
+
+    /* ---- P7b: reduce per-worker campaign/day tables -> campaign_daily ------- */
+    uint64_t sum_user_rev = 0;
+    for (uint64_t i = 0; i < nrows; i++)
+        sum_user_rev += (uint64_t)rev[i];
+    uint64_t *tot_rev = calloc(ncells ? ncells : 1, sizeof *tot_rev);
+    uint64_t *tot_s = calloc(ncells ? ncells : 1, sizeof *tot_s);
+    uint64_t *tot_p = calloc(ncells ? ncells : 1, sizeof *tot_p);
+    uint64_t *tot_a = calloc(ncells ? ncells : 1, sizeof *tot_a);
+    if (!tot_rev || !tot_s || !tot_p || !tot_a) {
+        fprintf(stderr, "out of memory (campaign reduce)\n");
+        return 1;
+    }
+    for (unsigned w = 0; w < nw; w++)
+        for (size_t c = 0; c < ncells; c++) {
+            const AggCell *x = &actx[w].agg[c];
+            tot_s[c] += x->sessions;
+            tot_p[c] += x->purchasing;
+            tot_a[c] += x->assisted;
+            tot_rev[c] += x->revenue;
+        }
+    size_t ncrows = 0;
+    for (size_t c = 0; c < ncells; c++)
+        ncrows += (tot_s[c] || tot_a[c]);
+    Slice *cid = malloc((ncrows ? ncrows : 1) * sizeof *cid);
+    Slice *chn = malloc((ncrows ? ncrows : 1) * sizeof *chn);
+    int32_t *cday = malloc((ncrows ? ncrows : 1) * sizeof *cday);
+    int64_t *cs = malloc((ncrows ? ncrows : 1) * sizeof *cs);
+    int64_t *cp = malloc((ncrows ? ncrows : 1) * sizeof *cp);
+    int64_t *crev = malloc((ncrows ? ncrows : 1) * sizeof *crev);
+    int64_t *cas = malloc((ncrows ? ncrows : 1) * sizeof *cas);
+    if (!cid || !chn || !cday || !cs || !cp || !crev || !cas) {
+        fprintf(stderr, "out of memory (campaign rows)\n");
+        return 1;
+    }
+    uint64_t csum_s = 0, csum_rev = 0, organic_s = 0, assist_total = 0, bad_rows = 0;
+    size_t cr = 0;
+    for (uint32_t c = 0; c <= dict.ncamp; c++)
+        for (uint32_t d = 0; d < ndays; d++) {
+            size_t x = (size_t)c * ndays + d;
+            if (!tot_s[x] && !tot_a[x])
+                continue;
+            cid[cr] = dict.camp_ids[c];
+            chn[cr] = dict.camp_channels[c];
+            cday[cr] = (int32_t)(day0 + d);
+            cs[cr] = (int64_t)tot_s[x];
+            cp[cr] = (int64_t)tot_p[x];
+            crev[cr] = (int64_t)tot_rev[x];
+            cas[cr] = (int64_t)tot_a[x];
+            csum_s += tot_s[x];
+            csum_rev += tot_rev[x];
+            assist_total += tot_a[x];
+            if (c == dict.ncamp) {
+                organic_s += tot_s[x];
+                bad_rows += tot_a[x] != 0;
+            } else {
+                bad_rows += tot_a[x] < tot_s[x];   /* credited => assisted */
+            }
+            cr++;
+        }
+    snprintf(odir, sizeof odir, "%s/campaign_daily", out_dir);
+    if (ensure_dir(odir))
+        return 1;
+    snprintf(opath, sizeof opath, "%s/part-00000.parquet", odir);
+    ColSpec ccols[7] = {
+        {"campaign_id", COL_STR, cid, NULL, NULL},
+        {"channel", COL_STR, chn, NULL, NULL},
+        {"day", COL_DATE, NULL, cday, NULL},
+        {"sessions", COL_I64, NULL, NULL, cs},
+        {"purchasing_sessions", COL_I64, NULL, NULL, cp},
+        {"revenue_cents", COL_I64, NULL, NULL, crev},
+        {"assisted_sessions", COL_I64, NULL, NULL, cas},
+    };
+    if (write_parquet(opath, ncrows, 7, ccols) != 0)
+        return 1;
+    uint64_t credits = 0;
+    for (size_t i = 0; i < nst; i++)
+        credits += stasks[i].credits;
+    int invariants_ok = csum_s == sum_sessions && csum_rev == sum_user_rev && bad_rows == 0 &&
+                        credits + organic_s == sum_sessions;
     uint64_t t_end = now_ns();
 
     struct rusage ru;
@@ -659,10 +966,22 @@ int main(int argc, char **argv)
             (unsigned long long)sum_sessions, (unsigned long long)nrows, ru.ru_maxrss / 1024,
             ms(t0, t_dict), ms(t_dict, t_p1), ms(t_p1, t_parse), ms(t_parse, t_dedup),
             ms(t_dedup, t_collect), ms(t_collect, t_prefix), ms(t_prefix, t_scatter),
-            ms(t_scatter, t_session), ms(t_session, t_end), ms(t0, t_end));
+            ms(t_cgroup, t_session), ms(t_session, t_end), ms(t0, t_end));
     double cpu_s = (double)ru.ru_utime.tv_sec + ru.ru_utime.tv_usec / 1e6 +
                    (double)ru.ru_stime.tv_sec + ru.ru_stime.tv_usec / 1e6;
     double wall_s = (double)(t_end - t0) / 1e9;
+    fprintf(stderr,
+            "evx: clicks files=%d bytes=%zu tasks=%zu valid=%llu persons_with_clicks=%llu max_person_clicks=%llu\n"
+            "evx: campaigns=%u days=%u credited=%llu organic=%llu assists=%llu campaign_rows=%zu\n"
+            "evx: ms click_parse=%.1f click_group=%.1f (session+attribution in session=)\n"
+            "evx: invariants %s (sessions %llu/%llu revenue %llu/%llu bad_rows %llu)\n",
+            ncfiles, click_bytes, nkt, (unsigned long long)nclicks, (unsigned long long)cpersons,
+            (unsigned long long)maxc, dict.ncamp, ndays, (unsigned long long)credits,
+            (unsigned long long)organic_s, (unsigned long long)assist_total, ncrows,
+            ms(t_scatter, t_cparse), ms(t_cparse, t_cgroup),
+            invariants_ok ? "OK" : "VIOLATED", (unsigned long long)csum_s,
+            (unsigned long long)sum_sessions, (unsigned long long)csum_rev,
+            (unsigned long long)sum_user_rev, (unsigned long long)bad_rows);
     fprintf(stderr, "evx: tables dedup_slots=%llu person_slots=%llu person_retries=%u\n",
             (unsigned long long)dsize, (unsigned long long)psize, person_retries);
     fprintf(stderr, "evx: cpu user=%.2fs sys=%.2fs avg_cores=%.2f (worker threads=%u + 1 idle coordinator)\n",

@@ -139,6 +139,88 @@ _Static_assert(offsetof(SessCtx, cat_sum) == 48, "SessCtx.cat_sum");
 _Static_assert(offsetof(SessCtx, touched) == 2096, "SessCtx.touched");
 _Static_assert(sizeof(Row) == 32, "Row");
 
+/* ---------------------------------------------------------------- clicks */
+
+/* Context for evx_parse_clicks (read-only, shared). */
+typedef struct {
+    int64_t cw_start;               /*  0  window_start - 7 days */
+    int64_t cw_end;                 /*  8  window_end */
+    const LookupEntry *link_slots;  /* 16  NULL when there are no links */
+    uint64_t link_mask;             /* 24 */
+    const LookupEntry *camp_slots;  /* 32  campaign_id -> dense id (val_len) */
+    uint64_t camp_mask;             /* 40 */
+    const PersonSlot *persons;      /* 48  events person table (name -> slot) */
+    uint64_t person_mask;           /* 56 */
+    const uint32_t *remap;          /* 64  person slot -> dense person id */
+    uint32_t *ccount;               /* 72  clicks per dense person (lock inc) */
+} ClickParseCtx;                    /* 80 */
+
+/* A valid click of a person who has sessions. 32 bytes. */
+typedef struct {
+    uint64_t k;           /*  0  ts - cw_start (>= 0) */
+    uint32_t pid;         /*  8  dense person id */
+    uint32_t camp;        /* 12  dense campaign id */
+    const char *cid;      /* 16  click_id (read only for equal-ts ties) */
+    uint32_t cid_len;     /* 24 */
+    uint32_t pad;         /* 28 */
+} ClickCand;
+
+/* Click grouped by person; Ev-shaped (8-byte sort key at 0, 16 bytes). */
+typedef struct {
+    uint64_t k;           /*  0 */
+    uint32_t camp;        /*  8 */
+    uint32_t cand_idx;    /* 12  index into the ClickCand store */
+} ClickEv;
+
+/* One session of the person being attributed. 24 bytes. */
+typedef struct {
+    int64_t start;        /*  0  ts_off of the first event */
+    uint32_t day_rel;     /*  8  day - day0 */
+    uint32_t pad;         /* 12 */
+    uint64_t revenue;     /* 16 */
+} SessRec;
+
+/* campaign/day aggregate cell, per worker. 24 bytes. */
+typedef struct {
+    uint32_t sessions;    /*  0  credited sessions */
+    uint32_t purchasing;  /*  4 */
+    uint32_t assisted;    /*  8 */
+    uint32_t pad;         /* 12 */
+    uint64_t revenue;     /* 16 */
+} AggCell;
+
+/* Per-worker context for evx_attribute. */
+typedef struct {
+    const uint64_t *offsets;   /*   0  events per dense person (prefix) */
+    const Ev *events;          /*   8  sorted by evx_sessionize */
+    const uint64_t *coffsets;  /*  16  clicks per dense person (prefix) */
+    ClickEv *clicks;           /*  24 */
+    const ClickCand *ccands;   /*  32 */
+    ClickEv *cscratch;         /*  40  >= max clicks of one person */
+    SessRec *sess;             /*  48  >= max events of one person */
+    uint32_t *cnt;             /*  56  [ncamp] zero between persons */
+    uint32_t *enter;           /*  64  [ncamp] */
+    uint32_t *day_first;       /*  72  [ndays + 2] */
+    AggCell *agg;              /*  80  [(ncamp + 1) * ndays] */
+    uint64_t base_ms;          /*  88  window_start - day0 * 86400000 */
+    uint32_t ncamp;            /*  96  organic = ncamp */
+    uint32_t ndays;            /* 100 */
+    uint32_t cpasses;          /* 104  radix passes for click keys */
+    uint32_t pad;              /* 108 */
+    uint32_t hist[8 * 256];    /* 112  radix histograms */
+} AttrCtx;
+
+_Static_assert(sizeof(ClickParseCtx) == 80, "ClickParseCtx");
+_Static_assert(sizeof(ClickCand) == 32, "ClickCand");
+_Static_assert(offsetof(ClickCand, cid) == 16, "ClickCand.cid");
+_Static_assert(sizeof(ClickEv) == 16, "ClickEv");
+_Static_assert(sizeof(SessRec) == 24, "SessRec");
+_Static_assert(sizeof(AggCell) == 24, "AggCell");
+_Static_assert(offsetof(AggCell, revenue) == 16, "AggCell.revenue");
+_Static_assert(offsetof(AttrCtx, base_ms) == 88, "AttrCtx.base_ms");
+_Static_assert(offsetof(AttrCtx, cpasses) == 104, "AttrCtx.cpasses");
+_Static_assert(offsetof(AttrCtx, hist) == 112, "AttrCtx.hist");
+
 /* ---- assembly entry points (System V AMD64) ---- */
 uint64_t evx_hash(const void *p, size_t len);
 int evx_memeq(const void *a, const void *b, size_t len);
@@ -159,5 +241,18 @@ uint64_t evx_collect(const CollectCtx *ctx, uint64_t slot_begin,
 void evx_scatter(const Win *w, uint64_t n, const uint32_t *remap,
                  uint64_t *cursor, Ev *dst);
 uint64_t evx_sessionize(SessCtx *ctx, uint64_t pbegin, uint64_t pend, Row *out);
+
+
+/* byte-wise order: <0, 0, >0 (unsigned bytes, shorter prefix first) */
+int evx_memcmp(const void *a, size_t alen, const void *b, size_t blen);
+/* sort 16-byte records by their first u64; hist = 8*256 u32 scratch */
+void evx_sort16(void *a, uint64_t n, void *scratch, uint32_t passes, uint32_t *hist);
+/* Parse click rows in [begin, end); returns ClickCand count. */
+uint64_t evx_parse_clicks(const ClickParseCtx *ctx, const char *begin,
+                          const char *end, ClickCand *out);
+void evx_scatter_clicks(const ClickCand *c, uint64_t n, uint64_t *cursor,
+                        ClickEv *dst, const ClickCand *base);
+/* Attribute dense persons [pbegin, pend); returns non-organic credits. */
+uint64_t evx_attribute(AttrCtx *ctx, uint64_t pbegin, uint64_t pend);
 
 #endif

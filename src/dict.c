@@ -361,3 +361,49 @@ int load_links(const char *data_dir, Dict *d)
     free(s.index);
     return 0;
 }
+
+/* --------------------------------------------------------------- campaigns */
+
+int load_campaigns(const char *data_dir, Dict *d)
+{
+    char path[4096];
+    snprintf(path, sizeof path, "%s/campaigns.csv", data_dir);
+    if (map_file(path, &d->campaigns_file) != 0)
+        return -1;
+    LineIter it;
+    const char *line;
+    size_t len, rows = 0;
+    Slice f[2];
+    line_iter_init(&it, &d->campaigns_file);
+    while (line_next(&it, &line, &len))
+        rows++;
+    if (rows >= UINT32_MAX - 1) {
+        fprintf(stderr, "campaigns: too many rows\n");
+        return -1;
+    }
+    d->camp_ids = calloc(rows + 1, sizeof(Slice));
+    d->camp_channels = calloc(rows + 1, sizeof(Slice));
+    uint64_t size = table_size_for(rows);
+    d->camp_slots = calloc(size, sizeof(LookupEntry));
+    if (!d->camp_ids || !d->camp_channels || !d->camp_slots)
+        return -1;
+    d->camp_mask = size - 1;
+    d->ncamp = 0;
+    line_iter_init(&it, &d->campaigns_file);
+    while (line_next(&it, &line, &len)) {
+        if (!evx_split_line(line, len, 2, f) || f[0].len == 0)
+            continue;
+        int ins;
+        LookupEntry *e = table_put(d->camp_slots, d->camp_mask, f[0].ptr, f[0].len, &ins);
+        if (!ins)
+            continue;                    /* campaign_id is unique; keep first */
+        e->val_len = d->ncamp;
+        d->camp_ids[d->ncamp] = f[0];
+        d->camp_channels[d->ncamp] = f[1];
+        d->ncamp++;
+    }
+    static const char ORGANIC[] = "organic";
+    d->camp_ids[d->ncamp] = (Slice){ORGANIC, 7, 0};
+    d->camp_channels[d->ncamp] = (Slice){ORGANIC, 7, 0};
+    return 0;
+}

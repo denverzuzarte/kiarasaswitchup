@@ -203,6 +203,71 @@ def main():
         f.write(header + "\n")
     open(os.path.join(out, "events", "part-00005.csv"), "w").close()
 
+    # ---- campaigns and clicks -------------------------------------------------
+    os.makedirs(os.path.join(out, "clicks"), exist_ok=True)
+    channels = ["search", "social", "email", "Display", "a,b"[:1]]
+    camps = [f"c_{i}" for i in range(40)]
+    with open(os.path.join(out, "campaigns.csv"), "w") as f:
+        f.write("campaign_id,channel\n")
+        for i, c in enumerate(camps):
+            f.write(f"{quote(c, rnd)},{channels[i % len(channels)]}\n")
+    W7 = 7 * DAY
+    tie_ids = ["c10", "c9", "C1", "c1", " c", "c", "\u00e9x", "k", "k0"]
+    starts = [r[2] for r in rows]            # event times (session-start proxies)
+    clines = []
+    kid = 0
+    for _ in range(n_events // 4):
+        kid += 1
+        ids = rnd.choice(people)
+        user = rnd.choice(ids)
+        t0 = rnd.choice(starts)
+        r = rnd.random()
+        if r < 0.15:                          # attribution boundaries around an event
+            t = t0 + rnd.choice([0, -1, 1, -W7, -W7 - 1, -W7 + 1])
+        elif r < 0.17:                        # click-window edges
+            t = rnd.choice([ws - W7, ws - W7 - 1, we - 1, we])
+        else:
+            t = t0 - rnd.randrange(0, 9 * DAY)
+        cid = f"k{kid}"
+        campaign = rnd.choice(camps[:6] if rnd.random() < 0.3 else camps)   # whale campaigns
+        if rnd.random() < 0.03:
+            campaign = rnd.choice(["c_999", "C_1", " c_1", "c_1 ", ""])
+        if rnd.random() < 0.01:
+            user = rnd.choice(["", "U1_0", "ghost_a", "AAA_only_link", "nobody_has_events"])
+        ts_s = iso(t, rnd) if t >= 0 else str(t)
+        if rnd.random() < 0.005:
+            ts_s = rnd.choice(BAD_TS + [ts_s + "\r"])
+        fields = [cid, user, campaign, ts_s]
+        if rnd.random() < 0.004:
+            fields[0] = ""
+        clines.append(",".join(quote(v, rnd) for v in fields))
+        if rnd.random() < 0.05:               # same-millisecond tie group, tricky ids
+            for tid in rnd.sample(tie_ids, rnd.randint(1, 4)):
+                # unique per group ("kid:" prefix) so a click_id never names two
+                # different clicks; within the group the ids differ only after
+                # the prefix: true-prefix, case, space and non-ASCII orderings
+                clines.append(",".join([f"{kid}:{tid}", user, rnd.choice(camps), ts_s]))
+        if rnd.random() < 0.02:               # duplicate, quoted differently
+            clines.append(",".join(f'"{v}"' for v in fields))
+        r = rnd.random()
+        if r < 0.003:
+            clines.append(clines[-1] + ",x")
+        elif r < 0.005:
+            clines.append(clines[-1].replace(",", ',"', 1))
+        elif r < 0.006:
+            clines.append("")
+    rnd.shuffle(clines)
+    cheader = "click_id,user_id,campaign_id,ts"
+    cut = [0, int(len(clines) * 0.6), int(len(clines) * 0.9), len(clines)]
+    for fi in range(3):
+        body = cheader + "\n" + "\n".join(clines[cut[fi]:cut[fi + 1]])
+        if fi != 1:
+            body += "\n"
+        with open(os.path.join(out, "clicks", f"part-{fi:05d}.csv"), "w", newline="") as f:
+            f.write(body)
+    with open(os.path.join(out, "clicks", "part-00003.csv"), "w") as f:
+        f.write(cheader + "\n")
+
 
 if __name__ == "__main__":
     main()

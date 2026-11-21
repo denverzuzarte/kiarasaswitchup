@@ -5,7 +5,7 @@ I checked every rule in `The rules.md` that touches events, links, products or `
 ## Conflicts / blockers
 
 1. **DuckDB C API (spec §2.3, §11): BLOCKER, worked around.** There is no `libduckdb` / `duckdb.h` on the build host. The spec also contradicts itself here. DuckDB is a C++ library, so linking it statically needs `libstdc++`, and §3.3 forbids C++ runtime dependencies. §2.3 forbids switching to C++, Python, a dynamically linked DuckDB, or an *unrelated output format*. I did none of those. Output is still Parquet, produced by a small writer in C (`src/parquet.c`): PLAIN encoding, uncompressed, Thrift-compact footer. The DuckDB dependency is gone, and no "final aggregation" is delegated to it. Aggregation happens in the assembly engine, which §3.2 wants anyway.
-2. **Events-only scope (spec §1, §11) vs the scorer (rules → Outputs).** The rules require **both** `/output/user_daily/` and `/output/campaign_daily/`. The spec forbids creating `campaign_daily`, so the scorer will mark this build incorrect until a click pipeline exists. The supplied harnesses (`scripts/run_fixtures.py`, `scripts/compare.py`, `make fixtures`, `make check-dev`) also fail on the missing table. I added `scripts/check_events.py`, which checks only `user_daily`. I followed the spec as requested; this item is for awareness.
+2. **RESOLVED by `clicks_c_assembly_spec.md`. Events-only scope (spec §1, §11) vs the scorer (rules → Outputs).** The rules require **both** `/output/user_daily/` and `/output/campaign_daily/`. The spec forbids creating `campaign_daily`, so the scorer will mark this build incorrect until a click pipeline exists. The supplied harnesses (`scripts/run_fixtures.py`, `scripts/compare.py`, `make fixtures`, `make check-dev`) also fail on the missing table. I added `scripts/check_events.py`, which checks only `user_daily`. I followed the spec as requested; this item is for awareness.
 3. **"One process, eight workers" (spec §4.1).** This is implemented as a pthread pool sized from `NCPU` (default: online CPUs, capped at 64). The spec's "8" is the scorer's value, not a constant.
 
 ## Gaps resolved toward the rules
@@ -28,3 +28,11 @@ I checked every rule in `The rules.md` that touches events, links, products or `
 - `user_daily`: one row per person/day, `revenue_cents` = 0 if no purchases, `top_category` is null with no purchases, and `unknown` competes.
 - Strings are never normalised: spaces and case are significant, and `\r` is data.
 - `day` is a Parquet `DATE` (INT32, days since epoch). `top_category` is an OPTIONAL byte array.
+
+## Clicks spec (`clicks_c_assembly_spec.md`) vs the rules
+
+- **OK:** click window `[window_start - 7 d, window_end)`; credit = latest click with `click.ts <= start` and `start - click.ts <= 7 d`, ties to the byte-wise smallest `click_id`; `organic` when there's none; assists = every campaign with a qualifying click, at most once per session, never `organic`; per-day counts on the session start day; assisted-only rows carry 0 in the credited columns.
+- **OK (§8, no click dedup):** the rules guarantee that copies of a click are identical. Validation, person, credit maximum and assist set are therefore unchanged by duplicates. The Python reference does dedup for real and agrees on every dataset tested.
+- **Deviation (§7.2 PIndex):** no separate 32 MiB index is built. After the memory work, the events person table is itself compact (about 1/8 of the candidates, 16-byte slots, 128 MiB at 48M) and already maps canonical name → slot, with `counts[]` reused as slot → dense ID. It's kept alive through the click parse and freed straight after. This is the same probe pattern with one structure fewer.
+- **Deviation (§7.2 note):** "the person table is 2^27 slots" no longer applies; see above.
+- Attribution is in assembly (`evx_attribute`), so the C contingency of §17 was not needed.

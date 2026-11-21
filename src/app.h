@@ -43,26 +43,34 @@ typedef struct {
     size_t link_ids, link_lines, link_dropped, link_components;
     Mapped *link_files;
     int nlink_files;
+
+    /* campaigns: exact campaign_id -> dense id (val_len), file order;
+       "organic" is id ncamp and never a key */
+    LookupEntry *camp_slots;
+    uint64_t camp_mask;
+    uint32_t ncamp;
+    Slice *camp_ids, *camp_channels;
+    Mapped campaigns_file;
 } Dict;
 
 int load_manifest(const char *data_dir, Dict *d);
 int load_products(const char *data_dir, Dict *d);
 int load_links(const char *data_dir, Dict *d);
+int load_campaigns(const char *data_dir, Dict *d);
 
 /* byte-wise comparison: memcmp, then shorter first */
 int bytes_cmp(const char *a, size_t al, const char *b, size_t bl);
 
-/* Parquet output of user_daily. Columns are passed as flat arrays. */
+/* Generic Parquet writer: one column descriptor per column. */
+typedef enum { COL_STR, COL_STR_OPT, COL_DATE, COL_I64 } ColKind;
 typedef struct {
-    size_t nrows;
-    const Slice *user_id;
-    const int32_t *day;
-    const int64_t *sessions;
-    const int64_t *events;
-    const int64_t *revenue;
-    const Slice *top_category;   /* ptr == NULL -> null */
-} UserDailyColumns;
+    const char *name;
+    ColKind kind;
+    const Slice *str;        /* COL_STR / COL_STR_OPT (ptr == NULL -> null) */
+    const int32_t *date;     /* COL_DATE: days since epoch */
+    const int64_t *i64;      /* COL_I64 */
+} ColSpec;
 
-int write_user_daily_parquet(const char *path, const UserDailyColumns *c);
+int write_parquet(const char *path, size_t nrows, int ncols, const ColSpec *cols);
 
 #endif

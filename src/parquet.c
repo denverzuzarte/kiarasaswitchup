@@ -1,17 +1,13 @@
 /*
- * parquet.c - minimal Parquet writer for the user_daily table.
+ * parquet.c - minimal Parquet writer (user_daily and campaign_daily).
  *
  * Replaces the DuckDB C API output path, which is unavailable on this build
  * host (see docs/SPEC_REVIEW.md). Format: "PAR1", one data page (v1) per
  * column per row group, PLAIN encoding, UNCOMPRESSED, Thrift compact
  * protocol FileMetaData footer, "PAR1".
  *
- *   user_id       BYTE_ARRAY  REQUIRED  UTF8 / STRING
- *   day           INT32       REQUIRED  DATE
- *   sessions      INT64       REQUIRED
- *   events        INT64       REQUIRED
- *   revenue_cents INT64       REQUIRED
- *   top_category  BYTE_ARRAY  OPTIONAL  UTF8 / STRING (RLE definition levels)
+ * Column kinds: COL_STR (BYTE_ARRAY, UTF8/STRING), COL_STR_OPT (same,
+ * OPTIONAL with RLE definition levels), COL_DATE (INT32 DATE), COL_I64.
  */
 #define _GNU_SOURCE
 
@@ -140,20 +136,6 @@ enum { REP_REQUIRED = 0, REP_OPTIONAL = 1 };
 enum { CT_UTF8 = 0, CT_DATE = 6, CT_NONE = -1 };
 enum { LT_NONE = 0, LT_STRING = 1, LT_DATE = 6 };
 
-typedef struct {
-    const char *name;
-    int type, rep, conv, logical;
-} ColDef;
-
-static const ColDef COLS[6] = {
-    {"user_id", PT_BYTE_ARRAY, REP_REQUIRED, CT_UTF8, LT_STRING},
-    {"day", PT_INT32, REP_REQUIRED, CT_DATE, LT_DATE},
-    {"sessions", PT_INT64, REP_REQUIRED, CT_NONE, LT_NONE},
-    {"events", PT_INT64, REP_REQUIRED, CT_NONE, LT_NONE},
-    {"revenue_cents", PT_INT64, REP_REQUIRED, CT_NONE, LT_NONE},
-    {"top_category", PT_BYTE_ARRAY, REP_OPTIONAL, CT_UTF8, LT_STRING},
-};
-
 #define ROWS_PER_GROUP ((size_t)1 << 20)
 
 typedef struct {
@@ -162,37 +144,38 @@ typedef struct {
     int64_t num_values;
 } ChunkInfo;
 
+static int col_type(ColKind k) { return k == COL_DATE ? PT_INT32 : k == COL_I64 ? PT_INT64 : PT_BYTE_ARRAY; }
+static int col_rep(ColKind k) { return k == COL_STR_OPT ? REP_OPTIONAL : REP_REQUIRED; }
+static int col_conv(ColKind k) { return k == COL_DATE ? CT_DATE : k == COL_I64 ? CT_NONE : CT_UTF8; }
+static int col_logical(ColKind k) { return k == COL_DATE ? LT_DATE : k == COL_I64 ? LT_NONE : LT_STRING; }
+
 /* Encode one column's page body for rows [r0, r1). */
-static void encode_column(Buf *page, int col, const UserDailyColumns *c, size_t r0, size_t r1)
+static void encode_column(Buf *page, const ColSpec *c, size_t r0, size_t r1)
 {
-    switch (col) {
-    case 0:
+    switch (c->kind) {
+    case COL_STR:
         for (size_t i = r0; i < r1; i++) {
-            put_le32(page, c->user_id[i].len);
-            put(page, c->user_id[i].ptr, c->user_id[i].len);
+            put_le32(page, c->str[i].len);
+            put(page, c->str[i].ptr, c->str[i].len);
         }
         break;
-    case 1:
+    case COL_DATE:
         for (size_t i = r0; i < r1; i++)
-            put_le32(page, (uint32_t)c->day[i]);
+            put_le32(page, (uint32_t)c->date[i]);
         break;
-    case 2:
-    case 3:
-    case 4: {
-        const int64_t *v = col == 2 ? c->sessions : col == 3 ? c->events : c->revenue;
+    case COL_I64:
         for (size_t i = r0; i < r1; i++)
-            put_le64(page, (uint64_t)v[i]);
+            put_le64(page, (uint64_t)c->i64[i]);
         break;
-    }
-    case 5: {
+    case COL_STR_OPT: {
         /* definition levels: RLE/bit-packed hybrid, bit width 1, RLE runs only,
            prefixed with their byte length */
         Buf lv = {0};
         size_t i = r0;
         while (i < r1) {
-            int def = c->top_category[i].ptr != NULL;
+            int def = c->str[i].ptr != NULL;
             size_t j = i + 1;
-            while (j < r1 && (c->top_category[j].ptr != NULL) == def)
+            while (j < r1 && (c->str[j].ptr != NULL) == def)
                 j++;
             put_varint(&lv, (uint64_t)(j - i) << 1);
             put_u8(&lv, (uint8_t)def);
@@ -204,10 +187,10 @@ static void encode_column(Buf *page, int col, const UserDailyColumns *c, size_t 
             page->oom = 1;
         free(lv.p);
         for (size_t k = r0; k < r1; k++) {
-            if (!c->top_category[k].ptr)
+            if (!c->str[k].ptr)
                 continue;
-            put_le32(page, c->top_category[k].len);
-            put(page, c->top_category[k].ptr, c->top_category[k].len);
+            put_le32(page, c->str[k].len);
+            put(page, c->str[k].ptr, c->str[k].len);
         }
         break;
     }
@@ -230,15 +213,15 @@ static int write_all(int fd, const void *p, size_t n)
     return 0;
 }
 
-int write_user_daily_parquet(const char *path, const UserDailyColumns *c)
+int write_parquet(const char *path, size_t nrows, int ncols, const ColSpec *cols)
 {
     int fd = open(path, O_WRONLY | O_CREAT | O_TRUNC, 0666);
     if (fd < 0) {
         perror(path);
         return -1;
     }
-    size_t ngroups = c->nrows ? (c->nrows + ROWS_PER_GROUP - 1) / ROWS_PER_GROUP : 1;
-    ChunkInfo *info = calloc(ngroups * 6, sizeof *info);
+    size_t ngroups = nrows ? (nrows + ROWS_PER_GROUP - 1) / ROWS_PER_GROUP : 1;
+    ChunkInfo *info = calloc(ngroups * (size_t)ncols, sizeof *info);
     int64_t pos = 0;
     int rc = -1;
     Buf page = {0}, hdr = {0};
@@ -250,11 +233,11 @@ int write_user_daily_parquet(const char *path, const UserDailyColumns *c)
 
     for (size_t g = 0; g < ngroups; g++) {
         size_t r0 = g * ROWS_PER_GROUP;
-        size_t r1 = r0 + ROWS_PER_GROUP < c->nrows ? r0 + ROWS_PER_GROUP : c->nrows;
-        for (int col = 0; col < 6; col++) {
+        size_t r1 = r0 + ROWS_PER_GROUP < nrows ? r0 + ROWS_PER_GROUP : nrows;
+        for (int col = 0; col < ncols; col++) {
             page.n = 0;
             hdr.n = 0;
-            encode_column(&page, col, c, r0, r1);
+            encode_column(&page, &cols[col], r0, r1);
             if (page.oom || page.n > INT32_MAX)
                 goto out;
             Thrift t = {.b = &hdr};
@@ -270,7 +253,7 @@ int write_user_daily_parquet(const char *path, const UserDailyColumns *c)
             put_u8(&hdr, T_STOP);
             if (hdr.oom)
                 goto out;
-            ChunkInfo *ci = &info[g * 6 + col];
+            ChunkInfo *ci = &info[g * (size_t)ncols + col];
             ci->offset = pos;
             ci->total_size = (int64_t)(hdr.n + page.n);
             ci->num_values = (int64_t)(r1 - r0);
@@ -284,48 +267,48 @@ int write_user_daily_parquet(const char *path, const UserDailyColumns *c)
     Buf meta = {0};
     Thrift t = {.b = &meta};
     th_i32(&t, 1, 1);                               /* version */
-    th_list(&t, 2, T_STRUCT, 7);                    /* schema */
+    th_list(&t, 2, T_STRUCT, (size_t)ncols + 1);    /* schema */
     th_begin_elem(&t);
     th_bin(&t, 4, "schema", 6);
-    th_i32(&t, 5, 6);                               /* num_children */
+    th_i32(&t, 5, ncols);                           /* num_children */
     th_end(&t);
-    for (int col = 0; col < 6; col++) {
-        const ColDef *d = &COLS[col];
+    for (int col = 0; col < ncols; col++) {
+        ColKind k = cols[col].kind;
         th_begin_elem(&t);
-        th_i32(&t, 1, d->type);
-        th_i32(&t, 3, d->rep);
-        th_bin(&t, 4, d->name, strlen(d->name));
-        if (d->conv != CT_NONE)
-            th_i32(&t, 6, d->conv);
-        if (d->logical != LT_NONE) {
+        th_i32(&t, 1, col_type(k));
+        th_i32(&t, 3, col_rep(k));
+        th_bin(&t, 4, cols[col].name, strlen(cols[col].name));
+        if (col_conv(k) != CT_NONE)
+            th_i32(&t, 6, col_conv(k));
+        if (col_logical(k) != LT_NONE) {
             th_begin(&t, 10);                       /* LogicalType union */
-            th_begin(&t, d->logical);               /* StringType / DateType {} */
+            th_begin(&t, col_logical(k));           /* StringType / DateType {} */
             th_end(&t);
             th_end(&t);
         }
         th_end(&t);
     }
-    th_i64(&t, 3, (int64_t)c->nrows);
+    th_i64(&t, 3, (int64_t)nrows);
     th_list(&t, 4, T_STRUCT, ngroups);              /* row_groups */
     for (size_t g = 0; g < ngroups; g++) {
         size_t r0 = g * ROWS_PER_GROUP;
-        size_t r1 = r0 + ROWS_PER_GROUP < c->nrows ? r0 + ROWS_PER_GROUP : c->nrows;
+        size_t r1 = r0 + ROWS_PER_GROUP < nrows ? r0 + ROWS_PER_GROUP : nrows;
         int64_t total = 0;
         th_begin_elem(&t);
-        th_list(&t, 1, T_STRUCT, 6);                /* columns */
-        for (int col = 0; col < 6; col++) {
-            const ChunkInfo *ci = &info[g * 6 + col];
+        th_list(&t, 1, T_STRUCT, (size_t)ncols);              /* columns */
+        for (int col = 0; col < ncols; col++) {
+            const ChunkInfo *ci = &info[g * (size_t)ncols + col];
             total += ci->total_size;
             th_begin_elem(&t);
             th_i64(&t, 2, ci->offset);              /* file_offset */
             th_begin(&t, 3);                        /* ColumnMetaData */
-            th_i32(&t, 1, COLS[col].type);
+            th_i32(&t, 1, col_type(cols[col].kind));
             th_list(&t, 2, T_I32, 2);
             put_zigzag(&meta, 0);                   /* PLAIN */
             put_zigzag(&meta, 3);                   /* RLE */
             th_list(&t, 3, T_BINARY, 1);
-            put_varint(&meta, strlen(COLS[col].name));
-            put(&meta, COLS[col].name, strlen(COLS[col].name));
+            put_varint(&meta, strlen(cols[col].name));
+            put(&meta, cols[col].name, strlen(cols[col].name));
             th_i32(&t, 4, 0);                       /* UNCOMPRESSED */
             th_i64(&t, 5, ci->num_values);
             th_i64(&t, 6, ci->total_size);

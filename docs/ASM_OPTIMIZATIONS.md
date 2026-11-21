@@ -67,6 +67,23 @@ A log of every low-level choice in `src/evx_*.s`, why it was made, and what was 
 | 6.6 | **Top category via a 256-bit touched bitmap** (4 × u64) and `tzcnt`/`blsr`. Category IDs are byte-order ranks, so an ascending walk with a strict `>` is the byte-wise tie-break. The walk also clears the state. | No 256-entry reset per day and no string compares. |
 | 6.7 | Price and category packed in one u32 (`price` < 2^24 because the max is 10,000,000). | 16-byte grouped events, 4 per cache line. |
 
+## 6b. Clicks and attribution (`evx_click.s`)
+
+| # | Optimisation | Why |
+|---|---|---|
+| 6b.1 | **No click dedup table.** Copies of a click are identical by the rules, so credit (a maximum) and assists (a set) are unchanged by duplicates. | Removes a ~12M-key CAS table (spec §8). |
+| 6b.2 | **Cheap-first drop order:** field count/quotes → empty IDs → campaign lookup (L2-resident table) → ts/window → person resolution. | Dropped rows never pay for the two DRAM probes (link table, person table). |
+| 6b.3 | **Shared `evx_canon`** for events (collect) and clicks. | Identical canonical name and tag bit for bit; one code path. |
+| 6b.4 | The **events person table doubles as the click person index** (it's compact after §5 memory work). | No second index build; one probe per click. |
+| 6b.5 | Clicks of people with no surviving events are dropped in C1. | Exact (no sessions) and shrinks C3/P6 work. |
+| 6b.6 | `ClickEv` is Ev-shaped (8-byte key + 8 bytes); `click_id` stays in a cold 32-byte record read only for equal-ms ties. | The proven radix/insertion sort is reused (`evx_sort16`); string bytes stay out of the sort. |
+| 6b.7 | **Click key in the click frame** (`k = ts - cw_start`): the qualifying window becomes `s ≤ k ≤ s + 7 d`, unsigned only. | No signed arithmetic, non-negative radix keys. |
+| 6b.8 | **Two-pointer sweep** over sessions and sorted clicks; credit is `C[hi-1]`; the tie scan covers only the top equal-k group. | O(sessions + clicks) per person. |
+| 6b.9 | **Lazy assist flush:** per campaign, enter/exit session indices; on exit, add the interval split by `day_first[]`. | O(clicks × days) instead of O(sessions × active campaigns) for whales. |
+| 6b.10 | Attribution runs per block **right after** `evx_sessionize`, while the block's `Ev` is L2-hot. Blocks are weighted by events + clicks. | Near-fused cache behaviour without modifying the verified sessionizer. |
+| 6b.11 | **Per-worker dense (campaign + organic) × day tables**, reduced in C. | No contended atomics on whale campaigns / `organic`. |
+| 6b.12 | `evx_memcmp`: 64-byte masked compares, first difference via `tzcnt` of the not-equal mask, unsigned byte subtract. | Byte-wise `click_id` order without a byte loop. |
+
 ## 7. OS and memory (C side, in support of the asm)
 
 - **Lazily committed** `MAP_NORESERVE` anonymous buffers sized by worst-case bounds (≥ 8 bytes per candidate row). Untouched pages cost nothing, so no growth or realloc logic is needed in asm.
@@ -90,6 +107,11 @@ A log of every low-level choice in `src/evx_*.s`, why it was made, and what was 
 | dev20m, cold page cache (first run) | 21.4M cand | 2,206,402 | 3.78 s | 850 | 358 | 1513 | 202 | 146 | 235 | 150 | 4.8 GiB |
 | dev48m (seed 1), `make run-dev DEV=dev48m RUN_MEM=24g`, warm, 2 runs | 51.4M cand | 5,242,106 | 5.85–5.97 s | 1494–1689 | 554–617 | 1661–1695 | 371–373 | 424–432 | 219–226 | 180–235 | 10.6 GiB |
 | dev48m, cold page cache (first run) | 51.4M cand | 5,242,106 | 8.50 s | 2157 | 979 | 3014 | 464 | 438 | 246 | 272 | 10.5 GiB |
+| dev48m + 12M clicks (both tables), Docker 24g, warm | 51.4M cand + 12.1M clicks | 5.24M + 28,014 | 5.13 s | 542 | 536 | 1635 | 50 | 345 | 471 (+attr) | 221 | 8.0 GiB |
+| same, cold first run | | | 7.06 s | 1636 | 712 | 1712 | 90 | 385 | 482 | 460 | 7.9 GiB |
+| dev 1M + 250K clicks (both tables), `make run-dev` | 1.07M + 252K | 117,038 + 27,400 | 93 ms | 24 | 7 | 26 | 1 | 4 | 6 | 6 | 0.4 GiB |
+
+At 48M with clicks, click parse is 470–602 ms and click grouping is 67–142 ms.
 
 Worker threads are hard-capped at 8 (`CPU_BUDGET` in `main.c`); average busy cores measured 5.2–6.4. At 20M, kernel time (sys 6–10 s) exceeds user time (8.7–9.2 s): first-touch page faults on the large lazily committed buffers dominate. Pre-faulting per worker or reusing buffers across phases is the next candidate.
 

@@ -104,3 +104,19 @@ Errors found and fixed during testing:
 - Memory: per-person arrays were sized by hash-table slots (about 3× candidates). They are now compacted to dense person IDs, and buffers are freed per phase (about 1 GB saved at 20M events).
 
 The reference implementation was itself validated against `../dev-answer` (MATCH) before being used as an oracle.
+
+## Clicks (clicks_c_assembly_spec.md), 2026-11-22
+
+| Stage | Test | Result |
+|---|---|---|
+| S1–S2 | `make unit` (adds `evx_memcmp` cases) | 110/110 |
+| S3 | `make fixtures-native` and `make fixtures` (official harness, Docker, both tables) | 36/36 both |
+| S3 | `make run-dev` then `make check-dev ANSWER=../dev-answer` | MATCH, both tables (117,038 + 27,400 rows) |
+| S4 | generator seeds 2, 3, 4 (1M) and 11 (3M) vs full reference (`make check-reference`) | MATCH |
+| S4 | `make fuzz-data` seeds 1–8 with click edge cases vs reference | MATCH |
+| S4 | `CPUS` = 1, 3, 8 | identical (MATCH) |
+| S4 | 48M events + 12M clicks, Docker, 8 CPU / 24 GB | 5.13 s warm, 7.06 s cold, 8.2 GiB peak, invariants OK |
+
+Errors found during testing:
+- The Parquet footer still had a hard-coded 6-column list (it broke the 7-column table); fixed.
+- The fuzzer generated one `click_id` for different clicks, which the rules exclude; fixed. The engine was not at fault.

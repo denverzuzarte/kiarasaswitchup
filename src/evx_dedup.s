@@ -174,28 +174,11 @@ evx_collect:
         test    rdi, rdi
         jz      .Lco_slot                   # kept copy is invalid: event dropped
         mov     esi, dword ptr [rcx + 32]
-        call    evx_hash                    # rax = hash(user id)
-        mov     r8, rax
-        cmp     qword ptr [rbp + 32], 0
-        je      .Lco_self
-        mov     rcx, qword ptr [rsp + 40]
-        mov     rdi, qword ptr [rbp + 32]
-        mov     rsi, qword ptr [rbp + 40]
-        mov     rdx, qword ptr [rcx + 24]
-        mov     ecx, dword ptr [rcx + 32]
-        call    evx_lookup                  # preserves r8
-        test    rax, rax
-        jz      .Lco_self
-        mov     rsi, qword ptr [rax + 16]   # canonical name
-        mov     edx, dword ptr [rax + 24]
-        mov     r11d, dword ptr [rax + 28]
-        jmp     .Lco_intern
-.Lco_self:
-        mov     rcx, qword ptr [rsp + 40]
-        mov     rsi, qword ptr [rcx + 24]
-        mov     edx, dword ptr [rcx + 32]
-        mov     r11, r8
-        shr     r11, 32
+        mov     rdx, qword ptr [rbp + 32]   # link table (may be NULL)
+        mov     rcx, qword ptr [rbp + 40]
+        call    evx_canon                   # shared with evx_parse_clicks
+        mov     rsi, rax                    # canonical name
+        mov     r11, rcx                    # tag; rdx = len
 .Lco_intern:
         # rsi = name, edx = len, r11d = tag
         mov     r10, r11
