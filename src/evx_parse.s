@@ -82,11 +82,11 @@ evx_parse_events:
         mov     r13, rsi                # cursor (line start)
         mov     r14, rdx                # end
         mov     eax, 0x0A
-        vpbroadcastb zmm20, eax
+        vpbroadcastb xmm20, eax
         mov     eax, 0x2C
-        vpbroadcastb zmm21, eax
+        vpbroadcastb xmm21, eax
         mov     eax, 0x22
-        vpbroadcastb zmm22, eax
+        vpbroadcastb xmm22, eax
 
 .Lline:
         cmp     r13, r14
@@ -99,15 +99,15 @@ evx_parse_events:
 .Lscan:
         mov     rcx, r14
         sub     rcx, r8                 # remaining bytes
-        cmp     rcx, 64
+        cmp     rcx, 16
         jb      .Lpartial
-        vmovdqu8 zmm16, zmmword ptr [r8]
-        vpcmpeqb k1, zmm16, zmm20
-        vpcmpeqb k2, zmm16, zmm21
-        vpcmpeqb k3, zmm16, zmm22
-        kmovq   rax, k1
-        kmovq   rdx, k2
-        kmovq   r11, k3
+        vmovdqu8 xmm16, xmmword ptr [r8]
+        vpcmpeqb k1, xmm16, xmm20
+        vpcmpeqb k2, xmm16, xmm21
+        vpcmpeqb k3, xmm16, xmm22
+        kmovw   eax, k1
+        kmovw   edx, k2
+        kmovw   r11d, k3
         test    rax, rax
         jnz     .Lhas_nl
         popcnt  r11, r11
@@ -125,20 +125,20 @@ evx_parse_events:
         blsr    rdx, rdx
         jmp     .Lc_full
 .Lc_full_done:
-        add     r8, 64
+        add     r8, 16
         jmp     .Lscan
 
 .Lpartial:
         mov     rax, -1
         bzhi    rax, rax, rcx
-        kmovq   k4, rax
-        vmovdqu8 zmm16{k4}{z}, zmmword ptr [r8]
-        vpcmpeqb k1, zmm16, zmm20
-        vpcmpeqb k2, zmm16, zmm21
-        vpcmpeqb k3, zmm16, zmm22
-        kmovq   rax, k1
-        kmovq   rdx, k2
-        kmovq   r11, k3
+        kmovw   k4, eax
+        vmovdqu8 xmm16{k4}{z}, xmmword ptr [r8]
+        vpcmpeqb k1, xmm16, xmm20
+        vpcmpeqb k2, xmm16, xmm21
+        vpcmpeqb k3, xmm16, xmm22
+        kmovw   eax, k1
+        kmovw   edx, k2
+        kmovw   r11d, k3
         bts     rax, rcx                # virtual newline at the range end
 .Lhas_nl:
         tzcnt   rsi, rax                # newline position in block
@@ -236,11 +236,11 @@ evx_parse_events:
         pop     r8
         pop     r8
         mov     ecx, 0x0A
-        vpbroadcastb zmm20, ecx
+        vpbroadcastb xmm20, ecx
         mov     ecx, 0x2C
-        vpbroadcastb zmm21, ecx
+        vpbroadcastb xmm21, ecx
         mov     ecx, 0x22
-        vpbroadcastb zmm22, ecx
+        vpbroadcastb xmm22, ecx
         mov     r15, rax
         mov     rcx, rax
         sub     rcx, qword ptr [r12 + 56]

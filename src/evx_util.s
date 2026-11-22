@@ -82,16 +82,16 @@ evx_hash:
         .type   evx_memeq, @function
         .p2align 5
 evx_memeq:
-        cmp     rdx, 64
+        cmp     rdx, 16
         ja      .Lm_long
         mov     r11, -1
         bzhi    r11, r11, rdx
-        kmovq   k1, r11
-        vmovdqu8 zmm16{k1}{z}, zmmword ptr [rdi]
-        vmovdqu8 zmm17{k1}{z}, zmmword ptr [rsi]
-        vpcmpb  k2, zmm16, zmm17, 4
+        kmovw   k1, r11d
+        vmovdqu8 xmm16{k1}{z}, xmmword ptr [rdi]
+        vmovdqu8 xmm17{k1}{z}, xmmword ptr [rsi]
+        vpcmpb  k2, xmm16, xmm17, 4
         xor     eax, eax
-        kortestq k2, k2
+        kortestw k2, k2
         setz    al
         ret
 .Lm_long:
@@ -99,24 +99,24 @@ evx_memeq:
         push    rsi
         push    rdx
 .Lm_loop:
-        cmp     rdx, 64
+        cmp     rdx, 16
         jb      .Lm_ltail
-        vmovdqu8 zmm16, zmmword ptr [rdi]
-        vpcmpb  k2, zmm16, zmmword ptr [rsi], 4
-        kortestq k2, k2
+        vmovdqu8 xmm16, xmmword ptr [rdi]
+        vpcmpb  k2, xmm16, xmmword ptr [rsi], 4
+        kortestw k2, k2
         jnz     .Lm_ne
-        add     rdi, 64
-        add     rsi, 64
-        sub     rdx, 64
+        add     rdi, 16
+        add     rsi, 16
+        sub     rdx, 16
         jmp     .Lm_loop
 .Lm_ltail:
         mov     r11, -1
         bzhi    r11, r11, rdx
-        kmovq   k1, r11
-        vmovdqu8 zmm16{k1}{z}, zmmword ptr [rdi]
-        vmovdqu8 zmm17{k1}{z}, zmmword ptr [rsi]
-        vpcmpb  k2, zmm16, zmm17, 4
-        kortestq k2, k2
+        kmovw   k1, r11d
+        vmovdqu8 xmm16{k1}{z}, xmmword ptr [rdi]
+        vmovdqu8 xmm17{k1}{z}, xmmword ptr [rsi]
+        vpcmpb  k2, xmm16, xmm17, 4
+        kortestw k2, k2
         jnz     .Lm_ne
         mov     eax, 1
         jmp     .Lm_out
@@ -320,27 +320,27 @@ evx_split_line:
         xor     r12d, r12d              # quote count
         xor     r13d, r13d              # wrapped fields
         mov     eax, 0x2C
-        vpbroadcastb zmm21, eax
+        vpbroadcastb xmm21, eax
         mov     eax, 0x22
-        vpbroadcastb zmm22, eax
+        vpbroadcastb xmm22, eax
 .Lsl_blk:
         mov     rcx, r9
         sub     rcx, r8
         jbe     .Lsl_last
-        cmp     rcx, 64
+        cmp     rcx, 16
         jb      .Lsl_part
-        vmovdqu8 zmm16, zmmword ptr [r8]
+        vmovdqu8 xmm16, xmmword ptr [r8]
         jmp     .Lsl_cmp
 .Lsl_part:
         mov     rax, -1
         bzhi    rax, rax, rcx
-        kmovq   k1, rax
-        vmovdqu8 zmm16{k1}{z}, zmmword ptr [r8]
+        kmovw   k1, eax
+        vmovdqu8 xmm16{k1}{z}, xmmword ptr [r8]
 .Lsl_cmp:
-        vpcmpeqb k2, zmm16, zmm21
-        vpcmpeqb k3, zmm16, zmm22
-        kmovq   r14, k2
-        kmovq   rax, k3
+        vpcmpeqb k2, xmm16, xmm21
+        vpcmpeqb k3, xmm16, xmm22
+        kmovw   r14d, k2
+        kmovw   eax, k3
         popcnt  rax, rax
         add     r12, rax
 .Lsl_comma:
@@ -355,7 +355,7 @@ evx_split_line:
         blsr    r14, r14
         jmp     .Lsl_comma
 .Lsl_nextblk:
-        add     r8, 64
+        add     r8, 16
         jmp     .Lsl_blk
 .Lsl_last:
         mov     r15, r9
@@ -422,7 +422,7 @@ evx_split_line:
 #   separators and an unsigned <= 9 compare for the digits (two k-masks),
 #   then vpshufb gathers the 7 digit pairs and vpmaddubsw (x10, x1) turns
 #   them into 7 two-digit words in one instruction.
-#   Clobbers rax, rcx, rdx, rsi, rdi, r8-r11, k1-k3, ymm16-ymm19.
+#   Clobbers rax, rcx, rdx, rsi, rdi, r8-r11, k1-k3, xmm16-xmm19.
 # ---------------------------------------------------------------------------
         .globl  evx_parse_ts
         .type   evx_parse_ts, @function
@@ -479,22 +479,37 @@ evx_parse_ts:
         jne     .Lts_dt
         neg     r10
 .Lts_dt:
-        mov     eax, 0x7FFFF            # 19 bytes of date-time
-        kmovd   k1, eax
-        vmovdqu8 ymm16{k1}{z}, ymmword ptr [rdi]
-        vpcmpeqb k2, ymm16, ymmword ptr [rip + .Lts_tmpl]
-        vpsubb  ymm17, ymm16, ymmword ptr [rip + .Lts_zero]
-        vpcmpub k3, ymm17, ymmword ptr [rip + .Lts_nine], 2
-        kmovd   eax, k2
-        kmovd   ecx, k3
+        # bytes 0..15: plain 16-byte load (len is 20 or 25 here)
+        vmovdqu8 xmm16, xmmword ptr [rdi]
+        vpcmpeqb k2, xmm16, xmmword ptr [rip + .Lts_tmpl]
+        vpsubb  xmm17, xmm16, xmmword ptr [rip + .Lts_zero]
+        vpcmpub k3, xmm17, xmmword ptr [rip + .Lts_nine], 2
+        kmovw   eax, k2
+        kmovw   ecx, k3
+        vpshufb xmm18, xmm17, xmmword ptr [rip + .Lts_shuf]
+        vpmaddubsw xmm19, xmm18, xmmword ptr [rip + .Lts_w101]
+        vmovdqu64 xmmword ptr [rsp - 40], xmm19       # red zone
+        # bytes 16..18: masked 3-byte load
+        mov     edx, 7
+        kmovw   k1, edx
+        vmovdqu8 xmm16{k1}{z}, xmmword ptr [rdi + 16]
+        vpcmpeqb k2, xmm16, xmmword ptr [rip + .Lts_tmpl + 16]
+        vpsubb  xmm17, xmm16, xmmword ptr [rip + .Lts_zero]
+        vpcmpub k3, xmm17, xmmword ptr [rip + .Lts_nine], 2
+        kmovw   edx, k2
+        shl     edx, 16
+        or      eax, edx
+        kmovw   edx, k3
+        shl     edx, 16
+        or      ecx, edx
         and     eax, 0x12490            # separator positions 4,7,10,13,16
         and     ecx, 0x6DB6F            # digit positions
         or      eax, ecx
         cmp     eax, 0x7FFFF
         jne     .Lts_bad
-        vpshufb ymm18, ymm17, ymmword ptr [rip + .Lts_shuf]
-        vpmaddubsw ymm19, ymm18, ymmword ptr [rip + .Lts_w101]
-        vmovdqu64 ymmword ptr [rsp - 40], ymm19       # red zone
+        vpshufb xmm18, xmm17, xmmword ptr [rip + .Lts_shuf + 16]
+        vpmaddubsw xmm19, xmm18, xmmword ptr [rip + .Lts_w101]
+        vmovdqu64 xmmword ptr [rsp - 24], xmm19
         movzx   eax, word ptr [rsp - 40]                # YY (hi)
         movzx   ecx, word ptr [rsp - 38]                # YY (lo)
         movzx   r8d, word ptr [rsp - 36]                # month

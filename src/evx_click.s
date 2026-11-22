@@ -71,26 +71,26 @@ evx_memcmp:
         cmp     rcx, r8
         cmovb   r8, rcx                 # common length
 .Lmc_loop:
-        cmp     r8, 64
+        cmp     r8, 16
         jb      .Lmc_tail
-        vmovdqu8 zmm16, zmmword ptr [rdi]
-        vmovdqu8 zmm17, zmmword ptr [rdx]
-        vpcmpb  k2, zmm16, zmm17, 4
-        kmovq   r11, k2
+        vmovdqu8 xmm16, xmmword ptr [rdi]
+        vmovdqu8 xmm17, xmmword ptr [rdx]
+        vpcmpb  k2, xmm16, xmm17, 4
+        kmovw   r11d, k2
         test    r11, r11
         jnz     .Lmc_diff
-        add     rdi, 64
-        add     rdx, 64
-        sub     r8, 64
+        add     rdi, 16
+        add     rdx, 16
+        sub     r8, 16
         jmp     .Lmc_loop
 .Lmc_tail:
         mov     r11, -1
         bzhi    r11, r11, r8
-        kmovq   k1, r11
-        vmovdqu8 zmm16{k1}{z}, zmmword ptr [rdi]
-        vmovdqu8 zmm17{k1}{z}, zmmword ptr [rdx]
-        vpcmpb  k2, zmm16, zmm17, 4
-        kmovq   r11, k2
+        kmovw   k1, r11d
+        vmovdqu8 xmm16{k1}{z}, xmmword ptr [rdi]
+        vmovdqu8 xmm17{k1}{z}, xmmword ptr [rdx]
+        vpcmpb  k2, xmm16, xmm17, 4
+        kmovw   r11d, k2
         test    r11, r11
         jnz     .Lmc_diff
         xor     eax, eax
@@ -298,11 +298,11 @@ evx_parse_clicks:
         mov     rbx, rcx                # out base
         mov     qword ptr [rsp + K_N], 0
         mov     eax, 0x0A
-        vpbroadcastb zmm20, eax
+        vpbroadcastb xmm20, eax
         mov     eax, 0x2C
-        vpbroadcastb zmm21, eax
+        vpbroadcastb xmm21, eax
         mov     eax, 0x22
-        vpbroadcastb zmm22, eax
+        vpbroadcastb xmm22, eax
 .Lk_line:
         cmp     r13, r14
         jae     .Lk_done
@@ -313,15 +313,15 @@ evx_parse_clicks:
 .Lk_scan:
         mov     rcx, r14
         sub     rcx, r8
-        cmp     rcx, 64
+        cmp     rcx, 16
         jb      .Lk_partial
-        vmovdqu8 zmm16, zmmword ptr [r8]
-        vpcmpeqb k1, zmm16, zmm20
-        vpcmpeqb k2, zmm16, zmm21
-        vpcmpeqb k3, zmm16, zmm22
-        kmovq   rax, k1
-        kmovq   rdx, k2
-        kmovq   r11, k3
+        vmovdqu8 xmm16, xmmword ptr [r8]
+        vpcmpeqb k1, xmm16, xmm20
+        vpcmpeqb k2, xmm16, xmm21
+        vpcmpeqb k3, xmm16, xmm22
+        kmovw   eax, k1
+        kmovw   edx, k2
+        kmovw   r11d, k3
         test    rax, rax
         jnz     .Lk_has_nl
         popcnt  r11, r11
@@ -339,19 +339,19 @@ evx_parse_clicks:
         blsr    rdx, rdx
         jmp     .Lk_cf
 .Lk_cf_done:
-        add     r8, 64
+        add     r8, 16
         jmp     .Lk_scan
 .Lk_partial:
         mov     rax, -1
         bzhi    rax, rax, rcx
-        kmovq   k4, rax
-        vmovdqu8 zmm16{k4}{z}, zmmword ptr [r8]
-        vpcmpeqb k1, zmm16, zmm20
-        vpcmpeqb k2, zmm16, zmm21
-        vpcmpeqb k3, zmm16, zmm22
-        kmovq   rax, k1
-        kmovq   rdx, k2
-        kmovq   r11, k3
+        kmovw   k4, eax
+        vmovdqu8 xmm16{k4}{z}, xmmword ptr [r8]
+        vpcmpeqb k1, xmm16, xmm20
+        vpcmpeqb k2, xmm16, xmm21
+        vpcmpeqb k3, xmm16, xmm22
+        kmovw   eax, k1
+        kmovw   edx, k2
+        kmovw   r11d, k3
         bts     rax, rcx
 .Lk_has_nl:
         tzcnt   rsi, rax
@@ -586,8 +586,10 @@ evx_parse_clicks:
         mov     eax, dword ptr [rax + r9*4]     # dense person id
         mov     r8, qword ptr [r12 + 72]
         lock inc dword ptr [r8 + rax*4]
-        vmovdqu64 ymm16, ymmword ptr [rsi]
-        vmovdqu64 ymmword ptr [rdi], ymm16
+        vmovdqu64 xmm16, xmmword ptr [rsi]
+        vmovdqu64 xmm17, xmmword ptr [rsi + 16]
+        vmovdqu64 xmmword ptr [rdi], xmm16
+        vmovdqu64 xmmword ptr [rdi + 16], xmm17
         mov     dword ptr [rdi + 8], eax
         add     rdi, 32
 .Lk_fc_next:
