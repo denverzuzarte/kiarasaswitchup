@@ -218,6 +218,19 @@ Phase times at 20M (wall, 8 workers): links + products 29 ms, P1 parse 229 ms, P
 
 Result (`make bench REVS="main HEAD" RUNS=5`, dev20m): **main 622 ms, r7-core 599 ms median** (−4%), CPU 4447 → 4297 ms, peak RSS 3651 → 3074 MiB. About 1.85 GB of that RSS is the mapped input (page cache counted in RSS); the anonymous part is about 1.2 GB. The plan estimated 420–460 ms. Parse absorbed most of what collect saved: the raw-ID probe per row costs about as much as collect's per-winner probe did. Outputs are identical to eeb320a on dev20m (NCPU 1/2/3/8, `EVX_PSIZE=1024`, `EVX_RSIZE=4096`), on the dev answer, on the 36 fixtures, and on fuzz seeds 3 and 11 against `reference_events.py`.
 
+## 6k. Round 7b: measurements toward Cascade Lake (branch r7b)
+
+Host: Zen 5 (Ryzen 7 9700X), dev20m native, interleaved `wait4` timing, 7-11 runs. Round 7 here: 574-595 ms min, 588-615 ms median (host noise of about +-10 ms between batches). The scorer is Cascade Lake (round 7 measured about 1.3 s there), so where a choice is neutral here it goes to what suits Cascade Lake: 256-bit vectors, fewer branch misses, fewer pages touched.
+
+| # | Change | Effect |
+|---|---|---|
+| 7b.1 | **Kept.** `evx_dedup_emit` walk: 4 table slots per group, one `vptestmq` (ymm, 256-bit) mask of the occupied slots, then only the set bits are visited (`tzcnt`/`blsr`). The two lookahead prefetches are branchless (an empty slot's remap prefetch goes to `remap[0]` through a zero Rec) | branch misses 121M -> 103M (-15%), user cycles -1%; wall within noise here (612 vs 617 ms median, 595 vs 599 min). Kept for Cascade Lake, where a mispredict costs more |
+| 7b.2 | Rejected: parse comma extraction unrolled and branchless (8 unconditional `tzcnt`/`blsr` stores per block, count by `popcnt`) | branch misses -2%, instructions +1%, wall 593 vs 588 ms median: no gain |
+| 7b.3 | Rejected: 256-bit (ymm) parse scanner with 32-byte blocks | +15 ms median here (607 vs 588): rows are about 80 bytes, so 32-byte blocks need 3-4 iterations per row. `vpcmpeqb` on zmm is an AVX-512 "light" instruction (licence 1), so the zmm scanner stays; worth one A/B on Cascade Lake |
+| 7b.4 | Rejected: `MADV_HUGEPAGE` on the Rec arena | 793 vs 594 ms median, sys 0.85 -> 1.65 s: THP compaction on first touch (1 GB free on the host), as in 6i.1 |
+
+Not attempted in this round (still open): a structural mask shared across rows, a per-worker cache of recent raw user ids in front of the raw-ID table, and overlapping C1 with P2.
+
 ## 7. OS and memory (C side, in support of the asm)
 
 - **Lazily committed** `MAP_NORESERVE` anonymous buffers sized by worst-case bounds (≥ 8 bytes per candidate row). Untouched pages cost nothing, so no growth or realloc logic is needed in asm.

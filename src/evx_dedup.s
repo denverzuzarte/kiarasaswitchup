@@ -97,6 +97,11 @@ evx_eid_eq:
         .set    EM_PF2, 24
 .endif
 
+        .section .rodata
+        .p2align 5
+.Lzero_rec:
+        .zero   32
+        .text
         .globl  evx_dedup_emit
         .type   evx_dedup_emit, @function
         .p2align 5
@@ -236,27 +241,38 @@ evx_dedup_emit:
 .Lem:
         cmp     r14, r12
         jae     .Lrecycle
-        mov     rcx, qword ptr [rbx + r14*8 + 8*EM_PF1]
+        # 4 slots per group: prefetches for slots +EM_PF1 / +EM_PF2 without
+        # branches (an empty slot's remap prefetch goes to remap[0]), then
+        # only the occupied slots of the group are visited (mask bits)
+        .irp    j, 0,1,2,3
+        mov     rcx, qword ptr [rbx + r14*8 + 8*EM_PF1 + 8*\j]
         shl     rcx, 16
         shr     rcx, 16
         prefetcht0 [rcx]
-        mov     rcx, qword ptr [rbx + r14*8 + 8*EM_PF2]
-        test    rcx, rcx
-        jz      .Lem_nopf
+        mov     rcx, qword ptr [rbx + r14*8 + 8*EM_PF2 + 8*\j]
         shl     rcx, 16
         shr     rcx, 16
+        lea     rdx, [rip + .Lzero_rec]
+        cmovz   rcx, rdx
         mov     ecx, dword ptr [rcx + 24]
         prefetcht0 [r13 + rcx*4]
-.Lem_nopf:
-        mov     rcx, qword ptr [rbx + r14*8]
-        inc     r14
-        test    rcx, rcx
+        .endr
+        vmovdqu64 ymm16, ymmword ptr [rbx + r14*8]
+        vptestmq k1, ymm16, ymm16
+        kmovb   r15d, k1
+        add     r14, 4
+.Lem_bit:
+        test    r15d, r15d
         jz      .Lem
+        tzcnt   eax, r15d
+        blsr    r15d, r15d
+        lea     rcx, [r14 + rax - 4]
+        mov     rcx, qword ptr [rbx + rcx*8]
         shl     rcx, 16
         shr     rcx, 16                         # winner Rec
         mov     eax, dword ptr [rcx + 24]       # rid
         cmp     eax, -1
-        je      .Lem                            # kept copy invalid: dropped
+        je      .Lem_bit                        # kept copy invalid: dropped
         mov     eax, dword ptr [r13 + rax*4]    # dense pid
         mov     edx, dword ptr [rbp + D_DSH]
         shrx    r8d, eax, edx                   # person range
@@ -308,7 +324,7 @@ evx_dedup_emit:
         mov     esi, dword ptr [rcx + 28]       # price_cat
         mov     dword ptr [r10 + 12], esi
         inc     qword ptr [rsp + 16]
-        jmp     .Lem
+        jmp     .Lem_bit
 
         # ---- recycle the partition's Rec chunks --------------------------------
 .Lrecycle:
