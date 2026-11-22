@@ -737,6 +737,9 @@ int main(int argc, char **argv)
         fprintf(stderr, "out of memory (candidates)\n");
         return 1;
     }
+#ifndef EVX_POPULATE
+#define EVX_POPULATE 0     /* measured: pre-faulting slabs is ~18 ms slower at 20M */
+#endif
     uint64_t slab_next = 0;
 
     /* ---- P1 parse (+ raw-ID intern) ------------------------------------------
@@ -783,7 +786,7 @@ int main(int argc, char **argv)
         slab_next = 0;
         for (unsigned w = 0; w < nw; w++)
             slabs[w] = (Slab){.arena = arena, .next = &slab_next, .nslabs = nslabs,
-                              .populate = 1};
+                              .populate = EVX_POPULATE};
         for (size_t i = 0; i < (size_t)nw * P; i++)
             heads[i] = (PartHead){NULL, NULL, CHUNK_NONE, 0, 0};
         atomic_store(&ps.overflow, 0);
@@ -1190,7 +1193,11 @@ int main(int argc, char **argv)
     static WriteArgs wa;
     wa = (WriteArgs){.st = stasks, .tb = tb, .pnames = pnames, .cats = dict.cats, .odir = odir};
     q = (Queue){.tasks = &wa};
-    pool_run(job_write, &q);
+    pool_start(job_write, &q);
+    /* the chunk arena (Recs, Wins) is dead after P6: unmap it on the idle
+       coordinator while the workers write Parquet */
+    big_free(arena, arena_bytes);
+    pool_wait();
     pool_shutdown();
     if (wa.rc)
         return 1;

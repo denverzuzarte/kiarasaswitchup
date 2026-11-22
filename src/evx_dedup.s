@@ -87,6 +87,9 @@ evx_eid_eq:
         .set    D_FREE,  64
         .set    D_SLAB,  72
         .set    DFRAME,  40             # == 8 mod 16: calls aligned
+.ifndef IN_PF
+        .set    IN_PF, 0                # insert: home-slot prefetch distance (measured: no gain)
+.endif
 .ifndef EM_PF1
         .set    EM_PF1, 48              # table is zeroed 64 slots past tsize
 .endif
@@ -145,6 +148,22 @@ evx_dedup_emit:
 .Lin_rec:
         cmp     r14, r15
         jae     .Lin_cnext
+.if IN_PF
+        # prefetch the home slot of the Rec IN_PF ahead (clamped to the chunk)
+        lea     rsi, [r14 + 32*IN_PF]
+        lea     rdi, [r15 - 32]
+        cmp     rsi, rdi
+        cmova   rsi, rdi
+        mov     eax, dword ptr [rsi]
+        and     eax, 0xFFFFFF
+        movzx   ecx, byte ptr [rsi + 14]        # hash bits 24..31
+        shl     ecx, 24
+        or      eax, ecx
+        shlx    eax, eax, r10d
+        imul    rax, r12
+        shr     rax, 32
+        prefetcht0 [rbx + rax*8]
+.endif
         mov     r8, qword ptr [r14]             # ki
         mov     r9, qword ptr [r14 + 8]         # eptr
         mov     eax, r8d
