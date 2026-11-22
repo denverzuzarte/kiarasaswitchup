@@ -1,0 +1,13 @@
+{
+  "goal": "In `evx_collect` (src/evx_dedup.s), stage 3 calls evx_canon to map a raw user id to its canonical person name, then always calls evx_khash on the result to find the person-table slot. Stage 2 already hashed the raw id (evx_khash, rax). When evx_canon returns the raw id unchanged (an unlinked user, or the user that is itself the canonical smallest name), the second hash is redundant. Keep the stage-2 hash in a frame slot (the frame has spare room: add a new per-batch array) and in stage 3 reuse it when the canonical key equals the raw key (compare both words), skipping the second evx_khash call. Results must be identical.",
+  "editable": ["src/evx_dedup.s"],
+  "context": [
+    {"file": "src/evx_dedup.s", "function": "evx_collect"},
+    {"file": "src/evx_click.s", "function": "evx_canon"}
+  ],
+  "hints": [
+    "evx_khash clobbers only rax and r11 and returns the full 64-bit hash; the slot index is hash & person_mask (r13) - store the full hash, mask later.",
+    "Frame layout: B_C, B_K0, B_K1, B_H are 8*BATCH arrays; B_PN/B_PEND follow. If you add an array, keep CFRAME so that rsp stays 16-byte aligned at calls (CFRAME must stay == 8 mod 16).",
+    "In the no-links path (link_slots == NULL) stage 2 already computes the slot; do not break it."
+  ]
+}

@@ -1,0 +1,6 @@
+{
+  "goal": "evx_khash: replace the 3-multiply fmix64 chain with two crc32 instructions (CRC32C of the 16-byte key). Only the low 32 bits of the hash are used anywhere.",
+  "editable": ["src/evx_util.s"],
+  "patch": "/home/denver/Hackathon/soln/.claude/worktrees/claude-optimal_path/build/intern/arch-patches/khash_crc.patch",
+  "attempts": 1
+}

@@ -1,0 +1,52 @@
+--- a/src/evx_util.s
++++ b/src/evx_util.s
+@@ -171,7 +171,7 @@
+ 
+ # ---------------------------------------------------------------------------
+ # uint64_t evx_khash(uint64_t k0 /*rdi*/, uint64_t k1 /*rsi*/)
+-#   Table index hash of a Key16: fmix64(k0 * K ^ k1); a long key hashes k1
++#   Table index hash of a Key16: CRC32C(k0, k1) (low 32 bits); a long key hashes k1
+ #   only (k0 is a pointer, so equal long ids at different addresses must hash
+ #   alike). Clobbers rax and r11 only.
+ # ---------------------------------------------------------------------------
+@@ -179,29 +179,18 @@
+         .type   evx_khash, @function
+         .p2align 5
+ evx_khash:
+-        mov     rax, rsi
+-        shr     rax, 56
+-        cmp     eax, 0xFF
+-        mov     rax, rdi
+-        jne     .Lkh_mix
++        # hardware CRC32C over the 16-byte key: 2 dependent 3-cycle ops instead
++        # of a 3-multiply fmix64 chain; only the low 32 bits are ever used
++        # (table masks, dedup partition / index), and all of them are mixed
++        mov     r11, rsi
++        shr     r11, 56
+         xor     eax, eax
+-.Lkh_mix:
+-        movabs  r11, 0x9E3779B97F4A7C15
+-        imul    rax, r11
+-        xor     rax, rsi
+-        mov     r11, rax
+-        shr     r11, 33
+-        xor     rax, r11
+-        movabs  r11, 0xFF51AFD7ED558CCD
+-        imul    rax, r11
+-        mov     r11, rax
+-        shr     r11, 33
+-        xor     rax, r11
+-        movabs  r11, 0xC4CEB9FE1A85EC53
+-        imul    rax, r11
+-        mov     r11, rax
+-        shr     r11, 33
+-        xor     rax, r11
++        cmp     r11d, 0xFF
++        cmovne  rax, rdi                # a long key hashes k1 only (k0 is a pointer)
++        mov     r11d, 0xFFFFFFFF
++        crc32   r11, rax
++        crc32   r11, rsi
++        mov     eax, r11d
+         ret
+         .size   evx_khash, .-evx_khash
+ 

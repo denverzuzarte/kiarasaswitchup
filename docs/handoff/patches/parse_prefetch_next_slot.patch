@@ -1,0 +1,11 @@
+--- a/src/evx_parse.s
++++ b/src/evx_parse.s
+@@ -242,6 +242,8 @@
+         mov     rax, qword ptr [rsp + L_K1]
+         mov     qword ptr [r15 + 8], rax
+         mov     dword ptr [r15 + 52], r9d
++        prefetchw [r15 + 111]                   # this partition's next Cand slot: warm
++                                                # long before its next row (~P rows later)
+ 
+         # ---- ingest_ts (always F1 per rules; defensive) --------------------
+         mov     rdi, qword ptr [rsp + F_ING]

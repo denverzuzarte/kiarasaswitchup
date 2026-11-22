@@ -1,0 +1,47 @@
+--- a/src/evx_util.s
++++ b/src/evx_util.s
+@@ -495,6 +495,18 @@
+         vpshufb ymm18, ymm17, ymmword ptr [rip + .Lts_shuf]
+         vpmaddubsw ymm19, ymm18, ymmword ptr [rip + .Lts_w101]
+         vmovdqu64 ymmword ptr [rsp - 40], ymm19       # red zone
++        # per-thread memo of the last date: rows of a file mostly share their
++        # YYYY-MM-DD, so identical date bytes reuse the validated day number
++        mov     rsi, qword ptr [rdi]                    # "YYYY-MM-"
++        movzx   edi, word ptr [rdi + 8]                 # "DD" (edi: untouched below)
++        mov     qword ptr [rsp - 56], rsi               # red zone, below the words
++        cmp     rsi, qword ptr fs:evx_ts_memo_key@tpoff
++        jne     .Lts_civil
++        cmp     edi, dword ptr fs:evx_ts_memo_dd@tpoff
++        jne     .Lts_civil
++        mov     rdx, qword ptr fs:evx_ts_memo_days@tpoff
++        jmp     .Lts_tod
++.Lts_civil:
+         movzx   eax, word ptr [rsp - 40]                # YY (hi)
+         movzx   ecx, word ptr [rsp - 38]                # YY (lo)
+         movzx   r8d, word ptr [rsp - 36]                # month
+@@ -559,6 +571,11 @@
+         sub     ecx, esi                # doe
+         add     rdx, rcx
+         sub     rdx, 865565             # 719468 + 146097
++        mov     rcx, qword ptr [rsp - 56]
++        mov     qword ptr fs:evx_ts_memo_key@tpoff, rcx
++        mov     dword ptr fs:evx_ts_memo_dd@tpoff, edi
++        mov     qword ptr fs:evx_ts_memo_days@tpoff, rdx
++.Lts_tod:
+         # time of day
+         movzx   eax, word ptr [rsp - 32]                # hour
+         movzx   ecx, word ptr [rsp - 30]                # minute
+@@ -627,4 +644,13 @@
+ .Lts_dim:
+         .byte 31,28,31,30,31,30,31,31,30,31,30,31
+ 
++        .section .tbss,"awT",@nobits
++        .p2align 3
++evx_ts_memo_key:
++        .zero   8                       # 0 never equals ASCII date bytes
++evx_ts_memo_days:
++        .zero   8
++evx_ts_memo_dd:
++        .zero   4
++
+         .section .note.GNU-stack,"",@progbits

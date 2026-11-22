@@ -1,0 +1,6 @@
+{
+  "goal": "evx_parse_events: prefetchw the partition's next Cand slot right after writing the current one (8.7% of parse samples sit on the first store into a cold chunk line).",
+  "editable": ["src/evx_parse.s"],
+  "patch": "/home/denver/Hackathon/soln/.claude/worktrees/claude-optimal_path/build/intern/arch-patches/parse_prefetch_next_slot.patch",
+  "attempts": 1
+}

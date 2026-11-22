@@ -1,0 +1,14 @@
+{
+  "goal": "Speed up `links_finish` in src/dict.c. It runs on worker 0 during the event parse, costs ~113 ms of CPU at 20M events, and runs at IPC 0.27 (memory-bound). perf attributes ~38% of its time to the final loop `lb->slots[lb->dslot[i]].val = lb->dkey[aux[dsu_find(parent, i)]]` (random writes into a 38 MB LookupEntry table) and ~36% to the smallest-name loop (random reads of lb->dkey[aux[r]]). Reduce the cache-miss stalls, e.g. by software-prefetching (__builtin_prefetch) the slot / dkey entries several iterations ahead, or by restructuring a loop so independent misses overlap. Results must be identical.",
+  "editable": ["src/dict.c"],
+  "context": [
+    {"file": "src/dict.c", "function": "links_finish"},
+    {"file": "src/dict.c", "function": "dsu_find"},
+    {"file": "src/dict.c", "function": "key_bytes"}
+  ],
+  "hints": [
+    "dsu_find does path halving and writes parent[]; keep the union order exactly as is (it decides component roots only, not names, but keep it simple).",
+    "A prefetch distance of 8-32 iterations is typical for DRAM latency at this loop's work per iteration.",
+    "The smallest-name rule (bytes_cmp, shorter prefix first) must not change."
+  ]
+}

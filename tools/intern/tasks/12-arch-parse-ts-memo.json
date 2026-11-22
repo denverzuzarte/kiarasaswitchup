@@ -1,0 +1,6 @@
+{
+  "goal": "evx_parse_ts: per-thread (TLS) memo of the last validated date bytes YYYY-MM-DD -> day number; identical date bytes skip the month/day checks and days_from_civil (4 multiplies). Time of day is still parsed and checked every call.",
+  "editable": ["src/evx_util.s"],
+  "patch": "/home/denver/Hackathon/soln/.claude/worktrees/claude-optimal_path/build/intern/arch-patches/parse_ts_date_memo.patch",
+  "attempts": 1
+}

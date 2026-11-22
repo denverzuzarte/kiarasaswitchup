@@ -1,0 +1,13 @@
+{
+  "goal": "Speed up `evx_count_range` and `evx_group_range` (src/evx_dedup.s). Per person range they walk Win chunk lists (4 KB chunks: [0] u32 count, [4] u32 next chunk index, Wins of 16 bytes from offset 16; a Win is ts_off u64 at 0, person slot u32 at 8, price_cat u32 at 12). count does cnt[remap[slot]]++; group does pos = cursor[k]++ and writes the Ev {ts_off, price_cat, 0} to dst + 16*pos. They run at IPC ~0.8. Ideas: unroll by 2-4 Wins with independent loads, prefetch the next chunk's first lines when starting a chunk, break the cursor load-increment-store dependency when consecutive Wins hit the same person. Results must be identical (Ev order within a person must not matter: the sessionizer sorts by ts, but keep every event).",
+  "editable": ["src/evx_dedup.s"],
+  "context": [
+    {"file": "src/evx_dedup.s", "function": "evx_count_range"},
+    {"file": "src/evx_dedup.s", "function": "evx_group_range"}
+  ],
+  "hints": [
+    "These are leaf functions: rax, rcx, rdx, rsi, rdi, r8-r11 are free; do not touch rbx, rbp, r12-r15 without saving them.",
+    "Chunk counts can be anything from 1 to 255; handle odd tails.",
+    "Both functions together are ~3% of all cycles: a win here is worth ~1% of wall time at most, so keep the change simple."
+  ]
+}
