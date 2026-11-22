@@ -202,19 +202,22 @@ evx_sessionize:
         mov     r9, r8
         shl     r9, 4
         add     r9, rdi                 # &a[i]
-        vmovdqu64 xmm16, xmmword ptr [r9]
         mov     r10, qword ptr [r9]     # key
+        mov     r11, qword ptr [r9 + 8]
 .Lis_inner:
         cmp     r9, rdi
         jbe     .Lis_place
         cmp     qword ptr [r9 - 16], r10
         jle     .Lis_place
-        vmovdqu64 xmm17, xmmword ptr [r9 - 16]
-        vmovdqu64 xmmword ptr [r9], xmm17
+        mov     rax, qword ptr [r9 - 16]
+        mov     rdx, qword ptr [r9 - 8]
+        mov     qword ptr [r9], rax
+        mov     qword ptr [r9 + 8], rdx
         sub     r9, 16
         jmp     .Lis_inner
 .Lis_place:
-        vmovdqu64 xmmword ptr [r9], xmm16
+        mov     qword ptr [r9], r10
+        mov     qword ptr [r9 + 8], r11
         inc     r8
         jmp     .Lis_outer
 .Lis_done:
@@ -306,8 +309,9 @@ evx_sessionize:
         mov     r8d, dword ptr [r9 + rdx*4]
         inc     dword ptr [r9 + rdx*4]
         shl     r8, 4
-        vmovdqu64 xmm16, xmmword ptr [rdi]
-        vmovdqu64 xmmword ptr [r13 + r8], xmm16
+        mov     rdx, qword ptr [rdi + 8]
+        mov     qword ptr [r13 + r8], rax
+        mov     qword ptr [r13 + r8 + 8], rdx
         add     rdi, 16
         cmp     rdi, rsi
         jb      .Lrx_sc

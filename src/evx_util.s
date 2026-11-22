@@ -16,6 +16,44 @@
         .intel_syntax noprefix
         .text
 
+# SWAR byte match (no SIMD): \out = 8-bit mask of the bytes of \w equal to the
+# byte broadcast in \c. Exact per byte (no borrow between bytes):
+#   x = w ^ c;  t = ((x & 0x7F..) + 0x7F..) | x;  bit 7 of t clear iff byte == 0;
+#   pext gathers the eight bit-7s.
+        .macro  SWARM out, w, x, c
+        mov     \x, \w
+        xor     \x, qword ptr [rip + \c]
+        mov     \out, \x
+        and     \out, qword ptr [rip + .Lsw_7f]
+        add     \out, qword ptr [rip + .Lsw_7f]
+        or      \out, \x
+        andn    \out, \out, qword ptr [rip + .Lsw_80]
+        pext    \out, \out, qword ptr [rip + .Lsw_80]
+        .endm
+# load \n (register, 0..7, preserved) bytes at \p into \dst (zero-filled
+# above), never touching a byte past p + n: byte loop, high byte first.
+        .macro  LOADN dst, dst8, p, n, cnt
+        xor     \dst, \dst
+        mov     \cnt, \n
+        test    \cnt, \cnt
+        jz      8f
+7:
+        shl     \dst, 8
+        mov     \dst8, byte ptr [\p + \cnt - 1]
+        dec     \cnt
+        jnz     7b
+8:
+        .endm
+
+        .section .rodata
+        .p2align 3
+.Lsw_7f:    .quad 0x7F7F7F7F7F7F7F7F
+.Lsw_80:    .quad 0x8080808080808080
+.Lsw_nl:    .quad 0x0A0A0A0A0A0A0A0A
+.Lsw_comma: .quad 0x2C2C2C2C2C2C2C2C
+.Lsw_quote: .quad 0x2222222222222222
+        .text
+
 # ---------------------------------------------------------------------------
 # uint64_t evx_hash(const void *p /*rdi*/, size_t len /*rsi*/)
 #   h = len * K; per 8-byte word: h = ((h ^ w) * K) ^ (.. >> 32);
@@ -46,11 +84,7 @@ evx_hash:
 .Lh_tail:
         test    rcx, rcx
         jz      .Lh_fin
-        mov     rdx, -1
-        bzhi    rdx, rdx, rcx
-        kmovq   k1, rdx
-        vmovdqu8 xmm16{k1}{z}, xmmword ptr [rdi]
-        vmovq   rdx, xmm16
+        LOADN   rdx, dl, rdi, rcx, rcx
         xor     rax, rdx
         imul    rax, r8
         mov     rdx, rax
@@ -82,50 +116,57 @@ evx_hash:
         .type   evx_memeq, @function
         .p2align 5
 evx_memeq:
-        cmp     rdx, 64
-        ja      .Lm_long
-        mov     r11, -1
-        bzhi    r11, r11, rdx
-        kmovq   k1, r11
-        vmovdqu8 zmm16{k1}{z}, zmmword ptr [rdi]
-        vmovdqu8 zmm17{k1}{z}, zmmword ptr [rsi]
-        vpcmpb  k2, zmm16, zmm17, 4
-        xor     eax, eax
-        kortestq k2, k2
-        setz    al
-        ret
-.Lm_long:
-        push    rdi
-        push    rsi
-        push    rdx
+        cmp     rdx, 8
+        jb      .Lm_short
+        xor     r11d, r11d
 .Lm_loop:
-        cmp     rdx, 64
-        jb      .Lm_ltail
-        vmovdqu8 zmm16, zmmword ptr [rdi]
-        vpcmpb  k2, zmm16, zmmword ptr [rsi], 4
-        kortestq k2, k2
-        jnz     .Lm_ne
-        add     rdi, 64
-        add     rsi, 64
-        sub     rdx, 64
+        lea     rax, [r11 + 8]
+        cmp     rax, rdx
+        ja      .Lm_last
+        mov     rax, qword ptr [rdi + r11]
+        cmp     rax, qword ptr [rsi + r11]
+        jne     .Lm_ne
+        add     r11, 8
         jmp     .Lm_loop
-.Lm_ltail:
-        mov     r11, -1
-        bzhi    r11, r11, rdx
-        kmovq   k1, r11
-        vmovdqu8 zmm16{k1}{z}, zmmword ptr [rdi]
-        vmovdqu8 zmm17{k1}{z}, zmmword ptr [rsi]
-        vpcmpb  k2, zmm16, zmm17, 4
-        kortestq k2, k2
-        jnz     .Lm_ne
+.Lm_last:                               # overlapping last word (len >= 8)
+        mov     rax, qword ptr [rdi + rdx - 8]
+        cmp     rax, qword ptr [rsi + rdx - 8]
+        jne     .Lm_ne
+.Lm_eq:
         mov     eax, 1
-        jmp     .Lm_out
+        ret
+.Lm_short:                              # 0..7: two overlapping loads per size
+        cmp     rdx, 4
+        jb      .Lm_lt4
+        mov     eax, dword ptr [rdi]
+        cmp     eax, dword ptr [rsi]
+        jne     .Lm_ne
+        mov     eax, dword ptr [rdi + rdx - 4]
+        cmp     eax, dword ptr [rsi + rdx - 4]
+        jne     .Lm_ne
+        mov     eax, 1
+        ret
+.Lm_lt4:
+        cmp     rdx, 2
+        jb      .Lm_lt2
+        movzx   eax, word ptr [rdi]
+        cmp     ax, word ptr [rsi]
+        jne     .Lm_ne
+        movzx   eax, word ptr [rdi + rdx - 2]
+        cmp     ax, word ptr [rsi + rdx - 2]
+        jne     .Lm_ne
+        mov     eax, 1
+        ret
+.Lm_lt2:
+        test    rdx, rdx
+        jz      .Lm_eq
+        movzx   eax, byte ptr [rdi]
+        cmp     al, byte ptr [rsi]
+        jne     .Lm_ne
+        mov     eax, 1
+        ret
 .Lm_ne:
         xor     eax, eax
-.Lm_out:
-        pop     rdx
-        pop     rsi
-        pop     rdi
         ret
         .size   evx_memeq, .-evx_memeq
 
@@ -142,12 +183,16 @@ evx_memeq:
 evx_key16:
         cmp     rsi, 15
         ja      .Lk16_long
-        mov     rax, -1
-        bzhi    rax, rax, rsi
-        kmovq   k1, rax
-        vmovdqu8 xmm16{k1}{z}, xmmword ptr [rdi]
-        vmovq   rax, xmm16
-        vpextrq rdx, xmm16, 1
+        xor     edx, edx
+        cmp     rsi, 8
+        jb      .Lk16_lo
+        mov     rax, qword ptr [rdi]
+        lea     r8, [rsi - 8]
+        LOADN   rdx, dl, rdi+8, r8, rcx
+        jmp     .Lk16_fin
+.Lk16_lo:
+        LOADN   rax, al, rdi, rsi, rcx
+.Lk16_fin:
         shl     rsi, 56
         or      rdx, rsi
         ret
@@ -319,28 +364,19 @@ evx_split_line:
         xor     ebp, ebp                # fields emitted
         xor     r12d, r12d              # quote count
         xor     r13d, r13d              # wrapped fields
-        mov     eax, 0x2C
-        vpbroadcastb zmm21, eax
-        mov     eax, 0x22
-        vpbroadcastb zmm22, eax
 .Lsl_blk:
         mov     rcx, r9
         sub     rcx, r8
         jbe     .Lsl_last
-        cmp     rcx, 64
+        cmp     rcx, 8
         jb      .Lsl_part
-        vmovdqu8 zmm16, zmmword ptr [r8]
+        mov     rdi, qword ptr [r8]
         jmp     .Lsl_cmp
 .Lsl_part:
-        mov     rax, -1
-        bzhi    rax, rax, rcx
-        kmovq   k1, rax
-        vmovdqu8 zmm16{k1}{z}, zmmword ptr [r8]
+        LOADN   rdi, dil, r8, rcx, rdx
 .Lsl_cmp:
-        vpcmpeqb k2, zmm16, zmm21
-        vpcmpeqb k3, zmm16, zmm22
-        kmovq   r14, k2
-        kmovq   rax, k3
+        SWARM   r14, rdi, rsi, .Lsw_comma
+        SWARM   rax, rdi, rsi, .Lsw_quote
         popcnt  rax, rax
         add     r12, rax
 .Lsl_comma:
@@ -355,7 +391,7 @@ evx_split_line:
         blsr    r14, r14
         jmp     .Lsl_comma
 .Lsl_nextblk:
-        add     r8, 64
+        add     r8, 8
         jmp     .Lsl_blk
 .Lsl_last:
         mov     r15, r9
@@ -479,22 +515,93 @@ evx_parse_ts:
         jne     .Lts_dt
         neg     r10
 .Lts_dt:
-        mov     eax, 0x7FFFF            # 19 bytes of date-time
-        kmovd   k1, eax
-        vmovdqu8 ymm16{k1}{z}, ymmword ptr [rdi]
-        vpcmpeqb k2, ymm16, ymmword ptr [rip + .Lts_tmpl]
-        vpsubb  ymm17, ymm16, ymmword ptr [rip + .Lts_zero]
-        vpcmpub k3, ymm17, ymmword ptr [rip + .Lts_nine], 2
-        kmovd   eax, k2
-        kmovd   ecx, k3
-        and     eax, 0x12490            # separator positions 4,7,10,13,16
-        and     ecx, 0x6DB6F            # digit positions
-        or      eax, ecx
-        cmp     eax, 0x7FFFF
+        cmp     byte ptr [rdi + 4], 0x2D
         jne     .Lts_bad
-        vpshufb ymm18, ymm17, ymmword ptr [rip + .Lts_shuf]
-        vpmaddubsw ymm19, ymm18, ymmword ptr [rip + .Lts_w101]
-        vmovdqu64 ymmword ptr [rsp - 40], ymm19       # red zone
+        cmp     byte ptr [rdi + 7], 0x2D
+        jne     .Lts_bad
+        cmp     byte ptr [rdi + 10], 0x54
+        jne     .Lts_bad
+        cmp     byte ptr [rdi + 13], 0x3A
+        jne     .Lts_bad
+        cmp     byte ptr [rdi + 16], 0x3A
+        jne     .Lts_bad
+        movzx   eax, byte ptr [rdi + 0]
+        sub     eax, 0x30
+        cmp     eax, 9
+        ja      .Lts_bad
+        movzx   ecx, byte ptr [rdi + 1]
+        sub     ecx, 0x30
+        cmp     ecx, 9
+        ja      .Lts_bad
+        lea     eax, [rax + rax*4]
+        lea     eax, [rcx + rax*2]
+        mov     word ptr [rsp -40], ax                 # red zone
+        movzx   eax, byte ptr [rdi + 2]
+        sub     eax, 0x30
+        cmp     eax, 9
+        ja      .Lts_bad
+        movzx   ecx, byte ptr [rdi + 3]
+        sub     ecx, 0x30
+        cmp     ecx, 9
+        ja      .Lts_bad
+        lea     eax, [rax + rax*4]
+        lea     eax, [rcx + rax*2]
+        mov     word ptr [rsp -38], ax                 # red zone
+        movzx   eax, byte ptr [rdi + 5]
+        sub     eax, 0x30
+        cmp     eax, 9
+        ja      .Lts_bad
+        movzx   ecx, byte ptr [rdi + 6]
+        sub     ecx, 0x30
+        cmp     ecx, 9
+        ja      .Lts_bad
+        lea     eax, [rax + rax*4]
+        lea     eax, [rcx + rax*2]
+        mov     word ptr [rsp -36], ax                 # red zone
+        movzx   eax, byte ptr [rdi + 8]
+        sub     eax, 0x30
+        cmp     eax, 9
+        ja      .Lts_bad
+        movzx   ecx, byte ptr [rdi + 9]
+        sub     ecx, 0x30
+        cmp     ecx, 9
+        ja      .Lts_bad
+        lea     eax, [rax + rax*4]
+        lea     eax, [rcx + rax*2]
+        mov     word ptr [rsp -34], ax                 # red zone
+        movzx   eax, byte ptr [rdi + 11]
+        sub     eax, 0x30
+        cmp     eax, 9
+        ja      .Lts_bad
+        movzx   ecx, byte ptr [rdi + 12]
+        sub     ecx, 0x30
+        cmp     ecx, 9
+        ja      .Lts_bad
+        lea     eax, [rax + rax*4]
+        lea     eax, [rcx + rax*2]
+        mov     word ptr [rsp -32], ax                 # red zone
+        movzx   eax, byte ptr [rdi + 14]
+        sub     eax, 0x30
+        cmp     eax, 9
+        ja      .Lts_bad
+        movzx   ecx, byte ptr [rdi + 15]
+        sub     ecx, 0x30
+        cmp     ecx, 9
+        ja      .Lts_bad
+        lea     eax, [rax + rax*4]
+        lea     eax, [rcx + rax*2]
+        mov     word ptr [rsp -30], ax                 # red zone
+        movzx   eax, byte ptr [rdi + 17]
+        sub     eax, 0x30
+        cmp     eax, 9
+        ja      .Lts_bad
+        movzx   ecx, byte ptr [rdi + 18]
+        sub     ecx, 0x30
+        cmp     ecx, 9
+        ja      .Lts_bad
+        lea     eax, [rax + rax*4]
+        lea     eax, [rcx + rax*2]
+        mov     word ptr [rsp -24], ax                 # red zone
         movzx   eax, word ptr [rsp - 40]                # YY (hi)
         movzx   ecx, word ptr [rsp - 38]                # YY (lo)
         movzx   r8d, word ptr [rsp - 36]                # month

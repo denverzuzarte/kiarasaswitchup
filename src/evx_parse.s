@@ -35,6 +35,44 @@
         .intel_syntax noprefix
         .text
 
+# SWAR byte match (no SIMD): \out = 8-bit mask of the bytes of \w equal to the
+# byte broadcast in \c. Exact per byte (no borrow between bytes):
+#   x = w ^ c;  t = ((x & 0x7F..) + 0x7F..) | x;  bit 7 of t clear iff byte == 0;
+#   pext gathers the eight bit-7s.
+        .macro  SWARM out, w, x, c
+        mov     \x, \w
+        xor     \x, qword ptr [rip + \c]
+        mov     \out, \x
+        and     \out, qword ptr [rip + .Lsw_7f]
+        add     \out, qword ptr [rip + .Lsw_7f]
+        or      \out, \x
+        andn    \out, \out, qword ptr [rip + .Lsw_80]
+        pext    \out, \out, qword ptr [rip + .Lsw_80]
+        .endm
+# load \n (register, 0..7, preserved) bytes at \p into \dst (zero-filled
+# above), never touching a byte past p + n: byte loop, high byte first.
+        .macro  LOADN dst, dst8, p, n, cnt
+        xor     \dst, \dst
+        mov     \cnt, \n
+        test    \cnt, \cnt
+        jz      8f
+7:
+        shl     \dst, 8
+        mov     \dst8, byte ptr [\p + \cnt - 1]
+        dec     \cnt
+        jnz     7b
+8:
+        .endm
+
+        .section .rodata
+        .p2align 3
+.Lsw_7f:    .quad 0x7F7F7F7F7F7F7F7F
+.Lsw_80:    .quad 0x8080808080808080
+.Lsw_nl:    .quad 0x0A0A0A0A0A0A0A0A
+.Lsw_comma: .quad 0x2C2C2C2C2C2C2C2C
+.Lsw_quote: .quad 0x2222222222222222
+        .text
+
         .set    F_EID,    64
         .set    F_USER,   80
         .set    F_TS,     96
@@ -81,12 +119,6 @@ evx_parse_events:
         mov     r12, rdi                # ctx
         mov     r13, rsi                # cursor (line start)
         mov     r14, rdx                # end
-        mov     eax, 0x0A
-        vpbroadcastb zmm20, eax
-        mov     eax, 0x2C
-        vpbroadcastb zmm21, eax
-        mov     eax, 0x22
-        vpbroadcastb zmm22, eax
 
 .Lline:
         cmp     r13, r14
@@ -99,15 +131,12 @@ evx_parse_events:
 .Lscan:
         mov     rcx, r14
         sub     rcx, r8                 # remaining bytes
-        cmp     rcx, 64
+        cmp     rcx, 8
         jb      .Lpartial
-        vmovdqu8 zmm16, zmmword ptr [r8]
-        vpcmpeqb k1, zmm16, zmm20
-        vpcmpeqb k2, zmm16, zmm21
-        vpcmpeqb k3, zmm16, zmm22
-        kmovq   rax, k1
-        kmovq   rdx, k2
-        kmovq   r11, k3
+        mov     rdi, qword ptr [r8]
+        SWARM   rax, rdi, rsi, .Lsw_nl
+        SWARM   rdx, rdi, rsi, .Lsw_comma
+        SWARM   r11, rdi, rsi, .Lsw_quote
         test    rax, rax
         jnz     .Lhas_nl
         popcnt  r11, r11
@@ -125,20 +154,14 @@ evx_parse_events:
         blsr    rdx, rdx
         jmp     .Lc_full
 .Lc_full_done:
-        add     r8, 64
+        add     r8, 8
         jmp     .Lscan
 
 .Lpartial:
-        mov     rax, -1
-        bzhi    rax, rax, rcx
-        kmovq   k4, rax
-        vmovdqu8 zmm16{k4}{z}, zmmword ptr [r8]
-        vpcmpeqb k1, zmm16, zmm20
-        vpcmpeqb k2, zmm16, zmm21
-        vpcmpeqb k3, zmm16, zmm22
-        kmovq   rax, k1
-        kmovq   rdx, k2
-        kmovq   r11, k3
+        LOADN   rdi, dil, r8, rcx, rsi          # the last < 8 bytes, no over-read
+        SWARM   rax, rdi, rsi, .Lsw_nl
+        SWARM   rdx, rdi, rsi, .Lsw_comma
+        SWARM   r11, rdi, rsi, .Lsw_quote
         bts     rax, rcx                # virtual newline at the range end
 .Lhas_nl:
         tzcnt   rsi, rax                # newline position in block
@@ -235,12 +258,6 @@ evx_parse_events:
         call    evx_chunk_alloc                 # C: clobbers caller-saved + zmm
         pop     r8
         pop     r8
-        mov     ecx, 0x0A
-        vpbroadcastb zmm20, ecx
-        mov     ecx, 0x2C
-        vpbroadcastb zmm21, ecx
-        mov     ecx, 0x22
-        vpbroadcastb zmm22, ecx
         mov     r15, rax
         mov     rcx, rax
         sub     rcx, qword ptr [r12 + 56]

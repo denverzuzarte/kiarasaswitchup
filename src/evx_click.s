@@ -13,6 +13,44 @@
         .intel_syntax noprefix
         .text
 
+# SWAR byte match (no SIMD): \out = 8-bit mask of the bytes of \w equal to the
+# byte broadcast in \c. Exact per byte (no borrow between bytes):
+#   x = w ^ c;  t = ((x & 0x7F..) + 0x7F..) | x;  bit 7 of t clear iff byte == 0;
+#   pext gathers the eight bit-7s.
+        .macro  SWARM out, w, x, c
+        mov     \x, \w
+        xor     \x, qword ptr [rip + \c]
+        mov     \out, \x
+        and     \out, qword ptr [rip + .Lsw_7f]
+        add     \out, qword ptr [rip + .Lsw_7f]
+        or      \out, \x
+        andn    \out, \out, qword ptr [rip + .Lsw_80]
+        pext    \out, \out, qword ptr [rip + .Lsw_80]
+        .endm
+# load \n (register, 0..7, preserved) bytes at \p into \dst (zero-filled
+# above), never touching a byte past p + n: byte loop, high byte first.
+        .macro  LOADN dst, dst8, p, n, cnt
+        xor     \dst, \dst
+        mov     \cnt, \n
+        test    \cnt, \cnt
+        jz      8f
+7:
+        shl     \dst, 8
+        mov     \dst8, byte ptr [\p + \cnt - 1]
+        dec     \cnt
+        jnz     7b
+8:
+        .endm
+
+        .section .rodata
+        .p2align 3
+.Lsw_7f:    .quad 0x7F7F7F7F7F7F7F7F
+.Lsw_80:    .quad 0x8080808080808080
+.Lsw_nl:    .quad 0x0A0A0A0A0A0A0A0A
+.Lsw_comma: .quad 0x2C2C2C2C2C2C2C2C
+.Lsw_quote: .quad 0x2222222222222222
+        .text
+
         .set    W7, 604800000           # 7 days in ms
         .set    GAP, 1800000            # 30 minutes in ms
 
@@ -71,28 +109,31 @@ evx_memcmp:
         cmp     rcx, r8
         cmovb   r8, rcx                 # common length
 .Lmc_loop:
-        cmp     r8, 64
+        cmp     r8, 8
         jb      .Lmc_tail
-        vmovdqu8 zmm16, zmmword ptr [rdi]
-        vmovdqu8 zmm17, zmmword ptr [rdx]
-        vpcmpb  k2, zmm16, zmm17, 4
-        kmovq   r11, k2
-        test    r11, r11
-        jnz     .Lmc_diff
-        add     rdi, 64
-        add     rdx, 64
-        sub     r8, 64
+        mov     r11, qword ptr [rdi]
+        xor     r11, qword ptr [rdx]
+        jnz     .Lmc_diff8
+        add     rdi, 8
+        add     rdx, 8
+        sub     r8, 8
         jmp     .Lmc_loop
 .Lmc_tail:
-        mov     r11, -1
-        bzhi    r11, r11, r8
-        kmovq   k1, r11
-        vmovdqu8 zmm16{k1}{z}, zmmword ptr [rdi]
-        vmovdqu8 zmm17{k1}{z}, zmmword ptr [rdx]
-        vpcmpb  k2, zmm16, zmm17, 4
-        kmovq   r11, k2
-        test    r11, r11
-        jnz     .Lmc_diff
+        test    r8, r8
+        jz      .Lmc_eq
+        movzx   eax, byte ptr [rdi]
+        movzx   r9d, byte ptr [rdx]
+        sub     eax, r9d
+        jnz     .Lmc_out
+        inc     rdi
+        inc     rdx
+        dec     r8
+        jmp     .Lmc_tail
+.Lmc_diff8:
+        tzcnt   r11, r11
+        shr     r11, 3                  # first differing byte
+        jmp     .Lmc_idx
+.Lmc_eq:
         xor     eax, eax
         cmp     rsi, rcx
         je      .Lmc_out
@@ -100,8 +141,7 @@ evx_memcmp:
         mov     r11d, -1
         cmovb   eax, r11d               # a is a proper prefix of b
         jmp     .Lmc_out
-.Lmc_diff:
-        tzcnt   r11, r11
+.Lmc_idx:
         movzx   eax, byte ptr [rdi + r11]
         movzx   r9d, byte ptr [rdx + r11]
         sub     eax, r9d
@@ -133,19 +173,22 @@ evx_sort16:
         mov     r9, r8
         shl     r9, 4
         add     r9, rdi
-        vmovdqu64 xmm16, xmmword ptr [r9]
         mov     r10, qword ptr [r9]
+        mov     r11, qword ptr [r9 + 8]
 .Ls_inner:
         cmp     r9, rdi
         jbe     .Ls_place
         cmp     qword ptr [r9 - 16], r10
         jbe     .Ls_place
-        vmovdqu64 xmm17, xmmword ptr [r9 - 16]
-        vmovdqu64 xmmword ptr [r9], xmm17
+        mov     rax, qword ptr [r9 - 16]
+        mov     rdx, qword ptr [r9 - 8]
+        mov     qword ptr [r9], rax
+        mov     qword ptr [r9 + 8], rdx
         sub     r9, 16
         jmp     .Ls_inner
 .Ls_place:
-        vmovdqu64 xmmword ptr [r9], xmm16
+        mov     qword ptr [r9], r10
+        mov     qword ptr [r9 + 8], r11
         inc     r8
         jmp     .Ls_outer
 .Ls_ret:
@@ -227,8 +270,10 @@ evx_sort16:
         mov     r8d, dword ptr [r9 + rdx*4]
         inc     dword ptr [r9 + rdx*4]
         shl     r8, 4
-        vmovdqu64 xmm16, xmmword ptr [rdi]
-        vmovdqu64 xmmword ptr [r13 + r8], xmm16
+        mov     rax, qword ptr [rdi]
+        mov     rdx, qword ptr [rdi + 8]
+        mov     qword ptr [r13 + r8], rax
+        mov     qword ptr [r13 + r8 + 8], rdx
         add     rdi, 16
         cmp     rdi, rsi
         jb      .Ls_sc
@@ -297,12 +342,6 @@ evx_parse_clicks:
         mov     r15, rcx                # out cursor
         mov     rbx, rcx                # out base
         mov     qword ptr [rsp + K_N], 0
-        mov     eax, 0x0A
-        vpbroadcastb zmm20, eax
-        mov     eax, 0x2C
-        vpbroadcastb zmm21, eax
-        mov     eax, 0x22
-        vpbroadcastb zmm22, eax
 .Lk_line:
         cmp     r13, r14
         jae     .Lk_done
@@ -313,15 +352,12 @@ evx_parse_clicks:
 .Lk_scan:
         mov     rcx, r14
         sub     rcx, r8
-        cmp     rcx, 64
+        cmp     rcx, 8
         jb      .Lk_partial
-        vmovdqu8 zmm16, zmmword ptr [r8]
-        vpcmpeqb k1, zmm16, zmm20
-        vpcmpeqb k2, zmm16, zmm21
-        vpcmpeqb k3, zmm16, zmm22
-        kmovq   rax, k1
-        kmovq   rdx, k2
-        kmovq   r11, k3
+        mov     rdi, qword ptr [r8]
+        SWARM   rax, rdi, rsi, .Lsw_nl
+        SWARM   rdx, rdi, rsi, .Lsw_comma
+        SWARM   r11, rdi, rsi, .Lsw_quote
         test    rax, rax
         jnz     .Lk_has_nl
         popcnt  r11, r11
@@ -339,19 +375,13 @@ evx_parse_clicks:
         blsr    rdx, rdx
         jmp     .Lk_cf
 .Lk_cf_done:
-        add     r8, 64
+        add     r8, 8
         jmp     .Lk_scan
 .Lk_partial:
-        mov     rax, -1
-        bzhi    rax, rax, rcx
-        kmovq   k4, rax
-        vmovdqu8 zmm16{k4}{z}, zmmword ptr [r8]
-        vpcmpeqb k1, zmm16, zmm20
-        vpcmpeqb k2, zmm16, zmm21
-        vpcmpeqb k3, zmm16, zmm22
-        kmovq   rax, k1
-        kmovq   rdx, k2
-        kmovq   r11, k3
+        LOADN   rdi, dil, r8, rcx, rsi          # the last < 8 bytes, no over-read
+        SWARM   rax, rdi, rsi, .Lsw_nl
+        SWARM   rdx, rdi, rsi, .Lsw_comma
+        SWARM   r11, rdi, rsi, .Lsw_quote
         bts     rax, rcx
 .Lk_has_nl:
         tzcnt   rsi, rax
@@ -586,8 +616,14 @@ evx_parse_clicks:
         mov     eax, dword ptr [rax + r9*4]     # dense person id
         mov     r8, qword ptr [r12 + 72]
         lock inc dword ptr [r8 + rax*4]
-        vmovdqu64 ymm16, ymmword ptr [rsi]
-        vmovdqu64 ymmword ptr [rdi], ymm16
+        mov     r8, qword ptr [rsi]
+        mov     r9, qword ptr [rsi + 8]
+        mov     qword ptr [rdi], r8
+        mov     qword ptr [rdi + 8], r9
+        mov     r8, qword ptr [rsi + 16]
+        mov     r9, qword ptr [rsi + 24]
+        mov     qword ptr [rdi + 16], r8
+        mov     qword ptr [rdi + 24], r9
         mov     dword ptr [rdi + 8], eax
         add     rdi, 32
 .Lk_fc_next:
