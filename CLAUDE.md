@@ -26,6 +26,8 @@ make check-dev ANSWER=../dev-answer PY=$PY   # both tables vs the official answe
 make dev DEV=dir SEED=n EVENTS=e CLICKS=c    # generate a dataset
 make fuzz-data DEV=fz SEED=n EVENTS=e PY=$PY # adversarial dataset
 make check-reference DEV=dir PY=$PY          # compare out/ with the Python reference
+make bench DEV=dev20m REVS="main HEAD" RUNS=5   # interleaved wall time of committed binaries
+make variant NAME=x VDEFS=.. VASDEFS=..      # alternative build into build/x/main for A/B tests
 make clean-out / make clean-dataset DEV=dir
 ```
 ```

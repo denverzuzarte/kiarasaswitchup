@@ -8,26 +8,41 @@ These are my working instructions for building and verifying the rewrite, one ph
 |---|---|---|
 | `src/evx.h` | C header | The **ABI contract** between C and assembly: struct layouts and offsets. Every asm offset constant mirrors a `_Static_assert` here. |
 | `src/evx_util.s` | asm | `evx_hash`, `evx_memeq`, `evx_split_line` (the CSV dialect), `evx_parse_ts` (F1/F2/F3) |
-| `src/evx_parse.s` | asm | `evx_parse_events`: batch event parse → validation flags → lookups → candidate records |
-| `src/evx_dedup.s` | asm | `evx_dedup_insert` (lock-free global winner table), `evx_collect` (valid winners + person interning + histogram), `evx_scatter` (group by person) |
+| `src/evx_parse.s` | asm | `evx_parse_events`: batch event parse → validation flags → lookups → candidate records written into their dedup partition's 4 KB chunk |
+| `src/evx_dedup.s` | asm | `evx_dedup_part` (per-partition private dedup table, losers marked dead), `evx_collect` (sequential arena walk, person interning, Wins into person-range chunk lists), `evx_count_range` / `evx_group_range` (per-range counts and placement) |
 | `src/evx_session.s` | asm | `evx_sessionize`: per-person ts sort, session split, day split, user/day aggregates, top category |
-| `src/main.c` | C | env, phases, pthread pool, task queues, timing/stats |
+| `src/main.c` | C | env, phases, pthread pool, task queues (silent unless an error occurs) |
 | `src/dict.c` | C | manifest, products + category ranking, links DSU → lookup tables |
-| `src/parquet.c` | C | Minimal Parquet writer (PLAIN, uncompressed, Thrift-compact footer) |
+| `src/parquet.c` | C | Parquet writer (PLAIN, uncompressed, Thrift-compact footer; strided / indexed string columns, INT32); `user_daily` is one part file per worker, written in parallel |
 | `src/tests/unit.c` | C | Unit tests of the asm primitives (`make unit`) |
 | `scripts/check_events.py` | Python | Fixture and dev-set checker for `user_daily` only |
 
 ## Data flow
 
 ```
-P0  C     manifest, products (cat ids in byte order), links → DSU → link LookupTable
-P1  asm   evx_parse_events  per newline-aligned byte range  → Cand[] (64 B)   [parallel, dynamic queue]
-P2  asm   evx_dedup_insert  per Cand sub-range → global CAS table of Cand*   [parallel]
-P3  asm   evx_collect       per dedup-slot range → Win[] (16 B) + person CAS table + lock-inc counts [parallel]
-P4  C     prefix sum of counts → offsets/cursors, max person size
-P5  asm   evx_scatter       per Win range → Ev[] grouped by person (lock xadd cursor) [parallel]
-P6  asm   evx_sessionize    per person-slot block → Row[] (32 B)              [parallel, dynamic queue]
-P7  C     Parquet writer → $OUTPUT_DIR/user_daily/part-00000.parquet
+coordinator                                   workers
+-----------                                   -------
+P0  manifest, links plan (vectorised line count), pool_init
+    pool_start(job_links) ─────────────────►  P0b link files: parse + intern (all workers)
+    products + campaigns (overlapped), pool_wait
+    map + plan event files
+    pool_run(job_parse) ───────────────────►  P0c worker 0: union-find + smallest names, then parses
+                                              P1  evx_parse_events → Cand (56 B) into the worker's open
+                                                  4 KB chunk of its event_id partition (256 partitions)
+    pool_run(job_dedup) ───────────────────►  P2  evx_dedup_part per partition: private table, no atomics,
+                                                  losers marked dead
+    person table
+    pool_run(job_collect) ─────────────────►  P3  evx_collect: arena in memory order → persons (cmpxchg16b),
+                                                  Wins into per-worker person-range chunk lists
+                                                  (recycled Cand chunks); overflow → redo from P1
+    pool_run(job_compact) x2 ──────────────►  P4  dense ids from person-table occupancy, per range
+    pool_run(job_parse_clicks) ────────────►  C1  clicks: parse, validate, person → dense id
+C2  click prefix sums
+    pool_run(job_scatter_clicks) ──────────►  C3  clicks grouped by person
+    pool_run(job_session) ─────────────────►  P5+P6 per person range: count → offsets → place Wins in an
+                                                  L2-resident scratch → evx_sessionize → evx_attribute
+    pool_run(job_write) ───────────────────►  P7  user_daily: one Parquet part per worker
+P7b campaign_daily (reduced from per-worker cells)
 ```
 
 Every arrow is a phase barrier (pool barrier). No structure is read in a phase while another phase can still write it.
@@ -48,7 +63,7 @@ Every arrow is a phase barrier (pool barrier). No structure is read in a phase w
 2. Products: split with `evx_split_line`, collect distinct categories, add `unknown`, sort byte-wise, and assign IDs in sorted order (bounds ≤ 255). Build the product LookupTable (`val_len` = cat id).
 3. Links: split each line; drop malformed lines and lines with an empty side. Intern IDs, then DSU (union by size, path halving), then the smallest name per root. Build the link LookupTable: key = raw ID, val = canonical name, `val_tag` = hash>>32.
 
-**Test B:** run the fixtures (L1–L3 exercise this) through the full pipeline. Debug `stderr` stats print the link/product counts.
+**Test B:** run the fixtures (L1–L3 exercise this) through the full pipeline.
 
 ### Phase C: parse + dedup (`evx_parse.s`, `evx_dedup.s`)
 1. `evx_parse_events` walks lines, rejects malformed lines and empty eid, computes all validity flags per row, and does lookups only for rows that are still valid.
@@ -104,6 +119,16 @@ Errors found and fixed during testing:
 - Memory: per-person arrays were sized by hash-table slots (about 3× candidates). They are now compacted to dense person IDs, and buffers are freed per phase (about 1 GB saved at 20M events).
 
 The reference implementation was itself validated against `../dev-answer` (MATCH) before being used as an oracle.
+
+### Round 6 (partitioned store), 2026-11-22
+
+| Test | Result |
+|---|---|
+| `make unit` | 121/121 |
+| `make fixtures-native` (both tables) | 36/36 |
+| dev set vs `../dev-answer`, also with `EVX_PSIZE=1024` (3 person-table reruns) and `NCPU` = 1, 2 | MATCH |
+| `scripts/fuzz_events.py` sets vs `reference_events.py`; one fuzz set at `NCPU` = 1, 3, 8 | MATCH |
+| 20M events + 5M clicks vs the previous engine's output | MATCH; 619–640 ms wall (start of round 934–947 ms) |
 
 ## Clicks (clicks_c_assembly_spec.md), 2026-11-22
 

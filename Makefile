@@ -34,7 +34,7 @@ space := $(empty) $(empty)
 
 export IMAGE CPUS MEM PLATFORM
 
-.PHONY: all build fixtures fixtures-native variant dev run-dev run-native fuzz-data check-reference check-dev check-dev-events clean clean-out clean-dataset unit check-fixtures
+.PHONY: all build fixtures fixtures-native variant bench dev run-dev run-native fuzz-data check-reference check-dev check-dev-events clean clean-out clean-dataset unit check-fixtures
 
 # Plain `make` builds the native executable. `make build` also builds its image.
 all: $(TARGET)
@@ -109,6 +109,13 @@ variant:
 	for f in $(C_SRCS); do $(CC) $(CPPFLAGS) $(CFLAGS) $(VDEFS) -c $$f -o build/$(NAME)/$$(basename $$f).o || exit 1; done
 	for f in $(ASM_SRCS); do $(CC) $(CPPFLAGS) $(ASFLAGS) $(if $(VASDEFS),-Wa$(comma)$(subst $(space),$(comma),$(VASDEFS))) -c $$f -o build/$(NAME)/$$(basename $$f).o || exit 1; done
 	$(CC) $(LDFLAGS) -o build/$(NAME)/main build/$(NAME)/*.o $(LDLIBS)
+
+# Interleaved wall-time comparison of committed binaries (git revisions):
+#   make bench DEV=dev20m REVS="1323748 main dopt" RUNS=5
+REVS ?= HEAD
+RUNS ?= 5
+bench:
+	scripts/bench.sh $(DEV) $(RUNS) $(CPUS) $(REVS)
 
 # Unit tests of the assembly primitives (not part of src/main).
 UNIT := src/tests/unit
