@@ -47,7 +47,7 @@ The C coordinator lives in `main.c` (with `dict.c` and `parquet.c`). It runs a p
 | C1 | `evx_parse_clicks` | parse + validate + drop (no click dedup: copies are identical); `evx_canon` → person-table probe → dense ID; `lock inc` click counts |
 | C2/C3 | `main.c`, `evx_scatter_clicks` | click prefix sums; clicks grouped by person (`ClickEv`, Ev-shaped) |
 | P6 | `evx_sessionize` then `evx_attribute` per block | sessions + `user_daily` rows; then re-derive sessions, sort clicks, two-pointer 7-day window, credit (latest, tie → `evx_memcmp`), lazy assist flush; per-worker campaign × day tables |
-| P7 | `parquet.c` | `user_daily` and `campaign_daily` (reduced from per-worker tables) Parquet; invariants printed (Σ sessions/revenue equal, assisted ≥ credited) |
+| P7 | `parquet.c` | `user_daily` built in RAM straight from the `Row` arrays: row groups = runs of session tasks, encoded on all workers, then the workers `pwrite` each group at its final offset. `campaign_daily` is reduced from per-worker tables and encoded the same way |
 
 **`src/evx.h` is the ABI contract.** Struct offsets used by the `.s` files are pinned with `_Static_assert`; change both sides together.
 
@@ -57,6 +57,8 @@ Asm conventions:
 - Tail reads are fault-suppressing masked loads, never over-reads.
 - `evx_memeq` preserves all GPRs except `rax`/`r11`.
 - Cascade Lake has no VBMI, so `vpermb` is unavailable.
+
+The binary prints nothing unless something fails (no stats, no profiler: the `dopt` branch removed them along with the partitioned-dedup and variant-switch code; `main` still has `EVX_PROFILE=1` / `make profile`).
 
 ## Constraints
 

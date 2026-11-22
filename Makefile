@@ -28,13 +28,10 @@ EVENTS   ?= 1000000
 CLICKS   ?= 250000
 RUN_MEM  ?= 10g
 PY       ?= python3
-comma := ,
-empty :=
-space := $(empty) $(empty)
 
 export IMAGE CPUS MEM PLATFORM
 
-.PHONY: all build fixtures fixtures-native variant profile bench dev run-dev run-native fuzz-data check-reference check-dev check-dev-events clean clean-out clean-dataset unit check-fixtures
+.PHONY: all build fixtures fixtures-native bench dev run-dev run-native fuzz-data check-reference check-dev check-dev-events clean clean-out clean-dataset unit check-fixtures
 
 # Plain `make` builds the native executable. `make build` also builds its image.
 all: $(TARGET)
@@ -96,25 +93,6 @@ check-reference:
 	rm -rf out-ref
 	$(PY) scripts/reference_events.py $(DEV) out-ref
 	cd scripts && $(PY) compare.py ../out ../out-ref
-
-# Variant binaries for micro-segment experiments, built from the same sources
-# with different compile-time switches into build/$(NAME)/main, e.g.
-#   make variant NAME=links_shared VDEFS=-DLINK_IDBLOCK=0
-#   make variant NAME=cparse_serial VASDEFS="--defsym CPARSE_PIPE=0"
-NAME    ?= base
-VDEFS   ?=
-VASDEFS ?=
-variant:
-	mkdir -p build/$(NAME)
-	for f in $(C_SRCS); do $(CC) $(CPPFLAGS) $(CFLAGS) $(VDEFS) -c $$f -o build/$(NAME)/$$(basename $$f).o || exit 1; done
-	for f in $(ASM_SRCS); do $(CC) $(CPPFLAGS) $(ASFLAGS) $(if $(VASDEFS),-Wa$(comma)$(subst $(space),$(comma),$(VASDEFS))) -c $$f -o build/$(NAME)/$$(basename $$f).o || exit 1; done
-	$(CC) $(LDFLAGS) -o build/$(NAME)/main build/$(NAME)/*.o $(LDLIBS)
-
-# Per-phase hardware-counter profile of a binary (default src/main) on $(DEV).
-# Output goes to out-prof/ (overwritten by the program).
-BIN ?= ./$(TARGET)
-profile:
-	EVX_PROFILE=1 DATA_DIR=$(DEV) OUTPUT_DIR=out-prof NCPU=$(CPUS) $(BIN) 2>&1 | sed -n '/ms dict/p;/evx profile/,/^evx: page/p'
 
 # Interleaved wall-time comparison of committed binaries (git revisions):
 #   make bench DEV=dev20m REVS="1323748 main dopt" RUNS=5

@@ -194,16 +194,6 @@ int load_products(const char *data_dir, Dict *d)
 
 /* ------------------------------------------------------------------- links */
 
-typedef struct {
-    const char **ptr;
-    uint32_t *len;
-    uint32_t *parent;
-    uint32_t *size;
-    size_t n, cap;
-    LookupEntry *index;     /* id -> ordinal (val_len) */
-    uint64_t mask;
-} Ids;
-
 static uint32_t dsu_find(uint32_t *parent, uint32_t x)
 {
     while (parent[x] != x) {
@@ -211,152 +201,6 @@ static uint32_t dsu_find(uint32_t *parent, uint32_t x)
         x = parent[x];
     }
     return x;
-}
-
-static int ids_grow_index(Ids *s)
-{
-    uint64_t size = table_size_for(s->cap);
-    LookupEntry *idx = calloc(size, sizeof(LookupEntry));
-    if (!idx)
-        return -1;
-    free(s->index);
-    s->index = idx;
-    s->mask = size - 1;
-    for (size_t i = 0; i < s->n; i++) {
-        int ins;
-        LookupEntry *e = table_put(s->index, s->mask, s->ptr[i], s->len[i], &ins);
-        e->val.k0 = i;
-    }
-    return 0;
-}
-
-static int ids_intern(Ids *s, const char *p, uint32_t len, uint32_t *out)
-{
-    if (s->n == s->cap) {
-        size_t cap = s->cap ? s->cap * 2 : 1024;
-        if (cap > UINT32_MAX)
-            return -1;
-        const char **np = realloc(s->ptr, cap * sizeof *np);
-        if (!np)
-            return -1;
-        s->ptr = np;
-        uint32_t *nl = realloc(s->len, cap * sizeof *nl);
-        if (!nl)
-            return -1;
-        s->len = nl;
-        uint32_t *npar = realloc(s->parent, cap * sizeof *npar);
-        if (!npar)
-            return -1;
-        s->parent = npar;
-        uint32_t *nsz = realloc(s->size, cap * sizeof *nsz);
-        if (!nsz)
-            return -1;
-        s->size = nsz;
-        s->cap = cap;
-        if (ids_grow_index(s) != 0)
-            return -1;
-    }
-    int ins;
-    LookupEntry *e = table_put(s->index, s->mask, p, len, &ins);
-    if (ins) {
-        uint32_t id = (uint32_t)s->n++;
-        e->val.k0 = id;
-        s->ptr[id] = p;
-        s->len[id] = len;
-        s->parent[id] = id;
-        s->size[id] = 1;
-    }
-    *out = (uint32_t)e->val.k0;
-    return 0;
-}
-
-int load_links(const char *data_dir, Dict *d)
-{
-    char dir[4096], path[8192];
-    snprintf(dir, sizeof dir, "%s/links", data_dir);
-    char **names = NULL;
-    int nf = list_csv(dir, &names);
-    if (nf < 0)
-        nf = 0;   /* no links directory: every id is its own person */
-    d->link_files = calloc((size_t)(nf ? nf : 1), sizeof(Mapped));
-    d->nlink_files = nf;
-
-    Ids s = {0};
-    for (int i = 0; i < nf; i++) {
-        snprintf(path, sizeof path, "%s/%s", dir, names[i]);
-        free(names[i]);
-        if (map_file(path, &d->link_files[i]) != 0)
-            return -1;
-        LineIter it;
-        const char *line;
-        size_t len;
-        Slice f[2];
-        line_iter_init(&it, &d->link_files[i]);
-        while (line_next(&it, &line, &len)) {
-            d->link_lines++;
-            if (!evx_split_line(line, len, 2, f) || f[0].len == 0 || f[1].len == 0) {
-                d->link_dropped++;
-                continue;
-            }
-            uint32_t a, b;
-            if (ids_intern(&s, f[0].ptr, f[0].len, &a) != 0 ||
-                ids_intern(&s, f[1].ptr, f[1].len, &b) != 0)
-                return -1;
-            a = dsu_find(s.parent, a);
-            b = dsu_find(s.parent, b);
-            if (a != b) {   /* union by size */
-                if (s.size[a] < s.size[b]) {
-                    uint32_t t = a; a = b; b = t;
-                }
-                s.parent[b] = a;
-                s.size[a] += s.size[b];
-            }
-        }
-    }
-    free(names);
-
-    d->link_ids = s.n;
-    if (s.n == 0) {
-        d->link_slots = NULL;
-        d->link_mask = 0;
-        free(s.index);
-        return 0;
-    }
-
-    /* smallest name per component, tracked independently of the root */
-    uint32_t *minid = malloc(s.n * sizeof *minid);
-    if (!minid)
-        return -1;
-    for (size_t i = 0; i < s.n; i++)
-        minid[i] = UINT32_MAX;
-    for (size_t i = 0; i < s.n; i++) {
-        uint32_t r = dsu_find(s.parent, (uint32_t)i);
-        if (minid[r] == UINT32_MAX) {
-            minid[r] = (uint32_t)i;
-            d->link_components++;
-        } else if (bytes_cmp(s.ptr[i], s.len[i], s.ptr[minid[r]], s.len[minid[r]]) < 0) {
-            minid[r] = (uint32_t)i;
-        }
-    }
-
-    uint64_t size = table_size_for(s.n);
-    d->link_slots = calloc(size, sizeof(LookupEntry));
-    if (!d->link_slots)
-        return -1;
-    d->link_mask = size - 1;
-    for (size_t i = 0; i < s.n; i++) {
-        uint32_t m = minid[dsu_find(s.parent, (uint32_t)i)];
-        int ins;
-        LookupEntry *e = table_put(d->link_slots, d->link_mask, s.ptr[i], s.len[i], &ins);
-        e->val = evx_key16(s.ptr[m], s.len[m]);   /* canonical name as a Key16 */
-    }
-    free(minid);
-    free(s.ptr);
-    free(s.len);
-    free(s.parent);
-    free(s.size);
-    free(s.index);
-    return 0;
 }
 
 /* --------------------------------------------------------------- campaigns */
@@ -420,13 +264,8 @@ int load_campaigns(const char *data_dir, Dict *d)
  *     val = its component's smallest key.
  */
 #define LINK_BUSY 1ull
-#ifndef LINK_IDBLOCK
-#define LINK_IDBLOCK 1      /* 1: per-thread id blocks; 0: one shared counter */
-#endif
 #define ID_BLOCK 4096
-#if LINK_IDBLOCK
 static __thread uint32_t tl_next, tl_end;   /* this thread's current id block */
-#endif
 
 struct LinkBuild {
     Mapped *files;
@@ -457,16 +296,12 @@ static uint32_t link_intern(LinkBuild *lb, const char *p, uint32_t len)
         if (cur == 0) {
             uint64_t zero = 0;
             if (atomic_compare_exchange_strong(k1p, &zero, LINK_BUSY)) {
-#if LINK_IDBLOCK
                 if (tl_next == tl_end) {    /* one shared atomic per 4096 ids */
                     tl_next = atomic_fetch_add_explicit(&lb->next_id, ID_BLOCK,
                                                         memory_order_relaxed);
                     tl_end = tl_next + ID_BLOCK;
                 }
                 uint32_t id = tl_next++;
-#else
-                uint32_t id = atomic_fetch_add_explicit(&lb->next_id, 1, memory_order_relaxed);
-#endif
                 lb->slots[i].key.k0 = k.k0;
                 lb->slots[i].val.k1 = id;            /* temporary: dense id */
                 lb->dslot[id] = (uint32_t)i;
