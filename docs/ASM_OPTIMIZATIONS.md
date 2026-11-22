@@ -136,6 +136,11 @@ The per-phase `sys_ms` column (RUSAGE_THREAD) showed about 1.8 s of CPU spent in
 
 Link union-find (worker 0, 180–190 ms) is now nearly as long as the event parse it overlaps (about 200 ms). It is the next critical path.
 
+## 6f. `dopt` branch: no diagnostics, no dead code, Parquet straight from RAM
+
+- Removed: the profiler (`prof.c`, `EVX_PROFILE`), all stats output and the invariant sums, the partitioned dedup (`evx_partition`, `evx_dedup_local`, the parser's `PartOut` path), the sequential `load_links`, and the `COLLECT_BATCH` / `SCATTER_SERIAL` / `LINK_IDBLOCK` / `NO_HUGEPAGE` / `INPUT_POPULATE` switches with the `variant` / `profile` targets. The parser frame keeps its size, so call alignment is unchanged.
+- Parquet: before, the coordinator gathered every row into six column arrays on one thread, and then encoded and `write()`-ed them serially. Now each row group (a run of consecutive session tasks, about nrows / 4nw rows, at least 64K) is encoded by one worker straight from its tasks' `Row` arrays. `pq_layout` fixes the offsets and footer, sizes the file with `ftruncate` and maps it `MAP_SHARED`, and the workers `memcpy` their groups into the mapping. There is no `write()` of data; `pwrite` is used only if the mapping fails. The pool stays alive through P7.
+
 ## 7. OS and memory (C side, in support of the asm)
 
 - **Lazily committed** `MAP_NORESERVE` anonymous buffers sized by worst-case bounds (≥ 8 bytes per candidate row). Untouched pages cost nothing, so no growth or realloc logic is needed in asm.

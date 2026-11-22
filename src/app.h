@@ -18,7 +18,6 @@ void unmap_file(Mapped *m);
 /* Anonymous, lazily committed (MAP_NORESERVE) zeroed memory. */
 void *big_alloc(size_t bytes);
 void big_free(void *p, size_t bytes);
-uint64_t now_ns(void);
 
 /* Sorted list of *.csv names in dir; returns count, -1 on error. */
 int list_csv(const char *dir, char ***names_out);
@@ -57,7 +56,6 @@ typedef struct {
 
 int load_manifest(const char *data_dir, Dict *d);
 int load_products(const char *data_dir, Dict *d);
-int load_links(const char *data_dir, Dict *d);
 int load_campaigns(const char *data_dir, Dict *d);
 
 /* Parallel links build (see dict.c): plan -> parse tasks on all workers ->
@@ -76,16 +74,29 @@ int links_finish(LinkBuild *lb, Dict *d);
 /* byte-wise comparison: memcmp, then shorter first */
 int bytes_cmp(const char *a, size_t al, const char *b, size_t bl);
 
-/* Generic Parquet writer: one column descriptor per column. */
+/* In-memory Parquet builder (parquet.c). Usage:
+ *   f = pq_begin(ngroups, rows per group, ncols, defs)
+ *   per group (any thread): pq_col(f, g, c) + pq_put_* for every row, pq_encode_done(f, g)
+ *   pq_layout(f, path)          offsets, footer, ftruncate + shared mapping
+ *   per group (any thread): pq_copy(f, g)
+ *   pq_close(f) */
 typedef enum { COL_STR, COL_STR_OPT, COL_DATE, COL_I64 } ColKind;
 typedef struct {
     const char *name;
     ColKind kind;
-    const Slice *str;        /* COL_STR / COL_STR_OPT (ptr == NULL -> null) */
-    const int32_t *date;     /* COL_DATE: days since epoch */
-    const int64_t *i64;      /* COL_I64 */
-} ColSpec;
-
-int write_parquet(const char *path, size_t nrows, int ncols, const ColSpec *cols);
+} PqColDef;
+typedef struct PqFile PqFile;
+typedef struct PqCol PqCol;
+PqFile *pq_begin(size_t ngroups, const size_t *group_rows, int ncols, const PqColDef *defs);
+PqCol *pq_col(PqFile *f, size_t group, int col);
+void pq_reserve(PqCol *c, size_t bytes);
+void pq_put_str(PqCol *c, const char *p, uint32_t len);
+void pq_put_opt_str(PqCol *c, const char *p, uint32_t len);   /* p == NULL: null */
+void pq_put_i32(PqCol *c, int32_t v);
+void pq_put_i64(PqCol *c, int64_t v);
+int pq_encode_done(PqFile *f, size_t group);
+int pq_layout(PqFile *f, const char *path);
+void pq_copy(PqFile *f, size_t group);
+int pq_close(PqFile *f);
 
 #endif

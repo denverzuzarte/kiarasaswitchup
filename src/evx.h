@@ -245,19 +245,8 @@ int evx_split_line(const char *p, size_t len, uint32_t nfields, Slice *out);
 int evx_parse_ts(const char *p, size_t len, int64_t *out);
 
 /* Parse the event rows in [begin, end) (no header). Returns Cand count. */
-/* Optional dedup-partition output of the parser (one per parse task). */
-typedef struct {
-    uint32_t *hist;      /*  0  rows per partition */
-    uint64_t *ent;       /*  8  compact reference per Cand */
-    uint16_t *pid;       /* 16  partition id per Cand */
-    uint32_t shift;      /* 24  partition = eid_h32 >> shift */
-    uint32_t pad;
-} PartOut;
 uint64_t evx_parse_events(const ParseCtx *ctx, const char *begin,
-                          const char *end, Cand *out, PartOut *po);   /* po may be NULL */
-void evx_partition(const uint64_t *ent, const uint16_t *pid, uint64_t n,
-                   uint64_t *cursor, uint64_t *entries);
-void evx_dedup_local(uint64_t *table, uint64_t tsize, const uint64_t *entries, uint64_t n);
+                          const char *end, Cand *out);
 /* table has `size` slots (any size < 2^32; index = (eid_h32 * size) >> 32) */
 const LookupEntry *evx_lookup(const LookupEntry *slots, uint64_t mask, uint64_t k0, uint64_t k1);
 void evx_dedup_insert(uint64_t *table, uint64_t size, Cand *c, uint64_t n);

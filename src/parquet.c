@@ -1,10 +1,17 @@
 /*
- * parquet.c - minimal Parquet writer (user_daily and campaign_daily).
+ * parquet.c - in-memory Parquet builder (user_daily and campaign_daily).
  *
  * Replaces the DuckDB C API output path, which is unavailable on this build
  * host (see docs/SPEC_REVIEW.md). Format: "PAR1", one data page (v1) per
  * column per row group, PLAIN encoding, UNCOMPRESSED, Thrift compact
  * protocol FileMetaData footer, "PAR1".
+ *
+ * The file is built in RAM straight from the caller's rows: each row group is
+ * encoded independently (pq_encode, any worker) into its own buffers through
+ * the pq_put_* calls; pq_layout then fixes every offset, sizes the output
+ * file with ftruncate and maps it shared; pq_copy (any worker) copies one
+ * group's pages into the mapping; pq_close writes nothing more (the footer
+ * is copied by pq_layout) and unmaps. No column arrays, no write() of data.
  *
  * Column kinds: COL_STR (BYTE_ARRAY, UTF8/STRING), COL_STR_OPT (same,
  * OPTIONAL with RLE definition levels), COL_DATE (INT32 DATE), COL_I64.
@@ -13,6 +20,7 @@
 
 #include <errno.h>
 #include <fcntl.h>
+#include <sys/mman.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
@@ -52,8 +60,6 @@ static void put(Buf *b, const void *src, size_t n)
 }
 
 static void put_u8(Buf *b, uint8_t v) { put(b, &v, 1); }
-static void put_le32(Buf *b, uint32_t v) { put(b, &v, 4); }
-static void put_le64(Buf *b, uint64_t v) { put(b, &v, 8); }
 
 static void put_varint(Buf *b, uint64_t v)
 {
@@ -136,148 +142,149 @@ enum { REP_REQUIRED = 0, REP_OPTIONAL = 1 };
 enum { CT_UTF8 = 0, CT_DATE = 6, CT_NONE = -1 };
 enum { LT_NONE = 0, LT_STRING = 1, LT_DATE = 6 };
 
-#define ROWS_PER_GROUP ((size_t)1 << 20)
-
-typedef struct {
-    int64_t offset;      /* data page offset in file */
-    int64_t total_size;  /* page header + page body */
-    int64_t num_values;
-} ChunkInfo;
-
 static int col_type(ColKind k) { return k == COL_DATE ? PT_INT32 : k == COL_I64 ? PT_INT64 : PT_BYTE_ARRAY; }
 static int col_rep(ColKind k) { return k == COL_STR_OPT ? REP_OPTIONAL : REP_REQUIRED; }
 static int col_conv(ColKind k) { return k == COL_DATE ? CT_DATE : k == COL_I64 ? CT_NONE : CT_UTF8; }
 static int col_logical(ColKind k) { return k == COL_DATE ? LT_DATE : k == COL_I64 ? LT_NONE : LT_STRING; }
 
-/* Encode one column's page body for rows [r0, r1). */
-static void encode_column(Buf *page, const ColSpec *c, size_t r0, size_t r1)
+/* One column chunk of one row group: page header + body, then its place. */
+struct PqCol {
+    Buf hdr, body;
+    Buf lv;                  /* COL_STR_OPT: definition-level RLE runs */
+    uint64_t run;            /* current def-level run length */
+    int run_def;
+    int64_t offset, total;
+};
+
+struct PqFile {
+    size_t ngroups;
+    const size_t *group_rows;
+    int ncols;
+    const PqColDef *defs;
+    struct PqCol *chunk;     /* [ngroups * ncols] */
+    Buf meta;
+    uint8_t *map;
+    size_t size;
+    int fd, failed;
+};
+
+PqFile *pq_begin(size_t ngroups, const size_t *group_rows, int ncols, const PqColDef *defs)
 {
-    switch (c->kind) {
-    case COL_STR:
-        for (size_t i = r0; i < r1; i++) {
-            put_le32(page, c->str[i].len);
-            put(page, c->str[i].ptr, c->str[i].len);
-        }
-        break;
-    case COL_DATE:
-        for (size_t i = r0; i < r1; i++)
-            put_le32(page, (uint32_t)c->date[i]);
-        break;
-    case COL_I64:
-        for (size_t i = r0; i < r1; i++)
-            put_le64(page, (uint64_t)c->i64[i]);
-        break;
-    case COL_STR_OPT: {
-        /* definition levels: RLE/bit-packed hybrid, bit width 1, RLE runs only,
-           prefixed with their byte length */
-        Buf lv = {0};
-        size_t i = r0;
-        while (i < r1) {
-            int def = c->str[i].ptr != NULL;
-            size_t j = i + 1;
-            while (j < r1 && (c->str[j].ptr != NULL) == def)
-                j++;
-            put_varint(&lv, (uint64_t)(j - i) << 1);
-            put_u8(&lv, (uint8_t)def);
-            i = j;
-        }
-        put_le32(page, (uint32_t)lv.n);
-        put(page, lv.p, lv.n);
-        if (lv.oom)
-            page->oom = 1;
-        free(lv.p);
-        for (size_t k = r0; k < r1; k++) {
-            if (!c->str[k].ptr)
-                continue;
-            put_le32(page, c->str[k].len);
-            put(page, c->str[k].ptr, c->str[k].len);
-        }
-        break;
+    PqFile *f = calloc(1, sizeof *f);
+    if (!f)
+        return NULL;
+    f->ngroups = ngroups;
+    f->group_rows = group_rows;
+    f->ncols = ncols;
+    f->defs = defs;
+    f->fd = -1;
+    f->chunk = calloc(ngroups * (size_t)ncols + 1, sizeof *f->chunk);
+    if (!f->chunk) {
+        free(f);
+        return NULL;
     }
-    }
+    return f;
 }
 
-static int write_all(int fd, const void *p, size_t n)
+PqCol *pq_col(PqFile *f, size_t group, int col) { return &f->chunk[group * (size_t)f->ncols + col]; }
+
+void pq_reserve(PqCol *c, size_t bytes) { buf_reserve(&c->body, bytes); }
+
+void pq_put_str(PqCol *c, const char *p, uint32_t len)
 {
-    const uint8_t *s = p;
-    while (n) {
-        ssize_t w = write(fd, s, n);
-        if (w < 0) {
-            if (errno == EINTR)
-                continue;
-            return -1;
+    buf_reserve(&c->body, 4 + (size_t)len);
+    if (c->body.oom)
+        return;
+    memcpy(c->body.p + c->body.n, &len, 4);
+    memcpy(c->body.p + c->body.n + 4, p, len);
+    c->body.n += 4 + (size_t)len;
+}
+
+void pq_put_i32(PqCol *c, int32_t v) { put(&c->body, &v, 4); }
+void pq_put_i64(PqCol *c, int64_t v) { put(&c->body, &v, 8); }
+
+static void lv_flush(PqCol *c)
+{
+    if (!c->run)
+        return;
+    put_varint(&c->lv, c->run << 1);        /* RLE run, bit width 1 */
+    put_u8(&c->lv, (uint8_t)c->run_def);
+    c->run = 0;
+}
+
+/* COL_STR_OPT: p == NULL is a null */
+void pq_put_opt_str(PqCol *c, const char *p, uint32_t len)
+{
+    int def = p != NULL;
+    if (c->run && c->run_def != def)
+        lv_flush(c);
+    c->run_def = def;
+    c->run++;
+    if (def)
+        pq_put_str(c, p, len);
+}
+
+/* Finish one row group: page headers (bodies are complete). */
+int pq_encode_done(PqFile *f, size_t group)
+{
+    size_t rows = f->group_rows[group];
+    for (int col = 0; col < f->ncols; col++) {
+        PqCol *c = pq_col(f, group, col);
+        if (f->defs[col].kind == COL_STR_OPT) {
+            /* page body = u32 level length, levels, values */
+            lv_flush(c);
+            Buf b = {0};
+            uint32_t ln = (uint32_t)c->lv.n;
+            buf_reserve(&b, 4 + c->lv.n + c->body.n);
+            put(&b, &ln, 4);
+            put(&b, c->lv.p, c->lv.n);
+            put(&b, c->body.p, c->body.n);
+            if (c->lv.oom)
+                b.oom = 1;
+            free(c->lv.p);
+            free(c->body.p);
+            c->lv = (Buf){0};
+            c->body = b;
         }
-        s += w;
-        n -= (size_t)w;
+        if (c->body.oom || c->body.n > INT32_MAX)
+            return -1;
+        Thrift t = {.b = &c->hdr};
+        th_i32(&t, 1, 0);                       /* DATA_PAGE */
+        th_i32(&t, 2, (int32_t)c->body.n);
+        th_i32(&t, 3, (int32_t)c->body.n);
+        th_begin(&t, 5);                        /* DataPageHeader */
+        th_i32(&t, 1, (int32_t)rows);
+        th_i32(&t, 2, 0);                       /* PLAIN */
+        th_i32(&t, 3, 3);                       /* RLE def levels */
+        th_i32(&t, 4, 3);                       /* RLE rep levels */
+        th_end(&t);
+        put_u8(&c->hdr, T_STOP);
+        if (c->hdr.oom)
+            return -1;
+        c->total = (int64_t)(c->hdr.n + c->body.n);
     }
     return 0;
 }
 
-int write_parquet(const char *path, size_t nrows, int ncols, const ColSpec *cols)
+static void build_footer(PqFile *f)
 {
-    int fd = open(path, O_WRONLY | O_CREAT | O_TRUNC, 0666);
-    if (fd < 0) {
-        perror(path);
-        return -1;
-    }
-    size_t ngroups = nrows ? (nrows + ROWS_PER_GROUP - 1) / ROWS_PER_GROUP : 1;
-    ChunkInfo *info = calloc(ngroups * (size_t)ncols, sizeof *info);
-    int64_t pos = 0;
-    int rc = -1;
-    Buf page = {0}, hdr = {0};
-    if (!info)
-        goto out;
-    if (write_all(fd, "PAR1", 4) != 0)
-        goto out;
-    pos = 4;
-
-    for (size_t g = 0; g < ngroups; g++) {
-        size_t r0 = g * ROWS_PER_GROUP;
-        size_t r1 = r0 + ROWS_PER_GROUP < nrows ? r0 + ROWS_PER_GROUP : nrows;
-        for (int col = 0; col < ncols; col++) {
-            page.n = 0;
-            hdr.n = 0;
-            encode_column(&page, &cols[col], r0, r1);
-            if (page.oom || page.n > INT32_MAX)
-                goto out;
-            Thrift t = {.b = &hdr};
-            th_i32(&t, 1, 0);                       /* DATA_PAGE */
-            th_i32(&t, 2, (int32_t)page.n);
-            th_i32(&t, 3, (int32_t)page.n);
-            th_begin(&t, 5);                        /* DataPageHeader */
-            th_i32(&t, 1, (int32_t)(r1 - r0));
-            th_i32(&t, 2, 0);                       /* PLAIN */
-            th_i32(&t, 3, 3);                       /* RLE def levels */
-            th_i32(&t, 4, 3);                       /* RLE rep levels */
-            th_end(&t);
-            put_u8(&hdr, T_STOP);
-            if (hdr.oom)
-                goto out;
-            ChunkInfo *ci = &info[g * (size_t)ncols + col];
-            ci->offset = pos;
-            ci->total_size = (int64_t)(hdr.n + page.n);
-            ci->num_values = (int64_t)(r1 - r0);
-            if (write_all(fd, hdr.p, hdr.n) != 0 || write_all(fd, page.p, page.n) != 0)
-                goto out;
-            pos += ci->total_size;
-        }
-    }
-
-    /* FileMetaData */
-    Buf meta = {0};
-    Thrift t = {.b = &meta};
+    size_t nrows = 0;
+    for (size_t g = 0; g < f->ngroups; g++)
+        nrows += f->group_rows[g];
+    Buf *meta = &f->meta;
+    Thrift t = {.b = meta};
     th_i32(&t, 1, 1);                               /* version */
-    th_list(&t, 2, T_STRUCT, (size_t)ncols + 1);    /* schema */
+    th_list(&t, 2, T_STRUCT, (size_t)f->ncols + 1); /* schema */
     th_begin_elem(&t);
     th_bin(&t, 4, "schema", 6);
-    th_i32(&t, 5, ncols);                           /* num_children */
+    th_i32(&t, 5, f->ncols);                        /* num_children */
     th_end(&t);
-    for (int col = 0; col < ncols; col++) {
-        ColKind k = cols[col].kind;
+    for (int col = 0; col < f->ncols; col++) {
+        ColKind k = f->defs[col].kind;
         th_begin_elem(&t);
         th_i32(&t, 1, col_type(k));
         th_i32(&t, 3, col_rep(k));
-        th_bin(&t, 4, cols[col].name, strlen(cols[col].name));
+        th_bin(&t, 4, f->defs[col].name, strlen(f->defs[col].name));
         if (col_conv(k) != CT_NONE)
             th_i32(&t, 6, col_conv(k));
         if (col_logical(k) != LT_NONE) {
@@ -289,53 +296,119 @@ int write_parquet(const char *path, size_t nrows, int ncols, const ColSpec *cols
         th_end(&t);
     }
     th_i64(&t, 3, (int64_t)nrows);
-    th_list(&t, 4, T_STRUCT, ngroups);              /* row_groups */
-    for (size_t g = 0; g < ngroups; g++) {
-        size_t r0 = g * ROWS_PER_GROUP;
-        size_t r1 = r0 + ROWS_PER_GROUP < nrows ? r0 + ROWS_PER_GROUP : nrows;
+    th_list(&t, 4, T_STRUCT, f->ngroups);           /* row_groups */
+    for (size_t g = 0; g < f->ngroups; g++) {
         int64_t total = 0;
         th_begin_elem(&t);
-        th_list(&t, 1, T_STRUCT, (size_t)ncols);              /* columns */
-        for (int col = 0; col < ncols; col++) {
-            const ChunkInfo *ci = &info[g * (size_t)ncols + col];
-            total += ci->total_size;
+        th_list(&t, 1, T_STRUCT, (size_t)f->ncols); /* columns */
+        for (int col = 0; col < f->ncols; col++) {
+            const PqCol *c = pq_col(f, g, col);
+            const char *name = f->defs[col].name;
+            total += c->total;
             th_begin_elem(&t);
-            th_i64(&t, 2, ci->offset);              /* file_offset */
+            th_i64(&t, 2, c->offset);               /* file_offset */
             th_begin(&t, 3);                        /* ColumnMetaData */
-            th_i32(&t, 1, col_type(cols[col].kind));
+            th_i32(&t, 1, col_type(f->defs[col].kind));
             th_list(&t, 2, T_I32, 2);
-            put_zigzag(&meta, 0);                   /* PLAIN */
-            put_zigzag(&meta, 3);                   /* RLE */
+            put_zigzag(meta, 0);                    /* PLAIN */
+            put_zigzag(meta, 3);                    /* RLE */
             th_list(&t, 3, T_BINARY, 1);
-            put_varint(&meta, strlen(cols[col].name));
-            put(&meta, cols[col].name, strlen(cols[col].name));
+            put_varint(meta, strlen(name));
+            put(meta, name, strlen(name));
             th_i32(&t, 4, 0);                       /* UNCOMPRESSED */
-            th_i64(&t, 5, ci->num_values);
-            th_i64(&t, 6, ci->total_size);
-            th_i64(&t, 7, ci->total_size);
-            th_i64(&t, 9, ci->offset);              /* data_page_offset */
+            th_i64(&t, 5, (int64_t)f->group_rows[g]);
+            th_i64(&t, 6, c->total);
+            th_i64(&t, 7, c->total);
+            th_i64(&t, 9, c->offset);               /* data_page_offset */
             th_end(&t);
             th_end(&t);
         }
         th_i64(&t, 2, total);
-        th_i64(&t, 3, (int64_t)(r1 - r0));
+        th_i64(&t, 3, (int64_t)f->group_rows[g]);
         th_end(&t);
     }
-    th_bin(&t, 6, "evx events-only engine", 22);    /* created_by */
-    put_u8(&meta, T_STOP);
-    if (!meta.oom && write_all(fd, meta.p, meta.n) == 0) {
-        uint32_t mlen = (uint32_t)meta.n;
-        if (write_all(fd, &mlen, 4) == 0 && write_all(fd, "PAR1", 4) == 0)
-            rc = 0;
+    th_bin(&t, 6, "evx engine", 10);                /* created_by */
+    put_u8(meta, T_STOP);
+    uint32_t mlen = (uint32_t)meta->n;
+    put(meta, &mlen, 4);
+    put(meta, "PAR1", 4);
+}
+
+static int pwrite_all(int fd, const void *p, size_t n, off_t off)
+{
+    const uint8_t *s = p;
+    while (n) {
+        ssize_t w = pwrite(fd, s, n, off);
+        if (w < 0) {
+            if (errno == EINTR)
+                continue;
+            return -1;
+        }
+        s += w;
+        n -= (size_t)w;
+        off += w;
     }
-    free(meta.p);
-out:
-    free(page.p);
-    free(hdr.p);
-    free(info);
-    if (close(fd) != 0)
+    return 0;
+}
+
+/* After every group is encoded: offsets, footer, sized + mapped file. */
+int pq_layout(PqFile *f, const char *path)
+{
+    int64_t pos = 4;
+    for (size_t g = 0; g < f->ngroups; g++)
+        for (int col = 0; col < f->ncols; col++) {
+            PqCol *c = pq_col(f, g, col);
+            c->offset = pos;
+            pos += c->total;
+        }
+    build_footer(f);
+    if (f->meta.oom)
+        return -1;
+    f->size = (size_t)pos + f->meta.n;
+    f->fd = open(path, O_RDWR | O_CREAT | O_TRUNC, 0666);
+    if (f->fd < 0) {
+        perror(path);
+        return -1;
+    }
+    if (ftruncate(f->fd, (off_t)f->size) != 0) {
+        perror(path);
+        return -1;
+    }
+    void *m = mmap(NULL, f->size, PROT_READ | PROT_WRITE, MAP_SHARED, f->fd, 0);
+    f->map = m == MAP_FAILED ? NULL : m;    /* NULL: pq_copy falls back to pwrite */
+    if (f->map) {
+        memcpy(f->map, "PAR1", 4);
+        memcpy(f->map + pos, f->meta.p, f->meta.n);
+        return 0;
+    }
+    if (pwrite_all(f->fd, "PAR1", 4, 0) || pwrite_all(f->fd, f->meta.p, f->meta.n, pos))
+        return -1;
+    return 0;
+}
+
+/* Copy one row group's pages to the file (any worker, after pq_layout). */
+void pq_copy(PqFile *f, size_t group)
+{
+    for (int col = 0; col < f->ncols; col++) {
+        PqCol *c = pq_col(f, group, col);
+        if (f->map) {
+            memcpy(f->map + c->offset, c->hdr.p, c->hdr.n);
+            memcpy(f->map + c->offset + c->hdr.n, c->body.p, c->body.n);
+        } else if (pwrite_all(f->fd, c->hdr.p, c->hdr.n, c->offset) ||
+                   pwrite_all(f->fd, c->body.p, c->body.n, c->offset + (off_t)c->hdr.n)) {
+            f->failed = 1;
+        }
+    }
+}
+
+int pq_close(PqFile *f)
+{
+    int rc = f->failed ? -1 : 0;
+    if (f->map)
+        munmap(f->map, f->size);
+    if (f->fd >= 0 && close(f->fd) != 0)
         rc = -1;
-    if (rc != 0)
-        fprintf(stderr, "parquet: failed writing %s\n", path);
+    if (rc)
+        fprintf(stderr, "parquet: write failed\n");
     return rc;
 }

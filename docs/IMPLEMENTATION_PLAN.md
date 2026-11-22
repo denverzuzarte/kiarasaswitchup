@@ -11,9 +11,9 @@ These are my working instructions for building and verifying the rewrite, one ph
 | `src/evx_parse.s` | asm | `evx_parse_events`: batch event parse → validation flags → lookups → candidate records |
 | `src/evx_dedup.s` | asm | `evx_dedup_insert` (lock-free global winner table), `evx_collect` (valid winners + person interning + histogram), `evx_scatter` (group by person) |
 | `src/evx_session.s` | asm | `evx_sessionize`: per-person ts sort, session split, day split, user/day aggregates, top category |
-| `src/main.c` | C | env, phases, pthread pool, task queues, timing/stats |
+| `src/main.c` | C | env, phases, pthread pool, task queues (silent unless an error occurs) |
 | `src/dict.c` | C | manifest, products + category ranking, links DSU → lookup tables |
-| `src/parquet.c` | C | Minimal Parquet writer (PLAIN, uncompressed, Thrift-compact footer) |
+| `src/parquet.c` | C | In-RAM Parquet builder (PLAIN, uncompressed, Thrift-compact footer); groups encoded and copied in parallel into a shared file mapping |
 | `src/tests/unit.c` | C | Unit tests of the asm primitives (`make unit`) |
 | `scripts/check_events.py` | Python | Fixture and dev-set checker for `user_daily` only |
 
@@ -48,7 +48,7 @@ Every arrow is a phase barrier (pool barrier). No structure is read in a phase w
 2. Products: split with `evx_split_line`, collect distinct categories, add `unknown`, sort byte-wise, and assign IDs in sorted order (bounds ≤ 255). Build the product LookupTable (`val_len` = cat id).
 3. Links: split each line; drop malformed lines and lines with an empty side. Intern IDs, then DSU (union by size, path halving), then the smallest name per root. Build the link LookupTable: key = raw ID, val = canonical name, `val_tag` = hash>>32.
 
-**Test B:** run the fixtures (L1–L3 exercise this) through the full pipeline. Debug `stderr` stats print the link/product counts.
+**Test B:** run the fixtures (L1–L3 exercise this) through the full pipeline.
 
 ### Phase C: parse + dedup (`evx_parse.s`, `evx_dedup.s`)
 1. `evx_parse_events` walks lines, rejects malformed lines and empty eid, computes all validity flags per row, and does lookups only for rows that are still valid.
