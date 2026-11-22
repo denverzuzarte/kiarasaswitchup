@@ -245,3 +245,4 @@ The dictionary phase (products + links DSU, single-threaded C) is 10–115 ms an
 Measured with exact `wait4` timing, 20M native, interleaved.
 
 - **C2 click prefix sum parallel** (`job_cprefix_sum` / `job_cprefix_write` in `main.c`): per-worker block sums and max, a serial pass over 8 block bases, then each worker writes its block's offsets and cursors. Median 625 -> 623 ms (about 2 ms, near the noise floor).
+- **Parallel exit teardown** (`job_release`, region registry in `main.c`): `big_alloc`/`map_file` register every large mapping; after the last Parquet part, each worker `MADV_DONTNEED`s its 1/nw slice of every region before the process exits (read-lock only, so slices run in parallel, unlike `munmap` which is write-locked and was slower). Measured split of the old ~50 ms exit: events file mapping about 25 ms, Cand arena about 20 ms, click buffers about 4 ms. Median 635 -> 605 ms (about -30 ms); min 629 -> 600.

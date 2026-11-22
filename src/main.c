@@ -28,6 +28,31 @@
 
 /* ------------------------------------------------------------- utilities */
 
+/* Every large mapping, so that the process can drop them in parallel before
+   exit (MADV_DONTNEED takes only the read lock, unlike munmap). The
+   coordinator is the only caller. */
+#define MAX_REGIONS 1024
+static struct { void *p; size_t n; } regions[MAX_REGIONS];
+static unsigned nregions;
+
+static void region_add(void *p, size_t n)
+{
+    if (nregions < MAX_REGIONS) {
+        regions[nregions].p = p;
+        regions[nregions].n = n;
+        nregions++;
+    }
+}
+
+static void region_del(void *p)
+{
+    for (unsigned i = nregions; i-- > 0;)
+        if (regions[i].p == p) {
+            regions[i] = regions[--nregions];
+            return;
+        }
+}
+
 int map_file(const char *path, Mapped *m)
 {
     m->data = NULL;
@@ -53,6 +78,7 @@ int map_file(const char *path, Mapped *m)
         /* enumerated advice values, not flags: one call each */
         madvise(p, (size_t)st.st_size, MADV_SEQUENTIAL);
         madvise(p, (size_t)st.st_size, MADV_WILLNEED);
+        region_add(p, (size_t)st.st_size);
         m->data = p;
         m->size = (size_t)st.st_size;
     }
@@ -62,8 +88,10 @@ int map_file(const char *path, Mapped *m)
 
 void unmap_file(Mapped *m)
 {
-    if (m->data)
+    if (m->data) {
+        region_del((void *)m->data);
         munmap((void *)m->data, m->size);
+    }
     m->data = NULL;
     m->size = 0;
 }
@@ -77,6 +105,7 @@ void *big_alloc(size_t bytes)
     if (p == MAP_FAILED)
         return NULL;
     madvise(p, bytes, MADV_NOHUGEPAGE);
+    region_add(p, bytes);
     return p;
 }
 
@@ -91,8 +120,10 @@ void *big_alloc_hp(size_t bytes)
 
 void big_free(void *p, size_t bytes)
 {
-    if (p)
+    if (p) {
+        region_del(p);
         munmap(p, bytes ? bytes : 4096);
+    }
 }
 
 static int name_cmp(const void *a, const void *b)
@@ -475,6 +506,24 @@ static void job_write(void *arg, unsigned wid)
     if (write_parquet(opath, n, 6, ucols, NULL, 0) != 0)
         a->rc = 1;
     free(mem);
+}
+
+/* Exit teardown, parallel: each worker drops its 1/nw slice of every region
+   (the dying process would otherwise free ~3.6 GB of page tables and pages on
+   one CPU). Only called when nothing reads the memory any more. */
+static void job_release(void *arg, unsigned wid)
+{
+    (void)arg;
+    const uintptr_t PG = 4096;
+    for (unsigned i = 0; i < nregions; i++) {
+        uintptr_t b = (uintptr_t)regions[i].p, e = b + regions[i].n;
+        uintptr_t pages = (e - b + PG - 1) / PG;
+        uintptr_t s0 = b + (pages * wid / pool.n) * PG, s1 = b + (pages * (wid + 1) / pool.n) * PG;
+        if (wid + 1 == pool.n || s1 > e)
+            s1 = (e + PG - 1) & ~(PG - 1);
+        if (s1 > s0)
+            madvise((void *)s0, s1 - s0, MADV_DONTNEED);
+    }
 }
 
 static void job_parse_clicks(void *arg, unsigned wid)
@@ -1115,7 +1164,6 @@ int main(int argc, char **argv)
     wa = (WriteArgs){.st = stasks, .tb = tb, .pnames = pnames, .cats = dict.cats, .odir = odir};
     q = (Queue){.tasks = &wa};
     pool_run(job_write, &q);
-    pool_shutdown();
     if (wa.rc)
         return 1;
 
@@ -1180,5 +1228,7 @@ int main(int argc, char **argv)
     };
     if (write_parquet(opath, ncrows, 7, ccols, NULL, 0) != 0)
         return 1;
+    pool_run(job_release, NULL);
+    pool_shutdown();
     return 0;
 }
