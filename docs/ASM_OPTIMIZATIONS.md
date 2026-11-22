@@ -173,7 +173,7 @@ A `perf record -F 20000 -e cycles:u` timeline in 5 ms bins at 20M showed about 1
 | + parallel start | 857 / 866 ms |
 | + pread input (reverted) | 1330 / 1401 ms |
 
-## 6i. Round 6: partitioned store, fused grouping (current implementation)
+## 6i. Round 6: partitioned store, fused grouping
 
 This round was developed from round 3 on a separate branch and then merged. Where it overlaps rounds 4 and 5 and the `dopt` branch (6e–6h), it supersedes them. The global CAS dedup table, `evx_scatter`, the global `Ev` array and the single-file Parquet layout no longer exist. The round-5 ideas also found there are kept: losers marked dead, memory-order collect, branchless quotes, `MADV_WILLNEED`, coordinator overlap. Interleaved head-to-head at 20M events + 5M clicks on the same host: round 6 **634 ms** median against 890 ms for `main` at `e5bea99`.
 
@@ -196,6 +196,27 @@ Measured on the build host (Ryzen 7 9700X), interleaved runs, idle-CPU gated. St
 Thread occupancy after this round: every pool phase is 98–99% busy (barrier imbalance 1–2%), and the serial gaps between phases total about 5 ms.
 
 Result: **619–620 ms** wall on a quiet machine (start 934–947 ms; the `main` branch at that time: 861–919 ms). Correct on the 36 fixtures, the dev answer (including forced person-table retries), NCPU 1/2/3/8 determinism, fuzz sets against `reference_events.py`, and the 20M golden output.
+
+## 6j. Round 7: 32-byte Rec, per-ID resolution, single-pass dedup + emit (current implementation)
+
+Branch `r7-core`. This supersedes the Cand / `evx_collect` parts of 6i. The pipeline is now: P1 parse (Rec + raw-ID intern), then P1.5 `evx_resolve_raw` (canon, person intern, compact, `remap[rid]`), then P2 `evx_dedup_emit`, then P5+P6 as before. Measured on the build host (Ryzen 7 9700X) with interleaved native runs timed with a blocking `wait4`, at 20M events + 5M clicks. Start: `main` eeb320a, 617 / **622** / 630 ms, 3651 MiB peak RSS.
+
+| # | Change | Effect |
+|---|---|---|
+| 7.1 | **32-byte Rec** instead of the 56-byte Cand: `ki` = (ingest seconds − window + 2^39) << 24 \| 24 hash bits (one compare gives ingest order), `eptr` = event_id pointer \| 16 more hash bits, `ts_off`, `rid`, `price_cat`. The chunk is a 32-byte header + 127 Recs, 32-byte aligned | arena 1.2 GB → 0.68 GB |
+| 7.2 | **Raw-ID intern in parse**: each valid copy interns its raw `user_id` Key16 (`cmpxchg16b` slots, slot = rid), delayed through a 16-row prefetch ring. Ring sizes 8 and 32 measured equal. Overflow (more than half claimed) reruns P1 with an 8× table. `EVX_RSIZE` forces it | parse 200 → ~228 ms |
+| 7.3 | The shared raw-claim counter took 6.5% of parse samples (`lock xadd` line bouncing). Claims are now counted per call and added in batches of 64 (slack of at most nw × 64 past the half-full limit) | parse −1.5% |
+| 7.4 | **P1.5 `evx_resolve_raw`**: one link lookup and one person intern per *distinct* raw id (1.28M at 20M, instead of 21M winners). Batched 32 deep (scan, hash and prefetch the link entry, canon and prefetch the person slot, intern). The person table is sized `pow2(2 × raw claims)`, so it cannot overflow unless `EVX_PSIZE` forces it. Then P1.5 alone reruns. The compaction and `remap[raw slot] = dense id` happen in place | P1.5 + P4 ≈ 30 ms |
+| 7.5 | **P2 `evx_dedup_emit`** replaces `evx_dedup_part` + `evx_collect`. The table holds tagged Rec pointers (hash bits 24–39 in the top 16 bits), so most mismatches need no Rec load. Equal 40-bit hashes are confirmed on the event_id bytes in the input (`evx_eid_eq`: the value ends at its first `,` or `"`). Then it walks the table and emits Wins `{ts_off, dense pid, price_cat}` into person ranges `pid >> dshift`, prefetching the Rec 48 slots ahead and `remap[rid]` 24 ahead (16/8 was 10 ms slower). The partition's Rec chunks go to the worker's free list and become the next partition's Win chunks | dedup + collect 180 → 110 ms |
+| 7.6 | Partitions of ≥ 64K estimated rows, up to 1024 (512 at 20M), instead of 128K / 512. The private table (≈ 0.5 MB) stays in L2. 32K rows / 1024 partitions measured the same | −15 ms |
+| 7.7 | Chunks come from per-worker 2 MB slabs of the arena (one atomic add per slab), allocated by `evx_chunk_alloc` (C, called from the asm) | — |
+| 7.8 | Tried, default off: `MADV_POPULATE_WRITE` on each slab. **+18 ms** (614 vs 596 ms): a whole slab is pre-faulted even when only part of it is used. Kept behind `-DEVX_POPULATE=1` | reverted |
+| 7.9 | The arena is unmapped by the idle coordinator while the workers write Parquet | wall ±0, RSS −100 MiB |
+| 7.10 | Tried and reverted: the `parse_ts` date memo (`docs/handoff/patches/parse_ts_date_memo.patch`): 615 vs 616 ms. Skipping the ingest parse when its bytes equal `ts`: only 139 of 200,000 dev20m rows qualify, so not implemented. A table home-slot prefetch 8/16 Recs ahead in the insert loop (`IN_PF`): 598–601 ms either way, left off | — |
+
+Phase times at 20M (wall, 8 workers): links + products 29 ms, P1 parse 229 ms, P1.5 resolve 17 ms, compaction + remap 13 ms, P2 dedup+emit 110 ms (256 partitions; less with 512), C1 53 ms, C3 22 ms, P5+P6 78 ms, Parquet 22–25 ms, exit about 50 ms.
+
+Result (`make bench REVS="main HEAD" RUNS=5`, dev20m): **main 622 ms, r7-core 599 ms median** (−4%), CPU 4447 → 4297 ms, peak RSS 3651 → 3074 MiB. About 1.85 GB of that RSS is the mapped input (page cache counted in RSS); the anonymous part is about 1.2 GB. The plan estimated 420–460 ms. Parse absorbed most of what collect saved: the raw-ID probe per row costs about as much as collect's per-winner probe did. Outputs are identical to eeb320a on dev20m (NCPU 1/2/3/8, `EVX_PSIZE=1024`, `EVX_RSIZE=4096`), on the dev answer, on the 36 fixtures, and on fuzz seeds 3 and 11 against `reference_events.py`.
 
 ## 7. OS and memory (C side, in support of the asm)
 
