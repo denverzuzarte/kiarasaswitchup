@@ -95,6 +95,8 @@ void pq_put_opt_str(PqCol *c, const char *p, uint32_t len);   /* p == NULL: null
 void pq_put_i32(PqCol *c, int32_t v);
 void pq_put_i64(PqCol *c, int64_t v);
 int pq_encode_done(PqFile *f, size_t group);
+void pq_presize(PqFile *f, size_t group, int col, size_t body);   /* optional: layout first */
+size_t pq_varint_len(uint64_t v);
 int pq_layout(PqFile *f, const char *path);
 void pq_copy(PqFile *f, size_t group);
 int pq_close(PqFile *f);

@@ -154,6 +154,7 @@ struct PqCol {
     Buf lv;                  /* COL_STR_OPT: definition-level RLE runs */
     uint64_t run;            /* current def-level run length */
     int run_def;
+    int presized;
     int64_t offset, total;
 };
 
@@ -224,6 +225,44 @@ void pq_put_opt_str(PqCol *c, const char *p, uint32_t len)
         pq_put_str(c, p, len);
 }
 
+static void put_header(Buf *hdr, size_t body, size_t rows)
+{
+    Thrift t = {.b = hdr};
+    th_i32(&t, 1, 0);                       /* DATA_PAGE */
+    th_i32(&t, 2, (int32_t)body);
+    th_i32(&t, 3, (int32_t)body);
+    th_begin(&t, 5);                        /* DataPageHeader */
+    th_i32(&t, 1, (int32_t)rows);
+    th_i32(&t, 2, 0);                       /* PLAIN */
+    th_i32(&t, 3, 3);                       /* RLE def levels */
+    th_i32(&t, 4, 3);                       /* RLE rep levels */
+    th_end(&t);
+    put_u8(hdr, T_STOP);
+}
+
+size_t pq_varint_len(uint64_t v)
+{
+    size_t n = 1;
+    while (v >= 0x80) {
+        v >>= 7;
+        n++;
+    }
+    return n;
+}
+
+/* Exact page-body size of one column chunk, known before encoding, so the
+   layout (and footer) can be fixed first and each group written as soon as
+   it is encoded. pq_encode_done checks the encoded size against it. */
+void pq_presize(PqFile *f, size_t group, int col, size_t body)
+{
+    PqCol *c = pq_col(f, group, col);
+    Buf h = {0};
+    put_header(&h, body, f->group_rows[group]);
+    c->total = (int64_t)(h.n + body);
+    c->presized = 1;
+    free(h.p);
+}
+
 /* Finish one row group: page headers (bodies are complete). */
 int pq_encode_done(PqFile *f, size_t group)
 {
@@ -248,20 +287,13 @@ int pq_encode_done(PqFile *f, size_t group)
         }
         if (c->body.oom || c->body.n > INT32_MAX)
             return -1;
-        Thrift t = {.b = &c->hdr};
-        th_i32(&t, 1, 0);                       /* DATA_PAGE */
-        th_i32(&t, 2, (int32_t)c->body.n);
-        th_i32(&t, 3, (int32_t)c->body.n);
-        th_begin(&t, 5);                        /* DataPageHeader */
-        th_i32(&t, 1, (int32_t)rows);
-        th_i32(&t, 2, 0);                       /* PLAIN */
-        th_i32(&t, 3, 3);                       /* RLE def levels */
-        th_i32(&t, 4, 3);                       /* RLE rep levels */
-        th_end(&t);
-        put_u8(&c->hdr, T_STOP);
+        put_header(&c->hdr, c->body.n, rows);
         if (c->hdr.oom)
             return -1;
-        c->total = (int64_t)(c->hdr.n + c->body.n);
+        int64_t total = (int64_t)(c->hdr.n + c->body.n);
+        if (c->presized && total != c->total)
+            return -1;                          /* size pass and encoder disagree */
+        c->total = total;
     }
     return 0;
 }
@@ -351,7 +383,7 @@ static int pwrite_all(int fd, const void *p, size_t n, off_t off)
     return 0;
 }
 
-/* After every group is encoded: offsets, then magic + footer written. */
+/* After every group is encoded or presized: offsets, then magic + footer. */
 int pq_layout(PqFile *f, const char *path)
 {
     int64_t pos = 4;
@@ -374,7 +406,8 @@ int pq_layout(PqFile *f, const char *path)
     return 0;
 }
 
-/* Write one row group's pages at their offsets (any worker, after pq_layout). */
+/* Write one row group's pages at their offsets (any worker, after pq_layout
+   and the group's pq_encode_done); frees the group's buffers. */
 void pq_copy(PqFile *f, size_t group)
 {
     for (int col = 0; col < f->ncols; col++) {
@@ -382,6 +415,9 @@ void pq_copy(PqFile *f, size_t group)
         if (pwrite_all(f->fd, c->hdr.p, c->hdr.n, c->offset) ||
             pwrite_all(f->fd, c->body.p, c->body.n, c->offset + (off_t)c->hdr.n))
             atomic_store(&f->failed, 1);
+        free(c->hdr.p);
+        free(c->body.p);
+        c->hdr = c->body = (Buf){0};
     }
 }
 

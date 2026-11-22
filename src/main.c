@@ -557,19 +557,49 @@ static void job_ud_encode(void *arg, unsigned wid)
                     pq_put_opt_str(c[5], a->cats[r->top_cat].ptr, a->cats[r->top_cat].len);
             }
         }
+        /* the layout is fixed (presized), so write it now: the pwrites
+           (serialized per file by the kernel) overlap other groups' encoding */
         if (pq_encode_done(a->f, g) != 0)
             atomic_store(&a->failed, 1);
+        else
+            pq_copy(a->f, g);
     }
 }
 
-static void job_pq_copy(void *arg, unsigned wid)
+/* exact page-body sizes of every user_daily column chunk of the groups */
+static void job_ud_size(void *arg, unsigned wid)
 {
     (void)wid;
     Queue *q = arg;
-    const UdArgs *a = q->ctx;
+    UdArgs *a = (UdArgs *)q->ctx;
     size_t g;
-    while ((g = atomic_fetch_add_explicit(&q->next, 1, memory_order_relaxed)) < q->ntasks)
-        pq_copy(a->f, g);
+    while ((g = atomic_fetch_add_explicit(&q->next, 1, memory_order_relaxed)) < q->ntasks) {
+        size_t n = a->grows[g], uid = 0, top = 0, lv = 0, run = 0;
+        int run_def = -1;
+        for (size_t t = a->gfirst[g]; t < a->gfirst[g + 1]; t++) {
+            const Row *r = a->tasks[t].out, *e = r + a->tasks[t].count;
+            for (; r < e; r++) {
+                uid += 4 + a->pnames[r->pid].len;
+                int def = r->top_cat != TOPCAT_NULL;
+                if (def)
+                    top += 4 + a->cats[r->top_cat].len;
+                if (run && def != run_def) {     /* RLE run: varint(len << 1), value byte */
+                    lv += pq_varint_len((uint64_t)run << 1) + 1;
+                    run = 0;
+                }
+                run_def = def;
+                run++;
+            }
+        }
+        if (run)
+            lv += pq_varint_len((uint64_t)run << 1) + 1;
+        pq_presize(a->f, g, 0, uid);
+        pq_presize(a->f, g, 1, n * 4);
+        pq_presize(a->f, g, 2, n * 8);
+        pq_presize(a->f, g, 3, n * 8);
+        pq_presize(a->f, g, 4, n * 8);
+        pq_presize(a->f, g, 5, 4 + lv + top);
+    }
 }
 
 static int64_t floor_div(int64_t a, int64_t b)
@@ -1125,15 +1155,12 @@ int main(int argc, char **argv)
                  .pnames = pnames, .cats = dict.cats};
     q = (Queue){.ntasks = ngroups, .ctx = &ua};
     atomic_init(&q.next, 0);
-    pool_run(job_ud_encode, &q);
-    if (atomic_load(&ua.failed) || pq_layout(uf, opath) != 0)
+    pool_run(job_ud_size, &q);
+    if (pq_layout(uf, opath) != 0)
         return 1;
     q = (Queue){.ntasks = ngroups, .ctx = &ua};
     atomic_init(&q.next, 0);
-    pool_run(job_pq_copy, &q);
-    pool_shutdown();
-    if (pq_close(uf) != 0)
-        return 1;
+    pool_start(job_ud_encode, &q);      /* encode + write; campaign_daily meanwhile */
 
     /* ---- P7b: reduce per-worker campaign/day tables -> campaign_daily ------- */
     uint64_t *tot_rev = calloc(ncells ? ncells : 1, sizeof *tot_rev);
@@ -1187,6 +1214,10 @@ int main(int argc, char **argv)
         return 1;
     pq_copy(cf, 0);
     if (pq_close(cf) != 0)
+        return 1;
+    pool_wait();
+    pool_shutdown();
+    if (atomic_load(&ua.failed) || pq_close(uf) != 0)
         return 1;
     return 0;
 }
