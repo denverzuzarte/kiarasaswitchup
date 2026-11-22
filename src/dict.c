@@ -278,6 +278,8 @@ struct LinkBuild {
     _Atomic uint64_t *filter;   /* linked-id bit filter (khash >> fshift) */
     uint64_t fshift;
     _Atomic uint64_t lines, dropped;
+    size_t bytes;
+    _Atomic uint64_t count;     /* line count (links_count) */
     _Atomic uint32_t next_id;   /* dense id counter */
     uint32_t *dslot;            /* dense id -> slot */
     Key16 *dkey;                /* dense id -> key (cache-friendly copy) */
@@ -324,7 +326,10 @@ static uint32_t link_intern(LinkBuild *lb, const char *p, uint32_t len)
     }
 }
 
-int links_plan(const char *data_dir, unsigned workers, LinkBuild **out)
+/* Three steps so the line count (which sizes the table) runs on all
+   workers: links_map (coordinator), links_count (every worker, one slice of
+   the concatenated files), links_plan (coordinator: tasks + allocations). */
+int links_map(const char *data_dir, LinkBuild **out)
 {
     char dir[4096], path[8192];
     snprintf(dir, sizeof dir, "%s/links", data_dir);
@@ -337,21 +342,43 @@ int links_plan(const char *data_dir, unsigned workers, LinkBuild **out)
         nf = 0;
     lb->files = calloc((size_t)(nf ? nf : 1), sizeof(Mapped));
     lb->nfiles = nf;
-    size_t bytes = 0, lines = 0;
     for (int i = 0; i < nf; i++) {
         snprintf(path, sizeof path, "%s/%s", dir, names[i]);
         free(names[i]);
         if (map_file(path, &lb->files[i]) != 0)
             return -1;
-        bytes += lb->files[i].size;
-        const char *p = lb->files[i].data, *e = p + lb->files[i].size;
-        while (p && p < e) {
-            const char *nl = memchr(p, '\n', (size_t)(e - p));
-            lines++;
-            p = nl ? nl + 1 : e;
-        }
+        lb->bytes += lb->files[i].size;
     }
     free(names);
+    *out = lb;
+    return 0;
+}
+
+/* newlines in slice w of nw of all link bytes, plus one per file whose
+   last line has no newline (counted by the slice holding its last byte) */
+void links_count(LinkBuild *lb, unsigned w, unsigned nw)
+{
+    uint64_t b = lb->bytes * w / nw, e = lb->bytes * (w + 1) / nw, base = 0, n = 0;
+    for (int i = 0; i < lb->nfiles; i++) {
+        uint64_t fs = lb->files[i].size;
+        const char *d = lb->files[i].data;
+        if (d && b < base + fs && e > base) {      /* file overlaps the slice */
+            uint64_t lo = b > base ? b - base : 0;
+            uint64_t hi = e < base + fs ? e - base : fs;
+            for (uint64_t k = lo; k < hi; k++)
+                n += d[k] == '\n';
+            if (hi == fs && d[fs - 1] != '\n')
+                n++;
+        }
+        base += fs;
+    }
+    atomic_fetch_add(&lb->count, n);
+}
+
+int links_plan(LinkBuild *lb, unsigned workers)
+{
+    int nf = lb->nfiles;
+    size_t bytes = lb->bytes, lines = atomic_load(&lb->count);
     size_t chunk = bytes / ((size_t)workers * 8) + 1;
     if (chunk < ((size_t)1 << 18))
         chunk = (size_t)1 << 18;
@@ -401,7 +428,6 @@ int links_plan(const char *data_dir, unsigned workers, LinkBuild **out)
     if (idcap >= UINT32_MAX)
         return -1;
     lb->mask = size - 1;
-    *out = lb;
     return 0;
 }
 

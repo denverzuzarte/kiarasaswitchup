@@ -65,7 +65,9 @@ typedef struct {
     uint64_t pair_off, npairs;
 } LinkTask;
 typedef struct LinkBuild LinkBuild;
-int links_plan(const char *data_dir, unsigned workers, LinkBuild **out);
+int links_map(const char *data_dir, LinkBuild **out);
+void links_count(LinkBuild *lb, unsigned w, unsigned nw);
+int links_plan(LinkBuild *lb, unsigned workers);
 size_t links_ntasks(const LinkBuild *lb);
 uint64_t links_task_pairs(const LinkBuild *lb, size_t task);
 void links_parse_task(LinkBuild *lb, size_t task);

@@ -287,6 +287,24 @@ typedef struct {
     Arena *arena;        /* compact per-task output (collect, sessionize) */
 } Queue;
 
+typedef struct {
+    const char *data_dir;
+    Dict *dict;
+    LinkBuild *lb;
+    unsigned nw;
+    _Atomic int rc;
+} StartArgs;
+
+static void job_startup(void *arg, unsigned wid)
+{
+    StartArgs *a = arg;
+    if (wid == 0 && load_products(a->data_dir, a->dict) != 0)
+        atomic_store(&a->rc, 1);
+    if (wid == (a->nw > 1 ? 1u : 0u) && load_campaigns(a->data_dir, a->dict) != 0)
+        atomic_store(&a->rc, 1);
+    links_count(a->lb, wid, a->nw);
+}
+
 /* P0b + P1 in one phase: every worker first takes link-file tasks (parse +
    intern), then event parse tasks. The worker that completes the last link
    task runs the (integer-only) union-find + smallest-name pass, then joins
@@ -665,18 +683,21 @@ int main(int argc, char **argv)
 
     /* ---- P0: manifest, products, links ---------------------------------- */
     static Dict dict;
-    if (load_manifest(data_dir, &dict) || load_products(data_dir, &dict) ||
-        load_campaigns(data_dir, &dict))
+    if (load_manifest(data_dir, &dict))
         return 1;
     if (pool_init(nw) != 0) {
         fprintf(stderr, "thread pool init failed\n");
         return 1;
     }
-    /* P0b: link files are parsed and interned by all workers at the start
-       of the event parse phase (job_parse) */
+    /* P0a on the workers: products (worker 0), campaigns (worker 1), link
+       line count (every worker, one slice); the coordinator maps and plans
+       the event files meanwhile. P0b: link files are parsed and interned by
+       all workers at the start of the event parse phase (job_parse). */
     LinkBuild *lbuild = NULL;
-    if (links_plan(data_dir, nw, &lbuild) != 0)
+    if (links_map(data_dir, &lbuild) != 0)
         return 1;
+    StartArgs sa0 = {.data_dir = data_dir, .dict = &dict, .lb = lbuild, .nw = nw};
+    pool_start(job_startup, &sa0);
 
     /* ---- event files -> newline-aligned byte-range tasks ----------------- */
     char evdir[4096], path[8192];
@@ -738,6 +759,10 @@ int main(int argc, char **argv)
         fprintf(stderr, "out of memory (candidates)\n");
         return 1;
     }
+
+    pool_wait();
+    if (atomic_load(&sa0.rc) || links_plan(lbuild, nw) != 0)
+        return 1;
 
     /* ---- P1: parse --------------------------------------------------------- */
     ParseCtx pctx = {
