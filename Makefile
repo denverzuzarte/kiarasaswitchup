@@ -31,7 +31,7 @@ PY       ?= python3
 
 export IMAGE CPUS MEM PLATFORM
 
-.PHONY: all build fixtures fixtures-native dev run-dev run-native fuzz-data check-reference check-dev check-dev-events clean clean-out clean-dataset unit check-fixtures
+.PHONY: all build fixtures fixtures-native bench dev run-dev run-native fuzz-data check-reference check-dev check-dev-events clean clean-out clean-dataset unit check-fixtures
 
 # Plain `make` builds the native executable. `make build` also builds its image.
 all: $(TARGET)
@@ -93,6 +93,13 @@ check-reference:
 	rm -rf out-ref
 	$(PY) scripts/reference_events.py $(DEV) out-ref
 	cd scripts && $(PY) compare.py ../out ../out-ref
+
+# Interleaved wall-time comparison of committed binaries (git revisions):
+#   make bench DEV=dev20m REVS="1323748 main dopt" RUNS=5
+REVS ?= HEAD
+RUNS ?= 5
+bench:
+	scripts/bench.sh $(DEV) $(RUNS) $(CPUS) $(REVS)
 
 # Unit tests of the assembly primitives (not part of src/main).
 UNIT := src/tests/unit
