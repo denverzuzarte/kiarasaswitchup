@@ -285,3 +285,12 @@ Measured with exact `wait4` timing, 20M native, interleaved.
 ## Round 7: parallel startup (r7-start)
 
 `links_plan` no longer reads link file contents on the coordinator: it only lists/mmaps and cuts raw byte ranges. A new scan job (`links_scan_task`) aligns each task to line starts (the first '\n' at index >= begin-1, header skipped for offset 0) and counts its lines on all workers; after that barrier `links_prepare` sizes pairs/table/id space from the exact line counts. The coordinator plans the event files during the scan, then loads products/campaigns and maps (WILLNEED) the click files while workers parse links. Measured (dev20m, warm cache): the scan takes ~1.3 ms in parallel, replacing a ~10 ms single-thread phase at the start; wall effect ~3 ms (host loaded, load ~3.5, not a valid bench). Cold-cache runs now issue readahead for events, links and clicks before the first parse starts.
+
+## Vector-width study (branches vec-512 / vec-256 / vec-128 / vec-64)
+
+Four builds of round 7 that differ only in SIMD width, to measure whether AVX-512
+frequency licensing costs anything on the target Cascade Lake host. All produce
+byte-identical output. This branch, **vec-256**: every zmm block (line scanners of
+evx_parse_events / evx_parse_clicks, evx_memeq, evx_memcmp, evx_split_line) is a
+32-byte ymm16+ block (EVEX AVX-512VL/BW, 32-bit k-masks, masked tail loads kept);
+C is built with -mprefer-vector-width=256 (explicit; the Cascade Lake default).

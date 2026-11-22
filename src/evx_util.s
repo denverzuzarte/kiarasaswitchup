@@ -82,16 +82,16 @@ evx_hash:
         .type   evx_memeq, @function
         .p2align 5
 evx_memeq:
-        cmp     rdx, 64
+        cmp     rdx, 32
         ja      .Lm_long
         mov     r11, -1
         bzhi    r11, r11, rdx
-        kmovq   k1, r11
-        vmovdqu8 zmm16{k1}{z}, zmmword ptr [rdi]
-        vmovdqu8 zmm17{k1}{z}, zmmword ptr [rsi]
-        vpcmpb  k2, zmm16, zmm17, 4
+        kmovd   k1, r11d
+        vmovdqu8 ymm16{k1}{z}, ymmword ptr [rdi]
+        vmovdqu8 ymm17{k1}{z}, ymmword ptr [rsi]
+        vpcmpb  k2, ymm16, ymm17, 4
         xor     eax, eax
-        kortestq k2, k2
+        kortestd k2, k2
         setz    al
         ret
 .Lm_long:
@@ -99,24 +99,24 @@ evx_memeq:
         push    rsi
         push    rdx
 .Lm_loop:
-        cmp     rdx, 64
+        cmp     rdx, 32
         jb      .Lm_ltail
-        vmovdqu8 zmm16, zmmword ptr [rdi]
-        vpcmpb  k2, zmm16, zmmword ptr [rsi], 4
-        kortestq k2, k2
+        vmovdqu8 ymm16, ymmword ptr [rdi]
+        vpcmpb  k2, ymm16, ymmword ptr [rsi], 4
+        kortestd k2, k2
         jnz     .Lm_ne
-        add     rdi, 64
-        add     rsi, 64
-        sub     rdx, 64
+        add     rdi, 32
+        add     rsi, 32
+        sub     rdx, 32
         jmp     .Lm_loop
 .Lm_ltail:
         mov     r11, -1
         bzhi    r11, r11, rdx
-        kmovq   k1, r11
-        vmovdqu8 zmm16{k1}{z}, zmmword ptr [rdi]
-        vmovdqu8 zmm17{k1}{z}, zmmword ptr [rsi]
-        vpcmpb  k2, zmm16, zmm17, 4
-        kortestq k2, k2
+        kmovd   k1, r11d
+        vmovdqu8 ymm16{k1}{z}, ymmword ptr [rdi]
+        vmovdqu8 ymm17{k1}{z}, ymmword ptr [rsi]
+        vpcmpb  k2, ymm16, ymm17, 4
+        kortestd k2, k2
         jnz     .Lm_ne
         mov     eax, 1
         jmp     .Lm_out
@@ -320,27 +320,27 @@ evx_split_line:
         xor     r12d, r12d              # quote count
         xor     r13d, r13d              # wrapped fields
         mov     eax, 0x2C
-        vpbroadcastb zmm21, eax
+        vpbroadcastb ymm21, eax
         mov     eax, 0x22
-        vpbroadcastb zmm22, eax
+        vpbroadcastb ymm22, eax
 .Lsl_blk:
         mov     rcx, r9
         sub     rcx, r8
         jbe     .Lsl_last
-        cmp     rcx, 64
+        cmp     rcx, 32
         jb      .Lsl_part
-        vmovdqu8 zmm16, zmmword ptr [r8]
+        vmovdqu8 ymm16, ymmword ptr [r8]
         jmp     .Lsl_cmp
 .Lsl_part:
         mov     rax, -1
         bzhi    rax, rax, rcx
-        kmovq   k1, rax
-        vmovdqu8 zmm16{k1}{z}, zmmword ptr [r8]
+        kmovd   k1, eax
+        vmovdqu8 ymm16{k1}{z}, ymmword ptr [r8]
 .Lsl_cmp:
-        vpcmpeqb k2, zmm16, zmm21
-        vpcmpeqb k3, zmm16, zmm22
-        kmovq   r14, k2
-        kmovq   rax, k3
+        vpcmpeqb k2, ymm16, ymm21
+        vpcmpeqb k3, ymm16, ymm22
+        kmovd   r14d, k2
+        kmovd   eax, k3
         popcnt  rax, rax
         add     r12, rax
 .Lsl_comma:
@@ -355,7 +355,7 @@ evx_split_line:
         blsr    r14, r14
         jmp     .Lsl_comma
 .Lsl_nextblk:
-        add     r8, 64
+        add     r8, 32
         jmp     .Lsl_blk
 .Lsl_last:
         mov     r15, r9

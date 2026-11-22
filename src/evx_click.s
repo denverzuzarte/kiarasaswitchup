@@ -71,26 +71,26 @@ evx_memcmp:
         cmp     rcx, r8
         cmovb   r8, rcx                 # common length
 .Lmc_loop:
-        cmp     r8, 64
+        cmp     r8, 32
         jb      .Lmc_tail
-        vmovdqu8 zmm16, zmmword ptr [rdi]
-        vmovdqu8 zmm17, zmmword ptr [rdx]
-        vpcmpb  k2, zmm16, zmm17, 4
-        kmovq   r11, k2
+        vmovdqu8 ymm16, ymmword ptr [rdi]
+        vmovdqu8 ymm17, ymmword ptr [rdx]
+        vpcmpb  k2, ymm16, ymm17, 4
+        kmovd   r11d, k2
         test    r11, r11
         jnz     .Lmc_diff
-        add     rdi, 64
-        add     rdx, 64
-        sub     r8, 64
+        add     rdi, 32
+        add     rdx, 32
+        sub     r8, 32
         jmp     .Lmc_loop
 .Lmc_tail:
         mov     r11, -1
         bzhi    r11, r11, r8
-        kmovq   k1, r11
-        vmovdqu8 zmm16{k1}{z}, zmmword ptr [rdi]
-        vmovdqu8 zmm17{k1}{z}, zmmword ptr [rdx]
-        vpcmpb  k2, zmm16, zmm17, 4
-        kmovq   r11, k2
+        kmovd   k1, r11d
+        vmovdqu8 ymm16{k1}{z}, ymmword ptr [rdi]
+        vmovdqu8 ymm17{k1}{z}, ymmword ptr [rdx]
+        vpcmpb  k2, ymm16, ymm17, 4
+        kmovd   r11d, k2
         test    r11, r11
         jnz     .Lmc_diff
         xor     eax, eax
@@ -298,11 +298,11 @@ evx_parse_clicks:
         mov     rbx, rcx                # out base
         mov     qword ptr [rsp + K_N], 0
         mov     eax, 0x0A
-        vpbroadcastb zmm20, eax
+        vpbroadcastb ymm20, eax
         mov     eax, 0x2C
-        vpbroadcastb zmm21, eax
+        vpbroadcastb ymm21, eax
         mov     eax, 0x22
-        vpbroadcastb zmm22, eax
+        vpbroadcastb ymm22, eax
 .Lk_line:
         cmp     r13, r14
         jae     .Lk_done
@@ -313,15 +313,15 @@ evx_parse_clicks:
 .Lk_scan:
         mov     rcx, r14
         sub     rcx, r8
-        cmp     rcx, 64
+        cmp     rcx, 32
         jb      .Lk_partial
-        vmovdqu8 zmm16, zmmword ptr [r8]
-        vpcmpeqb k1, zmm16, zmm20
-        vpcmpeqb k2, zmm16, zmm21
-        vpcmpeqb k3, zmm16, zmm22
-        kmovq   rax, k1
-        kmovq   rdx, k2
-        kmovq   r11, k3
+        vmovdqu8 ymm16, ymmword ptr [r8]
+        vpcmpeqb k1, ymm16, ymm20
+        vpcmpeqb k2, ymm16, ymm21
+        vpcmpeqb k3, ymm16, ymm22
+        kmovd   eax, k1
+        kmovd   edx, k2
+        kmovd   r11d, k3
         test    rax, rax
         jnz     .Lk_has_nl
         popcnt  r11, r11
@@ -339,19 +339,19 @@ evx_parse_clicks:
         blsr    rdx, rdx
         jmp     .Lk_cf
 .Lk_cf_done:
-        add     r8, 64
+        add     r8, 32
         jmp     .Lk_scan
 .Lk_partial:
         mov     rax, -1
         bzhi    rax, rax, rcx
-        kmovq   k4, rax
-        vmovdqu8 zmm16{k4}{z}, zmmword ptr [r8]
-        vpcmpeqb k1, zmm16, zmm20
-        vpcmpeqb k2, zmm16, zmm21
-        vpcmpeqb k3, zmm16, zmm22
-        kmovq   rax, k1
-        kmovq   rdx, k2
-        kmovq   r11, k3
+        kmovd   k4, eax
+        vmovdqu8 ymm16{k4}{z}, ymmword ptr [r8]
+        vpcmpeqb k1, ymm16, ymm20
+        vpcmpeqb k2, ymm16, ymm21
+        vpcmpeqb k3, ymm16, ymm22
+        kmovd   eax, k1
+        kmovd   edx, k2
+        kmovd   r11d, k3
         bts     rax, rcx
 .Lk_has_nl:
         tzcnt   rsi, rax
