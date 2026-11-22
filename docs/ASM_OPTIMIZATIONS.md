@@ -260,3 +260,11 @@ The dictionary phase (products + links DSU, single-threaded C) is 10–115 ms an
 3. **Link union-find** (worker 0, 113 ms CPU, IPC 0.27): the final scatter into the 38 MB link table and the random smallest-name reads. Prefetching or a parallel scatter is worth about 7 ms of wall time.
 4. **`evx_parse_ts`** (7% of cycles): memoise the date part for consecutive rows of a file.
 5. 512-bit vs 256-bit blocks in the scanner (Cascade Lake AVX-512 license), to be A/B timed on the scorer.
+
+## Round 7 idle-spot fixes (branch r7-idle)
+
+Measured with exact `wait4` timing, 20M native, interleaved.
+
+- **C2 click prefix sum parallel** (`job_cprefix_sum` / `job_cprefix_write` in `main.c`): per-worker block sums and max, a serial pass over 8 block bases, then each worker writes its block's offsets and cursors. Median 625 -> 623 ms (about 2 ms, near the noise floor).
+- **Parallel exit teardown** (`job_release`, region registry in `main.c`): `big_alloc`/`map_file` register every large mapping; after the last Parquet part, each worker `MADV_DONTNEED`s its 1/nw slice of every region before the process exits (read-lock only, so slices run in parallel, unlike `munmap` which is write-locked and was slower). Measured split of the old ~50 ms exit: events file mapping about 25 ms, Cand arena about 20 ms, click buffers about 4 ms. Median 635 -> 605 ms (about -30 ms); min 629 -> 600.
+- **Rejected (measured, no gain):** coordinator joining the link tasks after loading products (median 617 -> 617 ms). Parquet tail: instrumented per-worker timings show P7 is about 22 ms with all parts finishing within 3 ms of each other (already split by row count); the "under-used" samples in the perf timeline are kernel `write` time, which user-only perf sampling does not see. Startup: manifest and pool creation are under 0.3 ms; the 2.5 ms serial link plan and about 28 ms link parse (products load finishes at 14 ms) are fault-bound. 1 GB first-touch costs 80 ms on 8 threads whether by faulting or `MADV_POPULATE_WRITE` (zeroing/memcg, not exception entry), so prefaulting cannot help.
