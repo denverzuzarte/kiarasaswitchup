@@ -30,7 +30,7 @@ make clean-out / make clean-dataset DEV=dir
 ```
 ```
 
-`scripts/reference_events.py` is an independent Python implementation of the whole rule set, including real click dedup. Use `make check-reference` with it for differential testing. `EVX_PSIZE=<n>` forces a small person table to exercise the overflow/retry path.
+`scripts/reference_events.py` is an independent Python implementation of the whole rule set, including real click dedup. Use `make check-reference` with it for differential testing. `EVX_PSIZE=<n>` forces a small person table to exercise the overflow/retry path (a rerun from P1, because Wins reuse Cand chunks). There is no in-binary timing or profiling: measure with external wall time and `perf`.
 
 ## Architecture
 
@@ -38,16 +38,15 @@ The C coordinator lives in `main.c` (with `dict.c` and `parquet.c`). It runs a p
 
 | Phase | Code | Work |
 |---|---|---|
-| P0 | `dict.c` | manifest window, products → category IDs **in byte order** (the tie-break is the smallest ID), links → DSU → `LookupEntry` table raw ID → canonical (smallest) name |
-| P1 | `evx_parse_events` | newline-aligned byte ranges → 48-byte `Cand` per structurally valid row with a non-empty `event_id`; **all validation is computed here as a flag**, but the row still competes in dedup |
-| P2 | `evx_dedup_insert` | lock-free global CAS table of `Cand*` (16-bit tag in the top bits); the smallest `ingest` wins |
-| P3 | `evx_collect` | walk winners, drop invalid ones, `evx_canon` (links), intern the name in the person table (16-byte `cmpxchg16b` slots, sized ~1/8 of candidates, rerun ×8 on >50% load), `lock inc` counts |
-| P4 | `main.c` | compact slots → dense person IDs (`counts[]` reused as the remap), prefix-sum offsets, extract names, free big buffers |
-| P5 | `evx_scatter` | `lock xadd` cursors → each person's events contiguous (`Ev`, 16 B) |
+| P0 | `dict.c` | manifest window; link files parsed by all workers (`job_links`) **while the coordinator loads products → category IDs in byte order** (the tie-break is the smallest ID) and campaigns; DSU → `LookupEntry` raw ID → canonical (smallest) name runs on worker 0 during P1 |
+| P1 | `evx_parse_events` | newline-aligned byte ranges → 56-byte `Cand` per structurally valid row with a non-empty `event_id`, written **straight into its dedup partition** (`eid_h32 >> pshift`, 16–512 partitions): the worker's open 4 KB chunk (8 B header + 73 Cands) of that partition, chunks bump-allocated from one arena. **All validation is computed here as a flag**; the row still competes in dedup. Branchless quote unwrap |
+| P2 | `evx_dedup_part` | per partition, private L1/L2 table, **no atomics**; smallest `ingest` wins; every losing copy is **marked dead** (`user.k1 = 0`, `ts_off = -1`) |
+| P3 | `evx_collect` | **sequential** walk of the arena (live = winner), drop invalid, `evx_canon` (links), intern in the person table (16-byte `cmpxchg16b` slots, ~1/8 of candidates, rerun ×8 from P1 on >50% load). No per-person counter. Each Win goes to the worker's chunk list of its **person range** (`slot >> rshift`, 256 ranges); Win chunks are recycled consumed Cand chunks |
+| P4 | `main.c` `job_compact` | parallel per range: dense person IDs from person-table **occupancy** (slot order, so a range is a contiguous dense-ID block); `counts[]` becomes slot → dense remap; names |
 | C1 | `evx_parse_clicks` | parse + validate + drop (no click dedup: copies are identical); `evx_canon` → person-table probe → dense ID; `lock inc` click counts |
 | C2/C3 | `main.c`, `evx_scatter_clicks` | click prefix sums; clicks grouped by person (`ClickEv`, Ev-shaped) |
-| P6 | `evx_sessionize` then `evx_attribute` per block | sessions + `user_daily` rows; then re-derive sessions, sort clicks, two-pointer 7-day window, credit (latest, tie → `evx_memcmp`), lazy assist flush; per-worker campaign × day tables |
-| P7 | `parquet.c` | `user_daily` and `campaign_daily` (reduced from per-worker tables) Parquet; invariants printed (Σ sessions/revenue equal, assisted ≥ credited) |
+| P5+P6 | `job_session`: `evx_count_range`, `evx_group_range`, `evx_sessionize`, `evx_attribute` | per person range: count events per person, prefix into `offsets`, place the range's Wins into a per-worker L2-resident scratch (**no global `Ev` array**), then sessions + `user_daily` rows, then attribution (sort clicks, two-pointer 7-day window, credit latest, tie → `evx_memcmp`, lazy assist flush; per-worker campaign × day tables) |
+| P7 | `parquet.c`, `job_write` | `user_daily`: **one part file per worker, in parallel** (sessions/events INT32); `campaign_daily` reduced from per-worker tables. The binary prints nothing on success |
 
 **`src/evx.h` is the ABI contract.** Struct offsets used by the `.s` files are pinned with `_Static_assert`; change both sides together.
 

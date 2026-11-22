@@ -18,28 +18,15 @@
 #include <stdlib.h>
 #include <string.h>
 #include <sys/mman.h>
-#include <sys/resource.h>
 #include <sys/stat.h>
-#include <time.h>
 #include <unistd.h>
 
 #include "app.h"
-#include "prof.h"
 
 #define MAX_WORKERS 64
 #define CPU_BUDGET 8      /* never run more than 8 worker threads */
-#ifndef DEDUP_PART
-#define DEDUP_PART 0      /* 1: partitioned, cache-local dedup; 0: one global CAS table (faster here) */
-#endif
 
 /* ------------------------------------------------------------- utilities */
-
-uint64_t now_ns(void)
-{
-    struct timespec ts;
-    clock_gettime(CLOCK_MONOTONIC, &ts);
-    return (uint64_t)ts.tv_sec * 1000000000ull + (uint64_t)ts.tv_nsec;
-}
 
 int map_file(const char *path, Mapped *m)
 {
@@ -63,7 +50,9 @@ int map_file(const char *path, Mapped *m)
             close(fd);
             return -1;
         }
-        madvise(p, (size_t)st.st_size, MADV_SEQUENTIAL | MADV_WILLNEED);
+        /* enumerated advice values, not flags: one call each */
+        madvise(p, (size_t)st.st_size, MADV_SEQUENTIAL);
+        madvise(p, (size_t)st.st_size, MADV_WILLNEED);
         m->data = p;
         m->size = (size_t)st.st_size;
     }
@@ -87,7 +76,16 @@ void *big_alloc(size_t bytes)
                    MAP_PRIVATE | MAP_ANONYMOUS | MAP_NORESERVE, -1, 0);
     if (p == MAP_FAILED)
         return NULL;
-    madvise(p, bytes, MADV_HUGEPAGE);
+    madvise(p, bytes, MADV_NOHUGEPAGE);
+    return p;
+}
+
+/* random-access tables: huge pages cut TLB misses */
+void *big_alloc_hp(size_t bytes)
+{
+    void *p = big_alloc(bytes);
+    if (p)
+        madvise(p, bytes, MADV_HUGEPAGE);
     return p;
 }
 
@@ -178,13 +176,21 @@ static int pool_init(unsigned n)
     return 0;
 }
 
-/* Run fn on every worker and wait: one phase barrier. */
-static void pool_run(JobFn fn, void *arg)
+/* Start fn on every worker; the coordinator may work until pool_wait. */
+static void pool_start(JobFn fn, void *arg)
 {
     pool.fn = fn;
     pool.arg = arg;
     pthread_barrier_wait(&pool.start);
-    pthread_barrier_wait(&pool.done);
+}
+
+static void pool_wait(void) { pthread_barrier_wait(&pool.done); }
+
+/* Run fn on every worker and wait: one phase barrier. */
+static void pool_run(JobFn fn, void *arg)
+{
+    pool_start(fn, arg);
+    pool_wait();
 }
 
 static void pool_shutdown(void)
@@ -199,21 +205,14 @@ static void pool_shutdown(void)
 
 typedef struct {
     const char *begin, *end;
-    Cand *out;
     uint64_t count;
-    PartOut po;          /* dedup partition output (DEDUP_PART) */
 } ParseTask;
 
 typedef struct {
-    Cand *c;
+    char *c;            /* chunks [c, c + n * 4 KB); the Wins are written over them */
     uint64_t n;
-} DedupTask;
-
-typedef struct {
-    uint64_t slot_begin, slot_end;
     Win *out;
     uint64_t count;
-    uint64_t occupied;
 } CollectTask;
 
 typedef struct {
@@ -241,106 +240,72 @@ typedef struct {
    union-find + smallest-name pass while the other workers start parsing
    events; it joins the parse queue after.
    Still exactly the pool's threads: no extra thread, no oversubscription. */
-static uint32_t g_part_shift;   /* dedup partition = eid_h32 >> g_part_shift */
 
 typedef struct {
     Dict *dict;
     LinkBuild *lb;
     int rc;
-    uint64_t ns;
 } LinkJob;
 
 static void job_links(void *arg, unsigned wid)
 {
+    (void)wid;
     Queue *q = arg;
     LinkBuild *lb = (LinkBuild *)q->ctx;
     size_t i;
     while ((i = atomic_fetch_add_explicit(&q->next, 1, memory_order_relaxed)) < q->ntasks) {
-        prof_begin(wid, PH_LINKS);
         links_parse_task(lb, i);
-        prof_end(wid, PH_LINKS, links_task_pairs(lb, i), 1);
     }
 }
+
+/* Partitioned Cand store shared by parse, dedup and collect. */
+typedef struct {
+    const ParseCtx *pctx;
+    char *arena;
+    PartHead *heads;        /* [nw][P] */
+    uint32_t P, pbits;
+    unsigned nw;
+    uint64_t **table;       /* per worker dedup scratch */
+} PartStore;
 
 static void job_parse(void *arg, unsigned wid)
 {
     Queue *q = arg;
     ParseTask *t = q->tasks;
+    const PartStore *ps = q->ctx;
     LinkJob *lj = q->ctx2;
     if (wid == 0 && lj) {
-        uint64_t a = now_ns();
-        prof_begin(wid, PH_UNIONFIND);
         lj->rc = links_finish(lj->lb, lj->dict);
-        prof_end(wid, PH_UNIONFIND, lj->dict->link_ids, 1);
-        lj->ns = now_ns() - a;
     }
+    PartHead *heads = ps->heads + (size_t)wid * ps->P;
     size_t i;
     while ((i = atomic_fetch_add_explicit(&q->next, 1, memory_order_relaxed)) < q->ntasks) {
-        prof_begin(wid, PH_PARSE);
-        t[i].count = evx_parse_events(q->ctx, t[i].begin, t[i].end, t[i].out,
-                                      t[i].po.hist ? &t[i].po : NULL);
-        prof_end(wid, PH_PARSE, t[i].count, 1);
+        t[i].count = evx_parse_events(ps->pctx, t[i].begin, t[i].end, heads);
     }
+    /* close this worker's open chunks: their headers get the row count */
+    for (uint32_t p = 0; p < ps->P; p++)
+        if (heads[p].end)
+            *(uint32_t *)(heads[p].end - CHUNK_BYTES) =
+                (uint32_t)(((char *)heads[p].cur - (heads[p].end - CHUNK_BYTES) - 8) / sizeof(Cand));
 }
 
-/* ---- partitioned dedup (DEDUP_PART) ---------------------------------------- */
-typedef struct {
-    uint64_t *entries;          /* partition-major Cand references */
-    const uint64_t *part_off;   /* [P + 1] */
-    uint64_t **cursor;          /* per parse task: [P] write positions */
-    uint64_t **table;           /* per worker scratch table */
-    CollectCtx *wctx;           /* per worker collect ctx (dedup = its table) */
-    _Atomic int *overflow;
-} PartArgs;
-
-static void job_partition(void *arg, unsigned wid)
-{
-    Queue *q = arg;
-    ParseTask *t = q->tasks;
-    const PartArgs *a = q->ctx;
-    size_t i;
-    while ((i = atomic_fetch_add_explicit(&q->next, 1, memory_order_relaxed)) < q->ntasks) {
-        prof_begin(wid, PH_PARTITION);
-        evx_partition(t[i].po.ent, t[i].po.pid, t[i].count, a->cursor[i], a->entries);
-        prof_end(wid, PH_PARTITION, t[i].count, 1);
-    }
-}
-
-/* one partition: local dedup (no atomics, table in L1/L2), then collect over it */
-static void job_dedup_collect(void *arg, unsigned wid)
-{
-    Queue *q = arg;
-    CollectTask *t = q->tasks;
-    const PartArgs *a = q->ctx;
-    uint64_t *table = a->table[wid];
-    size_t i;
-    while ((i = atomic_fetch_add_explicit(&q->next, 1, memory_order_relaxed)) < q->ntasks) {
-        if (atomic_load_explicit(a->overflow, memory_order_relaxed))
-            break;
-        uint64_t n = a->part_off[i + 1] - a->part_off[i];
-        uint64_t tsize = n + n / 2 + 16;
-        memset(table, 0, tsize * sizeof *table);
-        prof_begin(wid, PH_DEDUP);
-        evx_dedup_local(table, tsize, a->entries + a->part_off[i], n);
-        prof_end(wid, PH_DEDUP, n, 1);
-        prof_begin(wid, PH_COLLECT);
-        t[i].count = evx_collect(&a->wctx[wid], 0, tsize, t[i].out, &t[i].occupied);
-        prof_end(wid, PH_COLLECT, t[i].occupied, 1);
-        if (t[i].count == UINT64_MAX)
-            atomic_store(a->overflow, 1);
-    }
-}
-
+/* one dedup partition per task: all workers' chunk lists into one private table */
 static void job_dedup(void *arg, unsigned wid)
 {
     Queue *q = arg;
-    DedupTask *t = q->tasks;
-    const uint64_t *size = q->ctx;
-    size_t i;
-    while ((i = atomic_fetch_add_explicit(&q->next, 1, memory_order_relaxed)) < q->ntasks) {
-        prof_begin(wid, PH_DEDUP);
-        evx_dedup_insert(q->ctx2, *size, t[i].c, t[i].n);
-        prof_end(wid, PH_DEDUP, t[i].n, 1);
+    const PartStore *ps = q->ctx;
+    uint64_t *table = ps->table[wid];
+    size_t p;
+    while ((p = atomic_fetch_add_explicit(&q->next, 1, memory_order_relaxed)) < q->ntasks) {
+        uint64_t n = 0;
+        for (unsigned w = 0; w < ps->nw; w++)
+            for (uint32_t c = ps->heads[(size_t)w * ps->P + p].head; c != CHUNK_NONE;
+                 c = *(uint32_t *)(ps->arena + (size_t)c * CHUNK_BYTES + 4))
+                n += *(uint32_t *)(ps->arena + (size_t)c * CHUNK_BYTES);
+        uint64_t tsize = n + n / 2 + 16;
+        memset(table, 0, tsize * sizeof *table);
+        for (unsigned w = 0; w < ps->nw; w++)
+            evx_dedup_part(table, tsize, ps->arena, ps->heads[(size_t)w * ps->P + p].head, ps->pbits);
     }
 }
 
@@ -353,62 +318,173 @@ static void job_collect(void *arg, unsigned wid)
     while ((i = atomic_fetch_add_explicit(&q->next, 1, memory_order_relaxed)) < q->ntasks) {
         if (atomic_load_explicit(overflow, memory_order_relaxed))
             break;                      /* the phase will be rerun anyway */
-        prof_begin(wid, PH_COLLECT);
-        t[i].count = evx_collect(q->ctx, t[i].slot_begin, t[i].slot_end, t[i].out,
-                                 &t[i].occupied);
-        prof_end(wid, PH_COLLECT, t[i].occupied, 1);
+        t[i].count = evx_collect(&((const CollectCtx *)q->ctx)[wid], t[i].c, t[i].n);
         if (t[i].count == UINT64_MAX)
             atomic_store(overflow, 1);
     }
 }
 
 typedef struct {
-    const uint32_t *remap;
-    uint64_t *cursor;
-    Ev *ev;
-} ScatterArgs;
+    SessCtx *sctx;              /* [nw] */
+    AttrCtx *actx;              /* [nw] */
+    const char *warena;
+    const PartHead *wheads;     /* [nw][R] */
+    unsigned nw;
+    uint32_t R;
+    const uint32_t *remap;      /* person slot -> dense id */
+    uint64_t *cursor;           /* per dense person: count, then next Ev position */
+    uint64_t *offsets;          /* [persons + 1]; range starts preset by the caller */
+    const uint64_t *ebase;      /* [R + 1] first event of each range */
+    Ev **scratch;               /* [nw] >= the largest range */
+} SessArgs;
 
-static void job_scatter(void *arg, unsigned wid)
-{
-    Queue *q = arg;
-    CollectTask *t = q->tasks;
-    const ScatterArgs *a = q->ctx;
-    size_t i;
-    while ((i = atomic_fetch_add_explicit(&q->next, 1, memory_order_relaxed)) < q->ntasks) {
-        prof_begin(wid, PH_GROUP);
-        evx_scatter(t[i].out, t[i].count, a->remap, a->cursor, a->ev);
-        prof_end(wid, PH_GROUP, t[i].count, 1);
-    }
-}
-
-/* P6: sessionize a block, then attribute it while its events are hot */
+/* P5+P6 per person range: place the range's Wins into this worker's scratch
+   (its Ev slice, L2-resident; no global Ev array), then sessionize and
+   attribute the range while it is hot */
 static void job_session(void *arg, unsigned wid)
 {
     Queue *q = arg;
     SessTask *t = q->tasks;
-    SessCtx *ctx = &((SessCtx *)q->ctx2)[wid];
-    AttrCtx *actx = &((AttrCtx *)q->ctx)[wid];
+    const SessArgs *a = q->ctx;
+    SessCtx *ctx = &a->sctx[wid];
+    AttrCtx *actx = &a->actx[wid];
     size_t i;
     while ((i = atomic_fetch_add_explicit(&q->next, 1, memory_order_relaxed)) < q->ntasks) {
-        uint64_t nev = ctx->offsets[t[i].pend] - ctx->offsets[t[i].pbegin];
-        prof_begin(wid, PH_SESSION);
+        if (t[i].pbegin == t[i].pend)
+            continue;
+        uint64_t base = a->ebase[i];
+        /* events + offsets[k] must land in the scratch: shift the base */
+        Ev *dst = (Ev *)((uintptr_t)a->scratch[wid] - base * sizeof(Ev));
+        for (unsigned w = 0; w < a->nw; w++)
+            evx_count_range(a->warena, a->wheads[(size_t)w * a->R + i].head, a->remap, a->cursor);
+        /* this range's offsets (offsets[pbegin] was preset) */
+        for (uint64_t k = t[i].pbegin, run = base; k < t[i].pend; k++) {
+            uint64_t c = a->cursor[k];
+            if (k != t[i].pbegin)
+                a->offsets[k] = run;
+            a->cursor[k] = run;
+            run += c;
+        }
+        for (unsigned w = 0; w < a->nw; w++)
+            evx_group_range(a->warena, a->wheads[(size_t)w * a->R + i].head, a->remap,
+                            a->cursor, dst);
+        ctx->events = dst;
+        actx->events = dst;
         t[i].count = evx_sessionize(ctx, t[i].pbegin, t[i].pend, t[i].out);
-        prof_end(wid, PH_SESSION, nev, 1);
-        prof_begin(wid, PH_ATTR);
         t[i].credits = evx_attribute(actx, t[i].pbegin, t[i].pend);
-        prof_end(wid, PH_ATTR, nev + (actx->coffsets[t[i].pend] - actx->coffsets[t[i].pbegin]), 1);
     }
+}
+
+/* P4: dense person ids from person-table occupancy, one range per task
+   (every claimed slot has >= 1 valid event). Pass 1 counts, pass 2 fills. */
+typedef struct {
+    const PersonSlot *persons;
+    uint32_t *remap;            /* slot -> dense id */
+    uint32_t rsh;
+    uint64_t *rfirst;           /* [R + 1] pass 1: persons per range; pass 2: prefix */
+    Key16 *pkeys;
+    Slice *pnames;
+    int fill;
+} CompactArgs;
+
+static void job_compact(void *arg, unsigned wid)
+{
+    (void)wid;
+    Queue *q = arg;
+    const CompactArgs *a = q->ctx;
+    size_t r;
+    while ((r = atomic_fetch_add_explicit(&q->next, 1, memory_order_relaxed)) < q->ntasks) {
+        uint64_t p0 = (uint64_t)r << a->rsh, p1 = (uint64_t)(r + 1) << a->rsh;
+        if (!a->fill) {
+            uint64_t n = 0;
+            for (uint64_t p = p0; p < p1; p++)
+                n += a->persons[p].k1 != 0;
+            a->rfirst[r] = n;
+            continue;
+        }
+        uint64_t k = a->rfirst[r];
+        for (uint64_t p = p0; p < p1; p++) {
+            if (!a->persons[p].k1)
+                continue;
+            /* output name: an inline key holds its own bytes (length in byte
+               15); a long key points into the input mapping */
+            a->pkeys[k] = a->persons[p];
+            if (KEY_LONG(a->pkeys[k].k1))
+                a->pnames[k] = (Slice){(const char *)a->pkeys[k].k0,
+                                       (uint32_t)((a->pkeys[k].k1 >> 32) & 0xFFFFFF), 0};
+            else
+                a->pnames[k] = (Slice){(const char *)&a->pkeys[k], (uint32_t)(a->pkeys[k].k1 >> 56), 0};
+            a->remap[p] = (uint32_t)k++;
+        }
+    }
+}
+
+/* P7: every worker writes one user_daily part file from a contiguous block
+   of person ranges (the rules accept any number of files). */
+typedef struct {
+    const SessTask *st;
+    const size_t *tb;           /* [nw + 1] task block bounds */
+    const Slice *pnames;
+    const Slice *cats;
+    const char *odir;
+    int rc;
+} WriteArgs;
+
+static void job_write(void *arg, unsigned wid)
+{
+    WriteArgs *a = ((Queue *)arg)->tasks;
+    size_t t0 = a->tb[wid], t1 = a->tb[wid + 1];
+    uint64_t n = 0;
+    for (size_t i = t0; i < t1; i++)
+        n += a->st[i].count;
+    if (!n && wid)
+        return;                 /* worker 0 always writes (maybe empty) */
+    /* one pass over the Rows into compact column arrays (fresh pages arrive
+       cache-hot from the kernel's zeroing); strings as indexes into the
+       name / category tables */
+    size_t nn = n ? n : 1;
+    char *mem = malloc(nn * 28);
+    if (!mem) {
+        a->rc = 1;
+        return;
+    }
+    uint32_t *pid = (uint32_t *)mem, *top = pid + nn;
+    int32_t *day = (int32_t *)(top + nn), *sess = day + nn, *evs = sess + nn;
+    int64_t *rev = (int64_t *)(evs + nn);
+    uint64_t r = 0;
+    for (size_t i = t0; i < t1; i++)
+        for (uint64_t k = 0; k < a->st[i].count; k++, r++) {
+            const Row *row = &a->st[i].out[k];
+            pid[r] = row->pid;
+            top[r] = row->top_cat;              /* TOPCAT_NULL = null */
+            day[r] = row->day;
+            sess[r] = (int32_t)row->sessions;
+            evs[r] = (int32_t)row->events;      /* < 2^32 events (checked) */
+            rev[r] = (int64_t)row->revenue;
+        }
+    char opath[8192];
+    snprintf(opath, sizeof opath, "%s/part-%05u.parquet", a->odir, wid);
+    ColSpec ucols[6] = {
+        {"user_id", COL_STR, a->pnames, NULL, NULL, 4, pid},
+        {"day", COL_DATE, NULL, day, NULL, 0, NULL},
+        {"sessions", COL_I32, NULL, sess, NULL, 0, NULL},
+        {"events", COL_I32, NULL, evs, NULL, 0, NULL},
+        {"revenue_cents", COL_I64, NULL, NULL, rev, 0, NULL},
+        {"top_category", COL_STR_OPT, a->cats, NULL, NULL, 4, top},
+    };
+    if (write_parquet(opath, n, 6, ucols, NULL, 0) != 0)
+        a->rc = 1;
+    free(mem);
 }
 
 static void job_parse_clicks(void *arg, unsigned wid)
 {
+    (void)wid;
     Queue *q = arg;
     ClickTask *t = q->tasks;
     size_t i;
     while ((i = atomic_fetch_add_explicit(&q->next, 1, memory_order_relaxed)) < q->ntasks) {
-        prof_begin(wid, PH_CPARSE);
         t[i].count = evx_parse_clicks(q->ctx, t[i].begin, t[i].end, t[i].out);
-        prof_end(wid, PH_CPARSE, t[i].count, 1);
     }
 }
 
@@ -420,14 +496,13 @@ typedef struct {
 
 static void job_scatter_clicks(void *arg, unsigned wid)
 {
+    (void)wid;
     Queue *q = arg;
     ClickTask *t = q->tasks;
     const ClickScatterArgs *a = q->ctx;
     size_t i;
     while ((i = atomic_fetch_add_explicit(&q->next, 1, memory_order_relaxed)) < q->ntasks) {
-        prof_begin(wid, PH_CGROUP);
         evx_scatter_clicks(t[i].out, t[i].count, a->cursor, a->dst, a->base);
-        prof_end(wid, PH_CGROUP, t[i].count, 1);
     }
 }
 
@@ -470,8 +545,6 @@ static unsigned worker_count(void)
     return (unsigned)n;
 }
 
-static double ms(uint64_t a, uint64_t b) { return (double)(b - a) / 1e6; }
-
 static int ensure_dir(const char *path)
 {
     if (mkdir(path, 0777) == 0 || errno == EEXIST)
@@ -485,7 +558,6 @@ int main(int argc, char **argv)
     (void)argc;
     (void)argv;
     umask(0);
-    uint64_t t0 = now_ns();
 
     const char *data_dir = getenv("DATA_DIR");
     if (!data_dir || !*data_dir)
@@ -497,10 +569,8 @@ int main(int argc, char **argv)
 
     /* ---- P0: manifest, products, links ---------------------------------- */
     static Dict dict;
-    if (load_manifest(data_dir, &dict) || load_products(data_dir, &dict) ||
-        load_campaigns(data_dir, &dict))
+    if (load_manifest(data_dir, &dict))
         return 1;
-    prof_init(nw);
     if (pool_init(nw) != 0) {
         fprintf(stderr, "thread pool init failed\n");
         return 1;
@@ -512,9 +582,14 @@ int main(int argc, char **argv)
     {
         Queue lq = {.ntasks = links_ntasks(lbuild), .ctx = lbuild};
         atomic_init(&lq.next, 0);
-        pool_run(job_links, &lq);
+        /* the coordinator loads products and campaigns while the workers
+           parse the link files (both are needed only from P1 on) */
+        pool_start(job_links, &lq);
+        int rc = load_products(data_dir, &dict) || load_campaigns(data_dir, &dict);
+        pool_wait();
+        if (rc)
+            return 1;
     }
-    uint64_t t_dict = now_ns();
 
     /* ---- event files -> newline-aligned byte-range tasks ----------------- */
     char evdir[4096], path[8192];
@@ -542,6 +617,7 @@ int main(int argc, char **argv)
     size_t task_cap = (size_t)nfiles + total_bytes / chunk + 16;
     ParseTask *ptasks = calloc(task_cap, sizeof *ptasks);
     size_t nptasks = 0, cand_cap = 0;
+    uint64_t est_rows = 0;
     for (int i = 0; i < nfiles; i++) {
         const char *b = files[i].data, *e = files[i].data + files[i].size;
         if (!b)
@@ -550,6 +626,13 @@ int main(int argc, char **argv)
         if (!nl)
             continue;                     /* header only */
         const char *p = nl + 1;
+        /* newline density of the first 64 KB: estimates the rows (picks the
+           number of dedup partitions; never correctness) */
+        size_t sample = (size_t)(e - p) < ((size_t)1 << 16) ? (size_t)(e - p) : ((size_t)1 << 16);
+        uint64_t nls = 1;
+        for (const char *x = p, *xe = p + sample; x < xe && (x = memchr(x, '\n', (size_t)(xe - x)));
+             x++)
+            nls++;
         while (p < e) {
             const char *q = p + chunk < e ? p + chunk : e;
             if (q < e) {
@@ -558,55 +641,45 @@ int main(int argc, char **argv)
             }
             ptasks[nptasks].begin = p;
             ptasks[nptasks].end = q;
+            est_rows += (uint64_t)((double)(q - p) * (double)nls / (double)(sample ? sample : 1)) + 1;
             /* a row that yields a Cand is >= 8 bytes ("e,,,,,,\n") */
             cand_cap += (size_t)(q - p) / 8 + 1;
             nptasks++;
             p = q;
         }
     }
-    size_t cand_bytes = cand_cap * sizeof(Cand);
-    Cand *cands = big_alloc(cand_bytes);
-    if (!cands) {
+    /* Partitioned Cand store: P dedup partitions of ~16K rows (from the row
+       estimate; any count is correct), 4 KB chunks bump-allocated from one
+       arena. Worst case: every task's bytes / 8 rows, plus one partially
+       filled open chunk per worker and partition. */
+    uint32_t pbits = 4;   /* <= 512 partitions: a worker's open chunk lines stay in L1/L2 */
+    while (pbits < 9 && ((uint64_t)1 << pbits) * 131072 < est_rows)
+        pbits++;
+    uint32_t P = 1u << pbits;
+    const uint32_t RBITS = 8, R = 1u << RBITS;   /* person ranges of the Win store */
+    /* + Win chunks (collect): mostly recycled Cand chunks; fresh at most one
+       open chunk per worker and range plus the Wins (<= rows) / 255 */
+    uint64_t nchunk_cap = cand_cap / CHUNK_CANDS + nptasks + (uint64_t)P * nw +
+                          cand_cap / WCHUNK_WINS + (uint64_t)R * nw + 16;
+    if (nchunk_cap >= CHUNK_NONE) {
+        fprintf(stderr, "too many event rows for the 32-bit chunk index\n");
+        return 1;
+    }
+    size_t arena_bytes = nchunk_cap * CHUNK_BYTES;
+    char *arena = big_alloc(arena_bytes);
+    PartHead *heads = malloc((size_t)nw * P * sizeof *heads);
+    uint64_t **dtable = calloc(nw, sizeof *dtable);
+    if (!arena || !heads || !dtable) {
         fprintf(stderr, "out of memory (candidates)\n");
         return 1;
     }
-    {
-        size_t off = 0;
-        for (size_t i = 0; i < nptasks; i++) {
-            ptasks[i].out = cands + off;
-            off += (size_t)(ptasks[i].end - ptasks[i].begin) / 8 + 1;
-        }
-    }
+    uint64_t arena_next = 0;
 
-    /* dedup partitions: ~4K rows each (estimated from bytes), so a
-       partition's private table (~1.5 x 8 B per row) stays in L1/L2 */
-    uint32_t pbits = 6;
-    while (pbits < 16 && ((uint64_t)1 << pbits) * 4096 < total_bytes / 48)
-        pbits++;
-    uint64_t nparts = (uint64_t)1 << pbits;
-    g_part_shift = 32 - pbits;
-    uint32_t *hist = NULL;
-    uint64_t *pent = NULL;
-    uint16_t *ppid = NULL;
-    size_t pcap = 0;
-    if (DEDUP_PART) {
-        for (size_t i = 0; i < nptasks; i++)
-            pcap += (size_t)(ptasks[i].end - ptasks[i].begin) / 8 + 1;
-        hist = big_alloc((nptasks ? nptasks : 1) * nparts * sizeof *hist);
-        pent = big_alloc((pcap ? pcap : 1) * sizeof *pent);
-        ppid = big_alloc((pcap ? pcap : 1) * sizeof *ppid);
-        if (!hist || !pent || !ppid) {
-            fprintf(stderr, "out of memory (partition histogram)\n");
-            return 1;
-        }
-        size_t off = 0;
-        for (size_t i = 0; i < nptasks; i++) {
-            ptasks[i].po = (PartOut){hist + i * nparts, pent + off, ppid + off, g_part_shift, 0};
-            off += (size_t)(ptasks[i].end - ptasks[i].begin) / 8 + 1;
-        }
-    }
-
-    /* ---- P1: parse --------------------------------------------------------- */
+    /* ---- P1 parse -> P2 dedup per partition -> P3 collect -------------------
+     * The person table starts at ~1/8 of the candidates (people are a few %
+     * of events). If more than half of it gets claimed, collect stops; the
+     * Wins already overwrote Cands, so the parse is redone with a table 8x
+     * larger. At pow2 >= 2 * ncand it can no longer overflow. */
     ParseCtx pctx = {
         .window_start = dict.window_start,
         .window_end = dict.window_end,
@@ -615,176 +688,142 @@ int main(int argc, char **argv)
         .prod_slots = dict.prod_slots,
         .prod_mask = dict.prod_mask,
         .unknown_cat = dict.unknown_cat,
+        .arena = arena,
+        .arena_next = &arena_next,
+        .pshift = 32 - pbits,
     };
+    PartStore ps = {.pctx = &pctx, .arena = arena, .heads = heads, .P = P, .pbits = pbits,
+                    .nw = nw, .table = dtable};
     LinkJob ljob = {.dict = &dict, .lb = lbuild};
-    Queue q = {.ntasks = nptasks, .tasks = ptasks, .ctx = &pctx, .ctx2 = &ljob};
-    atomic_init(&q.next, 0);
-    uint64_t t_p1 = now_ns();
-    pool_run(job_parse, &q);
-    if (ljob.rc != 0)
-        return 1;
-    uint64_t t_parse = now_ns();
-    uint64_t ncand = 0;
-    for (size_t i = 0; i < nptasks; i++)
-        ncand += ptasks[i].count;
-
-    /* ---- P2: dedup ------------------------------------------------------------
-     * DEDUP_PART: partition-major references (counting sort by eid hash), then
-     * per partition a private table + collect in one job (P3). Otherwise one
-     * global CAS table (1.5 slots per candidate, multiply-indexed). */
-    uint64_t dsize = ncand + ncand / 2 + 1024;
-    if (dsize >= ((uint64_t)1 << 32)) {
-        fprintf(stderr, "too many event rows for the 32-bit dedup index\n");
-        return 1;
-    }
-    uint64_t *dedup = NULL;
-    uint64_t *entries = NULL, *part_off = NULL, max_part = 0;
-    if (DEDUP_PART) {
-        entries = big_alloc((ncand ? ncand : 1) * sizeof *entries);
-        part_off = calloc(nparts + 1, sizeof *part_off);
-        uint64_t **cursor = calloc(nptasks ? nptasks : 1, sizeof *cursor);
-        uint64_t *curbuf = big_alloc((nptasks ? nptasks : 1) * nparts * sizeof *curbuf);
-        if (!entries || !part_off || !cursor || !curbuf) {
-            fprintf(stderr, "out of memory (partitions)\n");
-            return 1;
-        }
-        uint64_t run = 0;
-        for (uint64_t pp = 0; pp < nparts; pp++) {
-            part_off[pp] = run;
-            for (size_t t = 0; t < nptasks; t++) {
-                curbuf[t * nparts + pp] = run;
-                run += hist[t * nparts + pp];
-            }
-            uint64_t n = run - part_off[pp];
-            if (n > max_part)
-                max_part = n;
-        }
-        part_off[nparts] = run;
-        for (size_t t = 0; t < nptasks; t++)
-            cursor[t] = curbuf + t * nparts;
-        PartArgs pa = {.entries = entries, .cursor = cursor};
-        q = (Queue){.ntasks = nptasks, .tasks = ptasks, .ctx = &pa};
-        atomic_init(&q.next, 0);
-        pool_run(job_partition, &q);
-        big_free(curbuf, (nptasks ? nptasks : 1) * nparts * sizeof *curbuf);
-        big_free(hist, (nptasks ? nptasks : 1) * nparts * sizeof *hist);
-        big_free(pent, (pcap ? pcap : 1) * sizeof *pent);
-        big_free(ppid, (pcap ? pcap : 1) * sizeof *ppid);
-        free(cursor);
-    } else {
-        dedup = big_alloc(dsize * sizeof(uint64_t));
-        size_t dt_cap = nptasks + ncand / 65536 + 16;
-        DedupTask *dtasks = calloc(dt_cap, sizeof *dtasks);
-        size_t ndt = 0;
-        for (size_t i = 0; i < nptasks; i++)
-            for (uint64_t o = 0; o < ptasks[i].count; o += 65536) {
-                uint64_t n = ptasks[i].count - o < 65536 ? ptasks[i].count - o : 65536;
-                dtasks[ndt++] = (DedupTask){ptasks[i].out + o, n};
-            }
-        if (!dedup || !dtasks) {
-            fprintf(stderr, "out of memory (dedup)\n");
-            return 1;
-        }
-        q = (Queue){.ntasks = ndt, .tasks = dtasks, .ctx = &dsize, .ctx2 = dedup};
-        atomic_init(&q.next, 0);
-        pool_run(job_dedup, &q);
-    }
-    uint64_t t_dedup = now_ns();
-
-    /* ---- P3: collect valid winners, resolve + intern persons, count ---------
-     * The person table starts at ~1/8 of the candidates (people are a few %
-     * of events) and is enlarged and the phase rerun if more than half of it
-     * gets claimed. At pow2 >= 2 * ncand it can no longer overflow. */
-    uint64_t pmax = pow2_at_least(ncand * 2);
-    uint64_t psize = pow2_at_least(ncand / 8);
-    {
-        const char *env = getenv("EVX_PSIZE");    /* test hook: force retries */
-        if (env && *env)
-            psize = pow2_at_least(strtoull(env, NULL, 10));
-    }
-    if (psize > pmax)
-        psize = pmax;
-    Win *wins = big_alloc(dsize * sizeof(Win));
-    const uint64_t CSLOTS = 65536;
-    size_t nct = DEDUP_PART ? (size_t)nparts : (size_t)((dsize + CSLOTS - 1) / CSLOTS);
-    CollectTask *ctasks = calloc(nct, sizeof *ctasks);
-    uint64_t **wtable = calloc(nw, sizeof *wtable);
-    CollectCtx *wctx = calloc(nw, sizeof *wctx);
-    if (!wins || !ctasks || !wtable || !wctx) {
-        fprintf(stderr, "out of memory (collect)\n");
-        return 1;
-    }
-    if (DEDUP_PART)
-        for (unsigned w = 0; w < nw; w++) {
-            wtable[w] = big_alloc((max_part + max_part / 2 + 16) * sizeof(uint64_t));
-            if (!wtable[w]) {
-                fprintf(stderr, "out of memory (partition tables)\n");
-                return 1;
-            }
-        }
+    Queue q;
+    uint64_t ncand = 0, psize = 0, pmax = 0;
     PersonSlot *persons = NULL;
     uint32_t *counts = NULL;
-    unsigned person_retries = 0;
-    for (;;) {
-        persons = big_alloc(psize * sizeof *persons);
-        counts = big_alloc(psize * sizeof *counts);
-        if (!persons || !counts) {
+    CollectTask *ctasks = NULL;
+    size_t nct = 0;
+    /* Win store: 256 person ranges (slot >> rshift), per worker chunk lists */
+    PartHead *wheads = malloc((size_t)nw * R * sizeof *wheads);
+    CollectCtx *wcc = calloc(nw, sizeof *wcc);
+    if (!wheads || !wcc) {
+        fprintf(stderr, "out of memory (wins)\n");
+        return 1;
+    }
+    uint32_t plog = 0;
+    for (int first = 1;; first = 0) {
+        arena_next = 0;
+        for (size_t i = 0; i < (size_t)nw * P; i++)
+            heads[i] = (PartHead){NULL, NULL, CHUNK_NONE, 0, 0};
+        q = (Queue){.ntasks = nptasks, .tasks = ptasks, .ctx = &ps, .ctx2 = first ? &ljob : NULL};
+        atomic_init(&q.next, 0);
+        pool_run(job_parse, &q);
+        if (first && ljob.rc != 0)
+            return 1;
+        ncand = 0;
+        for (size_t i = 0; i < nptasks; i++)
+            ncand += ptasks[i].count;
+
+        if (first) {
+            /* scratch per worker: lazily committed, sized for any partition */
+            for (unsigned w = 0; w < nw; w++) {
+                dtable[w] = big_alloc((ncand + ncand / 2 + 16) * sizeof(uint64_t));
+                if (!dtable[w]) {
+                    fprintf(stderr, "out of memory (dedup)\n");
+                    return 1;
+                }
+            }
+        }
+        q = (Queue){.ntasks = P, .ctx = &ps};
+        atomic_init(&q.next, 0);
+        pool_run(job_dedup, &q);
+
+        if (!psize) {
+            pmax = pow2_at_least(ncand * 2);
+            psize = pow2_at_least(ncand / 8);
+            const char *env = getenv("EVX_PSIZE");    /* test hook: force retries */
+            if (env && *env)
+                psize = pow2_at_least(strtoull(env, NULL, 10));
+            if (psize > pmax)
+                psize = pmax;
+        }
+        persons = big_alloc_hp(psize * sizeof *persons);
+        counts = big_alloc_hp(psize * sizeof *counts);
+        uint64_t nchunks = arena_next;
+        const uint64_t CPT = 16;                       /* chunks per collect task */
+        free(ctasks);
+        nct = (size_t)((nchunks + CPT - 1) / CPT);
+        ctasks = calloc(nct ? nct : 1, sizeof *ctasks);
+        if (!persons || !counts || !ctasks) {
             fprintf(stderr, "out of memory (persons)\n");
             return 1;
         }
         for (size_t i = 0; i < nct; i++) {
-            if (DEDUP_PART) {
-                ctasks[i].slot_begin = 0;
-                ctasks[i].slot_end = 0;
-                ctasks[i].out = wins + part_off[i];
-            } else {
-                ctasks[i].slot_begin = i * CSLOTS;
-                ctasks[i].slot_end = (i + 1) * CSLOTS < dsize ? (i + 1) * CSLOTS : dsize;
-                ctasks[i].out = wins + ctasks[i].slot_begin;
-            }
-            ctasks[i].count = 0;
-            ctasks[i].occupied = 0;
+            uint64_t c0 = i * CPT, n = nchunks - c0 < CPT ? nchunks - c0 : CPT;
+            char *c = arena + c0 * CHUNK_BYTES;
+            ctasks[i] = (CollectTask){c, n, NULL, 0};
         }
         uint64_t claimed = 0;
         _Atomic int overflow = 0;
-        CollectCtx cctx = {
-            .dedup = dedup, .persons = persons, .person_mask = psize - 1, .counts = counts,
-            .link_slots = dict.link_slots, .link_mask = dict.link_mask,
-            .claimed = &claimed, .claim_limit = psize / 2,
-        };
-        if (DEDUP_PART) {
-            for (unsigned w = 0; w < nw; w++) {
-                wctx[w] = cctx;
-                wctx[w].dedup = wtable[w];
-            }
-            PartArgs pa = {.entries = entries, .part_off = part_off, .table = wtable,
-                           .wctx = wctx, .overflow = &overflow};
-            q = (Queue){.ntasks = nct, .tasks = ctasks, .ctx = &pa};
-            atomic_init(&q.next, 0);
-            pool_run(job_dedup_collect, &q);
-        } else {
-            q = (Queue){.ntasks = nct, .tasks = ctasks, .ctx = &cctx, .ctx2 = (void *)&overflow};
-            atomic_init(&q.next, 0);
-            pool_run(job_collect, &q);
-        }
+        plog = 0;
+        while (((uint64_t)1 << plog) < psize)
+            plog++;
+        for (size_t i = 0; i < (size_t)nw * R; i++)
+            wheads[i] = (PartHead){NULL, NULL, CHUNK_NONE, 0, 0};
+        for (unsigned w = 0; w < nw; w++)
+            wcc[w] = (CollectCtx){
+                .persons = persons, .person_mask = psize - 1, .counts = counts,
+                .link_slots = dict.link_slots, .link_mask = dict.link_mask,
+                .claimed = &claimed, .claim_limit = psize / 2,
+                .win_arena = arena, .win_next = &arena_next, .wheads = wheads + (size_t)w * R,
+                .rshift = plog - RBITS,     /* psize >= 1024 */
+            };
+        q = (Queue){.ntasks = nct, .tasks = ctasks, .ctx = wcc, .ctx2 = (void *)&overflow};
+        atomic_init(&q.next, 0);
+        pool_run(job_collect, &q);
         if (!atomic_load(&overflow))
             break;
         big_free(persons, psize * sizeof *persons);
         big_free(counts, psize * sizeof *counts);
         psize = psize * 8 < pmax ? psize * 8 : pmax;
-        person_retries++;
     }
-    uint64_t t_collect = now_ns();
+    for (unsigned w = 0; w < nw; w++)
+        big_free(dtable[w], (ncand + ncand / 2 + 16) * sizeof(uint64_t));
+    /* close the open Win chunks */
+    for (size_t i = 0; i < (size_t)nw * R; i++)
+        if (wheads[i].end)
+            *(uint32_t *)(wheads[i].end - CHUNK_BYTES) =
+                (uint32_t)(((char *)wheads[i].cur - (wheads[i].end - CHUNK_BYTES) - 16) / sizeof(Win));
+    free(heads);
 
-    /* ---- P4: dense persons + prefix sums --------------------------------
+    /* ---- P4: dense persons ----------------------------------------------
      * Person slots are sparse (table sized for the worst case). Compact the
-     * occupied ones into dense ids: counts[] is reused as the slot -> dense
-     * remap, so offsets/cursor/names are sized by people, not by slots. */
-    uint64_t nvalid = 0, maxn = 0, npersons = 0, nunique = 0;
-    for (size_t i = 0; i < nct; i++)
-        nunique += ctasks[i].occupied;
-    for (uint64_t p = 0; p < psize; p++)
-        npersons += counts[p] != 0;
+     * occupied ones into dense ids in slot order, so each person range is a
+     * contiguous block of dense ids: counts[] becomes the slot -> dense remap,
+     * and offsets/cursor/names are sized by people, not by slots. */
+    uint64_t nvalid = 0, maxn = 0, npersons = 0;
+    uint64_t *rfirst = calloc((size_t)R + 1, sizeof *rfirst);   /* range -> first dense id */
+    uint64_t *ebase = calloc((size_t)R + 1, sizeof *ebase);     /* range -> first event */
+    if (!rfirst || !ebase) {
+        fprintf(stderr, "out of memory (ranges)\n");
+        return 1;
+    }
+    const uint32_t rsh = plog - RBITS;
+    CompactArgs ca = {.persons = persons, .remap = counts, .rsh = rsh, .rfirst = rfirst};
+    q = (Queue){.ntasks = R, .ctx = &ca};
+    atomic_init(&q.next, 0);
+    pool_run(job_compact, &q);
+    for (uint32_t r = 0; r < R; r++) {
+        uint64_t n = rfirst[r], e = 0;
+        rfirst[r] = npersons;
+        npersons += n;
+        for (unsigned w = 0; w < nw; w++)
+            e += wheads[(size_t)w * R + r].count;
+        ebase[r] = nvalid;
+        nvalid += e;
+        if (e > maxn)
+            maxn = e;               /* largest range: bounds any one person */
+    }
+    rfirst[R] = npersons;
+    ebase[R] = nvalid;
     uint64_t *offsets = big_alloc((npersons + 1) * sizeof(uint64_t));
     uint64_t *cursor = big_alloc((npersons ? npersons : 1) * sizeof(uint64_t));
     Slice *pnames = malloc((npersons ? npersons : 1) * sizeof *pnames);
@@ -793,56 +832,18 @@ int main(int argc, char **argv)
         fprintf(stderr, "out of memory (offsets)\n");
         return 1;
     }
-    {
-        uint64_t k = 0;
-        for (uint64_t p = 0; p < psize; p++) {
-            uint64_t c = counts[p];
-            if (!c)
-                continue;
-            offsets[k] = nvalid;
-            cursor[k] = nvalid;
-            /* output name: an inline key holds its own bytes (length in byte
-               15); a long key points into the input mapping */
-            pkeys[k] = persons[p];
-            if (KEY_LONG(pkeys[k].k1))
-                pnames[k] = (Slice){(const char *)pkeys[k].k0,
-                                    (uint32_t)((pkeys[k].k1 >> 32) & 0xFFFFFF), 0};
-            else
-                pnames[k] = (Slice){(const char *)&pkeys[k], (uint32_t)(pkeys[k].k1 >> 56), 0};
-            nvalid += c;
-            if (c > maxn)
-                maxn = c;
-            counts[p] = (uint32_t)k++;
-        }
-        offsets[npersons] = nvalid;
-    }
-    /* names now live in pnames (pointing into the input mappings): the
-       candidate store, dedup table and person table are no longer needed */
-    if (dedup)
-        big_free(dedup, dsize * sizeof(uint64_t));
-    if (entries)
-        big_free(entries, (ncand ? ncand : 1) * sizeof *entries);
-    for (unsigned w = 0; w < nw; w++)
-        if (wtable[w])
-            big_free(wtable[w], (max_part + max_part / 2 + 16) * sizeof(uint64_t));
-    big_free(cands, cand_bytes);
+    ca.pkeys = pkeys;
+    ca.pnames = pnames;
+    ca.fill = 1;
+    q = (Queue){.ntasks = R, .ctx = &ca};
+    atomic_init(&q.next, 0);
+    pool_run(job_compact, &q);
+    /* range starts; the rest of offsets[] is filled per range in P6 */
+    for (uint32_t r = 0; r <= R; r++)
+        offsets[rfirst[r]] = ebase[r];
     /* the person table and counts[] (now slot -> dense remap) stay alive
        until the click parse has resolved every click's person */
-    uint64_t t_prefix = now_ns();
 
-    /* ---- P5: group events by person ---------------------------------------- */
-    Ev *ev = big_alloc((nvalid ? nvalid : 1) * sizeof(Ev));
-    if (!ev) {
-        fprintf(stderr, "out of memory (events)\n");
-        return 1;
-    }
-    ScatterArgs sa = {.remap = counts, .cursor = cursor, .ev = ev};
-    q = (Queue){.ntasks = nct, .tasks = ctasks, .ctx = &sa};
-    atomic_init(&q.next, 0);
-    pool_run(job_scatter, &q);
-    big_free(wins, dsize * sizeof(Win));
-    big_free(cursor, (npersons ? npersons : 1) * sizeof(uint64_t));
-    uint64_t t_scatter = now_ns();
 
     /* ---- C1: parse clicks ----------------------------------------------------
      * Every failing row is dropped at parse (copies of a click are identical,
@@ -914,12 +915,10 @@ int main(int argc, char **argv)
     q = (Queue){.ntasks = nkt, .tasks = ktasks, .ctx = &kctx};
     atomic_init(&q.next, 0);
     pool_run(job_parse_clicks, &q);
-    big_free(persons, psize * sizeof *persons);
-    big_free(counts, psize * sizeof *counts);
+    big_free(persons, psize * sizeof *persons);   /* counts[] (remap) stays for P5 */
     uint64_t nclicks = 0;
     for (size_t i = 0; i < nkt; i++)
         nclicks += ktasks[i].count;
-    uint64_t t_cparse = now_ns();
 
     /* ---- C2: click prefix sums ------------------------------------------------ */
     uint64_t *coffsets = big_alloc((npersons + 1) * sizeof(uint64_t));
@@ -928,18 +927,15 @@ int main(int argc, char **argv)
         fprintf(stderr, "out of memory (click offsets)\n");
         return 1;
     }
-    uint64_t maxc = 0, cpersons = 0;
+    uint64_t maxc = 0;
     {
         uint64_t run = 0;
         for (uint64_t k = 0; k < npersons; k++) {
             coffsets[k] = run;
             ccursor[k] = run;
             run += ccount[k];
-            if (ccount[k]) {
-                cpersons++;
-                if (ccount[k] > maxc)
-                    maxc = ccount[k];
-            }
+            if (ccount[k] > maxc)
+                maxc = ccount[k];
         }
         coffsets[npersons] = run;
     }
@@ -956,7 +952,6 @@ int main(int argc, char **argv)
     atomic_init(&q.next, 0);
     pool_run(job_scatter_clicks, &q);
     big_free(ccursor, (npersons ? npersons : 1) * sizeof(uint64_t));
-    uint64_t t_cgroup = now_ns();
 
     /* ---- P6: sessionize ------------------------------------------------------ */
     uint64_t span = (uint64_t)(dict.window_end - dict.window_start - 1);
@@ -973,7 +968,7 @@ int main(int argc, char **argv)
     }
     for (unsigned w = 0; w < nw; w++) {
         sctx[w].offsets = offsets;
-        sctx[w].events = ev;
+        sctx[w].events = NULL;                  /* per range (job_session) */
         sctx[w].scratch = big_alloc((maxn ? maxn : 1) * sizeof(Ev));
         sctx[w].day0 = day0;
         sctx[w].base_ms = (uint64_t)(dict.window_start - day0 * 86400000);
@@ -1003,7 +998,7 @@ int main(int argc, char **argv)
     for (unsigned w = 0; w < nw; w++) {
         AttrCtx *a = &actx[w];
         a->offsets = offsets;
-        a->events = ev;
+        a->events = NULL;
         a->coffsets = coffsets;
         a->clicks = kev;
         a->ccands = kc;
@@ -1023,77 +1018,60 @@ int main(int argc, char **argv)
         }
     }
     Row *rows = big_alloc((nvalid ? nvalid : 1) * sizeof(Row));
-    /* blocks of ~16K events + clicks (whales get a block of their own) */
-    size_t st_cap = npersons + 1;               /* every block has >= 1 person */
-    SessTask *stasks = calloc(st_cap, sizeof *stasks);
-    if (!rows || !stasks) {
+    /* one task per person range (rows <= events, so rows + offsets fits) */
+    size_t nst = R;
+    SessTask *stasks = calloc(nst, sizeof *stasks);
+    Ev **gscr = calloc(nw, sizeof *gscr);
+    if (!rows || !stasks || !gscr) {
         fprintf(stderr, "out of memory (rows)\n");
         return 1;
     }
-    size_t nst = 0;
-    for (uint64_t k = 0; k < npersons;) {
-        uint64_t e = k + 1;
-        while (e < npersons && e - k < 4096 &&
-               (offsets[e + 1] - offsets[k]) + (coffsets[e + 1] - coffsets[k]) <= 16384)
-            e++;
-        stasks[nst].pbegin = k;
-        stasks[nst].pend = e;
-        stasks[nst].out = rows + offsets[k];   /* rows <= events */
-        nst++;
-        k = e;
+    uint64_t maxr = maxn ? maxn : 1;
+    for (size_t r = 0; r < nst; r++) {
+        stasks[r].pbegin = rfirst[r];
+        stasks[r].pend = rfirst[r + 1];
+        stasks[r].out = rows + ebase[r];
     }
-    q = (Queue){.ntasks = nst, .tasks = stasks, .ctx = actx, .ctx2 = sctx};
+    for (unsigned w = 0; w < nw; w++)
+        if (!(gscr[w] = big_alloc(maxr * sizeof(Ev)))) {
+            fprintf(stderr, "out of memory (range scratch)\n");
+            return 1;
+        }
+    SessArgs sargs = {.sctx = sctx, .actx = actx, .warena = arena, .wheads = wheads, .nw = nw,
+                      .R = R, .remap = counts, .cursor = cursor, .offsets = offsets,
+                      .ebase = ebase, .scratch = gscr};
+    q = (Queue){.ntasks = nst, .tasks = stasks, .ctx = &sargs};
     atomic_init(&q.next, 0);
     pool_run(job_session, &q);
-    uint64_t t_session = now_ns();
-    pool_shutdown();
 
-    /* ---- P7: Parquet ------------------------------------------------------------ */
-    uint64_t nrows = 0;
-    for (size_t i = 0; i < nst; i++)
-        nrows += stasks[i].count;
-    Slice *uid = malloc((nrows ? nrows : 1) * sizeof *uid);
-    Slice *top = malloc((nrows ? nrows : 1) * sizeof *top);
-    int32_t *day = malloc((nrows ? nrows : 1) * sizeof *day);
-    int64_t *sess = malloc((nrows ? nrows : 1) * sizeof *sess);
-    int64_t *evs = malloc((nrows ? nrows : 1) * sizeof *evs);
-    int64_t *rev = malloc((nrows ? nrows : 1) * sizeof *rev);
-    if (!uid || !top || !day || !sess || !evs || !rev) {
-        fprintf(stderr, "out of memory (output columns)\n");
-        return 1;
-    }
-    uint64_t r = 0, sum_sessions = 0;
-    for (size_t i = 0; i < nst; i++)
-        for (uint64_t k = 0; k < stasks[i].count; k++, r++) {
-            const Row *row = &stasks[i].out[k];
-            uid[r] = pnames[row->pid];
-            day[r] = row->day;
-            sess[r] = row->sessions;
-            evs[r] = (int64_t)row->events;
-            rev[r] = (int64_t)row->revenue;
-            sum_sessions += row->sessions;
-            top[r] = row->top_cat == TOPCAT_NULL ? (Slice){NULL, 0, 0} : dict.cats[row->top_cat];
-        }
+    /* ---- P7: Parquet: user_daily, one part per worker, in parallel ---------- */
     char odir[4096], opath[8192];
     snprintf(odir, sizeof odir, "%s/user_daily", out_dir);
     if (ensure_dir(out_dir) || ensure_dir(odir))
         return 1;
-    snprintf(opath, sizeof opath, "%s/part-00000.parquet", odir);
-    ColSpec ucols[6] = {
-        {"user_id", COL_STR, uid, NULL, NULL},
-        {"day", COL_DATE, NULL, day, NULL},
-        {"sessions", COL_I64, NULL, NULL, sess},
-        {"events", COL_I64, NULL, NULL, evs},
-        {"revenue_cents", COL_I64, NULL, NULL, rev},
-        {"top_category", COL_STR_OPT, top, NULL, NULL},
-    };
-    if (write_parquet(opath, nrows, 6, ucols) != 0)
+    uint64_t nrows = 0;
+    for (size_t i = 0; i < nst; i++)
+        nrows += stasks[i].count;
+    size_t tb[MAX_WORKERS + 1];
+    {
+        size_t i = 0;
+        uint64_t run = 0;
+        tb[0] = 0;
+        for (unsigned w = 0; w < nw; w++) {
+            while (i < nst && run * nw < nrows * (w + 1))
+                run += stasks[i++].count;
+            tb[w + 1] = w + 1 == nw ? nst : i;
+        }
+    }
+    static WriteArgs wa;
+    wa = (WriteArgs){.st = stasks, .tb = tb, .pnames = pnames, .cats = dict.cats, .odir = odir};
+    q = (Queue){.tasks = &wa};
+    pool_run(job_write, &q);
+    pool_shutdown();
+    if (wa.rc)
         return 1;
 
     /* ---- P7b: reduce per-worker campaign/day tables -> campaign_daily ------- */
-    uint64_t sum_user_rev = 0;
-    for (uint64_t i = 0; i < nrows; i++)
-        sum_user_rev += (uint64_t)rev[i];
     uint64_t *tot_rev = calloc(ncells ? ncells : 1, sizeof *tot_rev);
     uint64_t *tot_s = calloc(ncells ? ncells : 1, sizeof *tot_s);
     uint64_t *tot_p = calloc(ncells ? ncells : 1, sizeof *tot_p);
@@ -1124,7 +1102,6 @@ int main(int argc, char **argv)
         fprintf(stderr, "out of memory (campaign rows)\n");
         return 1;
     }
-    uint64_t csum_s = 0, csum_rev = 0, organic_s = 0, assist_total = 0, bad_rows = 0;
     size_t cr = 0;
     for (uint32_t c = 0; c <= dict.ncamp; c++)
         for (uint32_t d = 0; d < ndays; d++) {
@@ -1138,15 +1115,6 @@ int main(int argc, char **argv)
             cp[cr] = (int64_t)tot_p[x];
             crev[cr] = (int64_t)tot_rev[x];
             cas[cr] = (int64_t)tot_a[x];
-            csum_s += tot_s[x];
-            csum_rev += tot_rev[x];
-            assist_total += tot_a[x];
-            if (c == dict.ncamp) {
-                organic_s += tot_s[x];
-                bad_rows += tot_a[x] != 0;
-            } else {
-                bad_rows += tot_a[x] < tot_s[x];   /* credited => assisted */
-            }
             cr++;
         }
     snprintf(odir, sizeof odir, "%s/campaign_daily", out_dir);
@@ -1154,75 +1122,15 @@ int main(int argc, char **argv)
         return 1;
     snprintf(opath, sizeof opath, "%s/part-00000.parquet", odir);
     ColSpec ccols[7] = {
-        {"campaign_id", COL_STR, cid, NULL, NULL},
-        {"channel", COL_STR, chn, NULL, NULL},
-        {"day", COL_DATE, NULL, cday, NULL},
-        {"sessions", COL_I64, NULL, NULL, cs},
-        {"purchasing_sessions", COL_I64, NULL, NULL, cp},
-        {"revenue_cents", COL_I64, NULL, NULL, crev},
-        {"assisted_sessions", COL_I64, NULL, NULL, cas},
+        {"campaign_id", COL_STR, cid, NULL, NULL, 0, NULL},
+        {"channel", COL_STR, chn, NULL, NULL, 0, NULL},
+        {"day", COL_DATE, NULL, cday, NULL, 0, NULL},
+        {"sessions", COL_I64, NULL, NULL, cs, 0, NULL},
+        {"purchasing_sessions", COL_I64, NULL, NULL, cp, 0, NULL},
+        {"revenue_cents", COL_I64, NULL, NULL, crev, 0, NULL},
+        {"assisted_sessions", COL_I64, NULL, NULL, cas, 0, NULL},
     };
-    if (write_parquet(opath, ncrows, 7, ccols) != 0)
+    if (write_parquet(opath, ncrows, 7, ccols, NULL, 0) != 0)
         return 1;
-    uint64_t credits = 0;
-    for (size_t i = 0; i < nst; i++)
-        credits += stasks[i].credits;
-    int invariants_ok = csum_s == sum_sessions && csum_rev == sum_user_rev && bad_rows == 0 &&
-                        credits + organic_s == sum_sessions;
-    uint64_t t_end = now_ns();
-
-    struct rusage ru;
-    getrusage(RUSAGE_SELF, &ru);
-    fprintf(stderr,
-            "evx: workers=%u files=%d bytes=%zu tasks=%zu\n"
-            "evx: products=%zu categories=%u link_ids=%zu link_lines=%zu dropped=%zu components=%zu\n"
-            "evx: candidates=%llu unique_ids=%llu duplicates=%llu valid_events=%llu persons=%llu max_person=%llu\n"
-            "evx: sessions=%llu rows=%llu peak_rss=%ld MiB\n"
-            "evx: ms dict=%.1f (link union-find %.1f, overlapped with parse) map+plan=%.1f parse=%.1f dedup=%.1f collect=%.1f prefix=%.1f "
-            "group=%.1f session=%.1f parquet=%.1f total=%.1f\n",
-            nw, nfiles, total_bytes, nptasks, dict.product_count, dict.ncats, dict.link_ids,
-            dict.link_lines, dict.link_dropped, dict.link_components,
-            (unsigned long long)ncand, (unsigned long long)nunique,
-            (unsigned long long)(ncand - nunique), (unsigned long long)nvalid,
-            (unsigned long long)npersons, (unsigned long long)maxn,
-            (unsigned long long)sum_sessions, (unsigned long long)nrows, ru.ru_maxrss / 1024,
-            ms(t0, t_dict), (double)ljob.ns / 1e6, ms(t_dict, t_p1), ms(t_p1, t_parse), ms(t_parse, t_dedup),
-            ms(t_dedup, t_collect), ms(t_collect, t_prefix), ms(t_prefix, t_scatter),
-            ms(t_cgroup, t_session), ms(t_session, t_end), ms(t0, t_end));
-    double cpu_s = (double)ru.ru_utime.tv_sec + ru.ru_utime.tv_usec / 1e6 +
-                   (double)ru.ru_stime.tv_sec + ru.ru_stime.tv_usec / 1e6;
-    double wall_s = (double)(t_end - t0) / 1e9;
-    fprintf(stderr,
-            "evx: clicks files=%d bytes=%zu tasks=%zu valid=%llu persons_with_clicks=%llu max_person_clicks=%llu\n"
-            "evx: campaigns=%u days=%u credited=%llu organic=%llu assists=%llu campaign_rows=%zu\n"
-            "evx: ms click_parse=%.1f click_group=%.1f (session+attribution in session=)\n"
-            "evx: invariants %s (sessions %llu/%llu revenue %llu/%llu bad_rows %llu)\n",
-            ncfiles, click_bytes, nkt, (unsigned long long)nclicks, (unsigned long long)cpersons,
-            (unsigned long long)maxc, dict.ncamp, ndays, (unsigned long long)credits,
-            (unsigned long long)organic_s, (unsigned long long)assist_total, ncrows,
-            ms(t_scatter, t_cparse), ms(t_cparse, t_cgroup),
-            invariants_ok ? "OK" : "VIOLATED", (unsigned long long)csum_s,
-            (unsigned long long)sum_sessions, (unsigned long long)csum_rev,
-            (unsigned long long)sum_user_rev, (unsigned long long)bad_rows);
-    fprintf(stderr, "evx: tables dedup_slots=%llu person_slots=%llu person_retries=%u\n",
-            (unsigned long long)dsize, (unsigned long long)psize, person_retries);
-    {
-        double wall[PH_COUNT] = {0};
-        wall[PH_LINKS] = ms(t0, t_dict);
-        wall[PH_PARSE] = ms(t_p1, t_parse);
-        wall[PH_UNIONFIND] = (double)ljob.ns / 1e6;
-        wall[PH_DEDUP] = ms(t_parse, t_dedup);
-        wall[PH_COLLECT] = ms(t_dedup, t_collect);
-        wall[PH_GROUP] = ms(t_prefix, t_scatter);
-        wall[PH_CPARSE] = ms(t_scatter, t_cparse);
-        wall[PH_CGROUP] = ms(t_cparse, t_cgroup);
-        wall[PH_SESSION] = ms(t_cgroup, t_session);
-        wall[PH_ATTR] = 0;
-        prof_report(wall);
-    }
-    fprintf(stderr, "evx: page faults minor=%ld major=%ld\n", ru.ru_minflt, ru.ru_majflt);
-    fprintf(stderr, "evx: cpu user=%.2fs sys=%.2fs avg_cores=%.2f (worker threads=%u + 1 idle coordinator)\n",
-            (double)ru.ru_utime.tv_sec + ru.ru_utime.tv_usec / 1e6,
-            (double)ru.ru_stime.tv_sec + ru.ru_stime.tv_usec / 1e6, cpu_s / wall_s, nw);
     return 0;
 }

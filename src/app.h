@@ -17,8 +17,8 @@ int map_file(const char *path, Mapped *m);
 void unmap_file(Mapped *m);
 /* Anonymous, lazily committed (MAP_NORESERVE) zeroed memory. */
 void *big_alloc(size_t bytes);
+void *big_alloc_hp(size_t bytes);
 void big_free(void *p, size_t bytes);
-uint64_t now_ns(void);
 
 /* Sorted list of *.csv names in dir; returns count, -1 on error. */
 int list_csv(const char *dir, char ***names_out);
@@ -75,15 +75,20 @@ int links_finish(LinkBuild *lb, Dict *d);
 int bytes_cmp(const char *a, size_t al, const char *b, size_t bl);
 
 /* Generic Parquet writer: one column descriptor per column. */
-typedef enum { COL_STR, COL_STR_OPT, COL_DATE, COL_I64 } ColKind;
+typedef enum { COL_STR, COL_STR_OPT, COL_DATE, COL_I64, COL_I32 } ColKind;
 typedef struct {
     const char *name;
     ColKind kind;
-    const Slice *str;        /* COL_STR / COL_STR_OPT (ptr == NULL -> null) */
-    const int32_t *date;     /* COL_DATE: days since epoch */
+    const Slice *str;        /* COL_STR / COL_STR_OPT (ptr == NULL -> null); with idx:
+                                the string table */
+    const int32_t *date;     /* COL_DATE: days since epoch; COL_I32 values (32 bits) */
     const int64_t *i64;      /* COL_I64 */
+    size_t stride;           /* bytes between values (0: packed array) */
+    const uint32_t *idx;     /* strings: str[idx] per row (stride); 0xFFFFFFFF = null */
 } ColSpec;
 
-int write_parquet(const char *path, size_t nrows, int ncols, const ColSpec *cols);
+/* scratch (may be NULL): already-faulted memory for the page buffers */
+int write_parquet(const char *path, size_t nrows, int ncols, const ColSpec *cols,
+                  void *scratch, size_t scratch_cap);
 
 #endif

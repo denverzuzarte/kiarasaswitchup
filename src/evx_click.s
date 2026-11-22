@@ -379,38 +379,36 @@ evx_parse_clicks:
         lea     r13, [rax + 1]
         cmp     r9d, 3
         jne     .Lk_line
+        # cut the 4 fields: branchless quote unwrap (see evx_parse.s)
         mov     rcx, rbp
         xor     r11d, r11d
-        xor     r9d, r9d
-.Lk_field:
-        cmp     r9d, 3
-        je      .Lk_f_last
-        mov     rdx, qword ptr [rsp + r9*8]
-        jmp     .Lk_f_cut
-.Lk_f_last:
+        .irp    f, 0,1,2,3
+        .if     \f == 3
         mov     rdx, qword ptr [rsp + K_END]
-.Lk_f_cut:
+        .else
+        mov     rdx, qword ptr [rsp + 8*\f]
+        .endif
         mov     rax, rdx
-        sub     rax, rcx
-        mov     rsi, rcx
-        cmp     rax, 2
-        jb      .Lk_f_store
+        sub     rax, rcx                # len
+        xor     esi, esi
+        xor     r8d, r8d
+        xor     r9d, r9d
         cmp     byte ptr [rcx], 0x22
-        jne     .Lk_f_store
+        sete    sil
         cmp     byte ptr [rdx - 1], 0x22
-        jne     .Lk_f_store
-        inc     rsi
-        sub     rax, 2
-        inc     r11d
-.Lk_f_store:
-        mov     r8d, r9d
-        shl     r8d, 4
-        mov     qword ptr [rsp + r8 + 64], rsi
-        mov     qword ptr [rsp + r8 + 72], rax
+        sete    r8b
+        cmp     rax, 2
+        setae   r9b
+        and     esi, r8d
+        and     esi, r9d                # wrapped
+        add     r11d, esi
+        sub     rax, rsi
+        sub     rax, rsi
+        add     rsi, rcx
+        mov     qword ptr [rsp + 64 + 16*\f], rsi
+        mov     qword ptr [rsp + 72 + 16*\f], rax
         lea     rcx, [rdx + 1]
-        inc     r9d
-        cmp     r9d, 4
-        jb      .Lk_field
+        .endr
         add     r11, r11
         cmp     r10, r11
         jne     .Lk_line

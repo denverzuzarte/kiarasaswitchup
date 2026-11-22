@@ -501,12 +501,13 @@ int links_plan(const char *data_dir, unsigned workers, LinkBuild **out)
         if (map_file(path, &lb->files[i]) != 0)
             return -1;
         bytes += lb->files[i].size;
-        const char *p = lb->files[i].data, *e = p + lb->files[i].size;
-        while (p && p < e) {
-            const char *nl = memchr(p, '\n', (size_t)(e - p));
-            lines++;
-            p = nl ? nl + 1 : e;
-        }
+        /* lines = newlines (+1 for an unterminated last line); a plain
+           byte loop, vectorised by the compiler, instead of a memchr per line */
+        const unsigned char *p = (const unsigned char *)lb->files[i].data;
+        size_t n = lb->files[i].size, nl = 0;
+        for (size_t j = 0; j < n; j++)
+            nl += p[j] == '\n';
+        lines += nl + (n && p[n - 1] != '\n');
     }
     free(names);
     size_t chunk = bytes / ((size_t)workers * 8) + 1;
@@ -537,7 +538,7 @@ int links_plan(const char *data_dir, unsigned workers, LinkBuild **out)
     }
     lb->pairs = big_alloc((pair_off ? pair_off : 1) * sizeof *lb->pairs);
     uint64_t size = table_size_for(lines * 2 + 1);   /* <= 2 ids per line, load <= 0.5 */
-    lb->slots = big_alloc(size * sizeof(LookupEntry));
+    lb->slots = big_alloc_hp(size * sizeof(LookupEntry));
     /* id space: <= 2 ids per line plus one partly used block per thread */
     size_t idcap = lines * 2 + 1 + (size_t)(workers + 1) * ID_BLOCK;
     lb->dslot = big_alloc(idcap * sizeof *lb->dslot);

@@ -24,6 +24,7 @@ typedef struct {
     uint8_t *p;
     size_t n, cap;
     int oom;
+    int ext;            /* p is caller scratch: never realloc'd or freed */
 } Buf;
 
 static void buf_reserve(Buf *b, size_t extra)
@@ -33,13 +34,16 @@ static void buf_reserve(Buf *b, size_t extra)
     size_t cap = b->cap ? b->cap : 4096;
     while (cap < b->n + extra)
         cap *= 2;
-    uint8_t *p = realloc(b->p, cap);
+    uint8_t *p = b->ext ? malloc(cap) : realloc(b->p, cap);
     if (!p) {
         b->oom = 1;
         return;
     }
+    if (b->ext)
+        memcpy(p, b->p, b->n);
     b->p = p;
     b->cap = cap;
+    b->ext = 0;
 }
 
 static void put(Buf *b, const void *src, size_t n)
@@ -52,8 +56,6 @@ static void put(Buf *b, const void *src, size_t n)
 }
 
 static void put_u8(Buf *b, uint8_t v) { put(b, &v, 1); }
-static void put_le32(Buf *b, uint32_t v) { put(b, &v, 4); }
-static void put_le64(Buf *b, uint64_t v) { put(b, &v, 8); }
 
 static void put_varint(Buf *b, uint64_t v)
 {
@@ -144,57 +146,129 @@ typedef struct {
     int64_t num_values;
 } ChunkInfo;
 
-static int col_type(ColKind k) { return k == COL_DATE ? PT_INT32 : k == COL_I64 ? PT_INT64 : PT_BYTE_ARRAY; }
+static int col_type(ColKind k)
+{
+    return k == COL_DATE || k == COL_I32 ? PT_INT32 : k == COL_I64 ? PT_INT64 : PT_BYTE_ARRAY;
+}
 static int col_rep(ColKind k) { return k == COL_STR_OPT ? REP_OPTIONAL : REP_REQUIRED; }
-static int col_conv(ColKind k) { return k == COL_DATE ? CT_DATE : k == COL_I64 ? CT_NONE : CT_UTF8; }
-static int col_logical(ColKind k) { return k == COL_DATE ? LT_DATE : k == COL_I64 ? LT_NONE : LT_STRING; }
+static int col_conv(ColKind k)
+{
+    return k == COL_DATE ? CT_DATE : k == COL_I64 || k == COL_I32 ? CT_NONE : CT_UTF8;
+}
+static int col_logical(ColKind k)
+{
+    return k == COL_DATE ? LT_DATE : k == COL_I64 || k == COL_I32 ? LT_NONE : LT_STRING;
+}
 
-/* Encode one column's page body for rows [r0, r1). */
+/* row i's string (NULL ptr = null), 32-bit and 64-bit values */
+static inline Slice col_str(const ColSpec *c, size_t i)
+{
+    if (!c->idx)
+        return c->str[i];
+    uint32_t x = *(const uint32_t *)((const char *)c->idx + i * c->stride);
+    return x == 0xFFFFFFFFu ? (Slice){NULL, 0, 0} : c->str[x];
+}
+static inline int32_t col_i32(const ColSpec *c, size_t i)
+{
+    return c->stride ? *(const int32_t *)((const char *)c->date + i * c->stride) : c->date[i];
+}
+static inline int64_t col_i64(const ColSpec *c, size_t i)
+{
+    return c->stride ? *(const int64_t *)((const char *)c->i64 + i * c->stride) : c->i64[i];
+}
+
+/* Encode one column's page body for rows [r0, r1). The exact size is
+   reserved first, so values are stored with plain unchecked copies. */
 static void encode_column(Buf *page, const ColSpec *c, size_t r0, size_t r1)
 {
+    size_t n = r1 - r0, bytes = 0;
+    switch (c->kind) {
+    case COL_STR:
+    case COL_STR_OPT:
+        for (size_t i = r0; i < r1; i++) {
+            Slice v = col_str(c, i);
+            bytes += v.ptr ? 4 + (size_t)v.len : 0;
+        }
+        bytes += c->kind == COL_STR_OPT ? 4 + 11 * n : 0;   /* def levels: worst case */
+        break;
+    case COL_DATE:
+    case COL_I32:
+        bytes = 4 * n;
+        break;
+    case COL_I64:
+        bytes = 8 * n;
+        break;
+    }
+    buf_reserve(page, bytes);
+    if (page->oom)
+        return;
+    uint8_t *o = page->p + page->n;
     switch (c->kind) {
     case COL_STR:
         for (size_t i = r0; i < r1; i++) {
-            put_le32(page, c->str[i].len);
-            put(page, c->str[i].ptr, c->str[i].len);
+            Slice v = col_str(c, i);
+            memcpy(o, &v.len, 4);
+            memcpy(o + 4, v.ptr, v.len);
+            o += 4 + v.len;
         }
         break;
     case COL_DATE:
-        for (size_t i = r0; i < r1; i++)
-            put_le32(page, (uint32_t)c->date[i]);
+    case COL_I32:
+        if (!c->stride) {
+            memcpy(o, c->date + r0, 4 * n);
+            o += 4 * n;
+            break;
+        }
+        for (size_t i = r0; i < r1; i++, o += 4) {
+            int32_t v = col_i32(c, i);
+            memcpy(o, &v, 4);
+        }
         break;
     case COL_I64:
-        for (size_t i = r0; i < r1; i++)
-            put_le64(page, (uint64_t)c->i64[i]);
+        if (!c->stride) {
+            memcpy(o, c->i64 + r0, 8 * n);
+            o += 8 * n;
+            break;
+        }
+        for (size_t i = r0; i < r1; i++, o += 8) {
+            int64_t v = col_i64(c, i);
+            memcpy(o, &v, 8);
+        }
         break;
     case COL_STR_OPT: {
-        /* definition levels: RLE/bit-packed hybrid, bit width 1, RLE runs only,
-           prefixed with their byte length */
-        Buf lv = {0};
+        /* definition levels: RLE/bit-packed hybrid, bit width 1, RLE runs
+           only, prefixed with their byte length */
+        uint8_t *lenp = o;
+        o += 4;
         size_t i = r0;
         while (i < r1) {
-            int def = c->str[i].ptr != NULL;
+            int def = col_str(c, i).ptr != NULL;
             size_t j = i + 1;
-            while (j < r1 && (c->str[j].ptr != NULL) == def)
+            while (j < r1 && (col_str(c, j).ptr != NULL) == def)
                 j++;
-            put_varint(&lv, (uint64_t)(j - i) << 1);
-            put_u8(&lv, (uint8_t)def);
+            uint64_t v = (uint64_t)(j - i) << 1;
+            while (v >= 0x80) {
+                *o++ = (uint8_t)(v | 0x80);
+                v >>= 7;
+            }
+            *o++ = (uint8_t)v;
+            *o++ = (uint8_t)def;
             i = j;
         }
-        put_le32(page, (uint32_t)lv.n);
-        put(page, lv.p, lv.n);
-        if (lv.oom)
-            page->oom = 1;
-        free(lv.p);
+        uint32_t lvn = (uint32_t)(o - lenp - 4);
+        memcpy(lenp, &lvn, 4);
         for (size_t k = r0; k < r1; k++) {
-            if (!c->str[k].ptr)
+            Slice v = col_str(c, k);
+            if (!v.ptr)
                 continue;
-            put_le32(page, c->str[k].len);
-            put(page, c->str[k].ptr, c->str[k].len);
+            memcpy(o, &v.len, 4);
+            memcpy(o + 4, v.ptr, v.len);
+            o += 4 + v.len;
         }
         break;
     }
     }
+    page->n = (size_t)(o - page->p);
 }
 
 static int write_all(int fd, const void *p, size_t n)
@@ -213,7 +287,8 @@ static int write_all(int fd, const void *p, size_t n)
     return 0;
 }
 
-int write_parquet(const char *path, size_t nrows, int ncols, const ColSpec *cols)
+int write_parquet(const char *path, size_t nrows, int ncols, const ColSpec *cols,
+                  void *scratch, size_t scratch_cap)
 {
     int fd = open(path, O_WRONLY | O_CREAT | O_TRUNC, 0666);
     if (fd < 0) {
@@ -225,6 +300,13 @@ int write_parquet(const char *path, size_t nrows, int ncols, const ColSpec *cols
     int64_t pos = 0;
     int rc = -1;
     Buf page = {0}, hdr = {0};
+    if (scratch && scratch_cap) {
+        page.p = scratch;
+        page.cap = scratch_cap;
+        page.ext = 1;
+    }
+    else
+        buf_reserve(&page, (nrows < ROWS_PER_GROUP ? nrows : ROWS_PER_GROUP) * 24 + 4096);
     if (!info)
         goto out;
     if (write_all(fd, "PAR1", 4) != 0)
@@ -330,7 +412,8 @@ int write_parquet(const char *path, size_t nrows, int ncols, const ColSpec *cols
     }
     free(meta.p);
 out:
-    free(page.p);
+    if (!page.ext)
+        free(page.p);
     free(hdr.p);
     free(info);
     if (close(fd) != 0)

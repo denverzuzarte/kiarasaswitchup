@@ -156,3 +156,26 @@ The dictionary phase (products + links DSU, single-threaded C) is 10–115 ms an
 2. **Prefix** (P4) is a sequential C scan of `psize` slots. It could be parallelised per slot block, with a two-level prefix sum.
 3. **Links/DSU** (P0) is single-threaded. Link files could be parsed in parallel into per-file pair arrays before the union pass.
 4. 512-bit vs 256-bit blocks in the scanner. 512-bit integer ops can lower the Cascade Lake turbo license. A `ymm` variant (still with `k`-mask compares via AVX-512VL) should be A/B timed on the scorer.
+
+
+## 6e. Round 6: partitioned store, fused grouping, silent binary (20M events + 5M clicks)
+
+Measured on the build host (Ryzen 7 9700X), interleaved runs, idle-CPU gated. Start of round: 934–947 ms.
+
+| # | Change | Effect |
+|---|---|---|
+| 6e.1 | Huge pages only on random-access tables (dedup/person/counts/links); streaming buffers `MADV_NOHUGEPAGE`. THP direct compaction made first-touch faults cost ~3 s of sys time under memory pressure | sys 3.0 s → 0.8 s |
+| 6e.2 | Tried: dedup CAS fused into parse (lag 6, then bursts of 16–64 after prefetching the slots). Each `lock cmpxchg` still ~300 cycles; no gain over a separate phase. Reverted | — |
+| 6e.3 | **Partitioned Cand store**: parse writes each Cand into its `event_id`-hash partition's 4 KB chunk; dedup per partition in a private table without atomics; losers marked dead; collect walks the arena sequentially. 256 partitions measured best (16/64/128/512/4096 tried: more streams slow parse, fewer partitions spill the table) | dedup 180 → 58 ms; total ≈ 780 ms |
+| 6e.4 | Wins into 256 person-range chunk lists; group per range in cache (no `lock xadd`). Fresh Win memory made collect +70 ms, so consumed Cand chunks are recycled as Win chunks | group 116 → 44 ms |
+| 6e.5 | **Group fused into the session job** per range, into a per-worker scratch: the 313 MB `Ev` array and its faults are gone | total ≈ 690 ms |
+| 6e.6 | Branchless, unrolled quote unwrap (80% of event rows are quoted): parse branch misses 3.4 → 1.0 per row | parse −20 ms |
+| 6e.7 | No per-person `lock inc` in collect (58% of collect samples sat on it): dense IDs from person-table occupancy, counts per range in the session job | collect 140 → 115 ms |
+| 6e.8 | `user_daily` as one Parquet part per worker, written in parallel, INT32 sessions/events, compact index columns, pre-reserved page buffer | Parquet 46 → 28 ms |
+| 6e.9 | Coordinator loads products/campaigns while workers parse links (`pool_start`/`pool_wait`); link-line count is a vectorised byte loop, not a memchr per line | −8 ms |
+| 6e.10 | Tried and reverted: whole-chunk software prefetch (no gain); fused dedup+collect per partition (199 vs 169 ms: the person and link tables get evicted); parallel `munmap` teardown before exit (TLB-shootdown IPIs, no gain); Parquet encoded from Rows in dead arena memory (cold RFOs, slower than fresh pages) | — |
+| 6e.11 | All timing, profiling (`prof.c`), statistics and invariant reporting removed; the binary is silent | — |
+
+Thread occupancy after this round: every pool phase is 98–99% busy (barrier imbalance 1–2%), and the serial gaps between phases total about 5 ms.
+
+Result: **619–620 ms** wall on a quiet machine (start 934–947 ms; the `main` branch at that time: 861–919 ms). Correct on the 36 fixtures, the dev answer (including forced person-table retries), NCPU 1/2/3/8 determinism, fuzz sets against `reference_events.py`, and the 20M golden output.

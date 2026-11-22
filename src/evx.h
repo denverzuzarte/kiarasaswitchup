@@ -53,15 +53,34 @@ typedef struct {
     uint64_t prod_mask;           /* 40 */
     uint32_t unknown_cat;         /* 48 */
     uint32_t pad;                 /* 52 */
-} ParseCtx;                       /* 56 */
+    char *arena;                  /* 56  4 KB chunks: u32 count, u32 next, 73 Cands */
+    uint64_t *arena_next;         /* 64  next free chunk index (lock xadd) */
+    uint32_t pshift;              /* 72  partition = eid_h32 >> pshift */
+    uint32_t pad2;                /* 76 */
+} ParseCtx;                       /* 80 */
+
+#define CHUNK_BYTES 4096
+#define CHUNK_CANDS 73            /* 8 + 73 * 56 == 4096 */
+#define CHUNK_NONE 0xFFFFFFFFu
+
+/* A worker's open chunk of one dedup partition. 32 bytes. */
+typedef struct {
+    struct Cand *cur;             /*  0  next Cand slot */
+    char *end;                    /*  8  chunk end (0: no chunk yet) */
+    uint32_t head;                /* 16  first chunk of this worker's list */
+    uint32_t count;               /* 20  Win lists: Wins in this list */
+    uint64_t pad2;
+} PartHead;
 
 /*
  * One structurally valid event row with a non-empty event_id. 56 bytes.
  * Validation (incl. the late rule) is evaluated once at parse time; an invalid
  * row has user.k1 == 0 but still competes in dedup. The person is resolved
  * later, in evx_collect, and only for winning copies.
+ * A copy that loses dedup is marked dead: user.k1 = 0 (collect skips it) and
+ * ts_off = -1 (a re-insert skips it). Live rows always have ts_off >= 0.
  */
-typedef struct {
+typedef struct Cand {
     Key16 eid;            /*  0 */
     int64_t ingest;       /* 16  epoch ms */
     Key16 user;           /* 24  user.k1 == 0: this copy fails validation */
@@ -75,15 +94,23 @@ typedef Key16 PersonSlot;
 
 /* Context for evx_collect. */
 typedef struct {
-    const uint64_t *dedup;        /*  0  slots: tag16 << 48 | Cand*  */
+    const uint64_t *unused;       /*  0 */
     PersonSlot *persons;          /*  8 */
     uint64_t person_mask;         /* 16 */
-    uint32_t *counts;             /* 24  events per person slot */
+    uint32_t *counts;             /* 24  unused (counts are built after P4) */
     const LookupEntry *link_slots;/* 32  NULL when there are no links */
     uint64_t link_mask;           /* 40 */
     uint64_t *claimed;            /* 48  shared count of claimed person slots */
     uint64_t claim_limit;         /* 56  > this many claims: table too small */
-} CollectCtx;                     /* 64 */
+    char *win_arena;              /* 64  the Cand arena: Win chunks are recycled Cand
+                                         chunks or fresh ones past the parse's */
+    uint64_t *win_next;           /* 72  arena_next (lock xadd) */
+    PartHead *wheads;             /* 80  this worker's open chunk per person range */
+    uint32_t rshift;              /* 88  person range = slot >> rshift */
+    uint32_t pad;                 /* 92 */
+    char *free_chunks;            /* 96  this worker's consumed Cand chunks (Win reuse) */
+} CollectCtx;                     /* 104 */
+#define WCHUNK_WINS 255           /* 16 + 255 * 16 == 4096 */
 
 /* Valid dedup winner, before grouping. 16 bytes. */
 typedef struct {
@@ -127,7 +154,12 @@ _Static_assert(sizeof(Slice) == 16, "Slice");
 _Static_assert(sizeof(Key16) == 16, "Key16");
 _Static_assert(sizeof(LookupEntry) == 32, "LookupEntry");
 _Static_assert(offsetof(LookupEntry, val) == 16, "LookupEntry.val");
-_Static_assert(sizeof(ParseCtx) == 56, "ParseCtx");
+_Static_assert(sizeof(ParseCtx) == 80, "ParseCtx");
+_Static_assert(offsetof(ParseCtx, arena) == 56, "ParseCtx.arena");
+_Static_assert(offsetof(ParseCtx, pshift) == 72, "ParseCtx.pshift");
+_Static_assert(sizeof(PartHead) == 32, "PartHead");
+_Static_assert(offsetof(PartHead, head) == 16, "PartHead.head");
+_Static_assert(8 + CHUNK_CANDS * 56 == CHUNK_BYTES, "chunk layout");
 _Static_assert(offsetof(ParseCtx, unknown_cat) == 48, "ParseCtx.unknown_cat");
 _Static_assert(sizeof(Cand) == 56, "Cand");
 _Static_assert(offsetof(Cand, ingest) == 16, "Cand.ingest");
@@ -136,7 +168,9 @@ _Static_assert(offsetof(Cand, ts_off) == 40, "Cand.ts_off");
 _Static_assert(offsetof(Cand, price_cat) == 48, "Cand.price_cat");
 _Static_assert(offsetof(Cand, eid_h32) == 52, "Cand.eid_h32");
 _Static_assert(sizeof(PersonSlot) == 16, "PersonSlot");
-_Static_assert(sizeof(CollectCtx) == 64, "CollectCtx");
+_Static_assert(sizeof(CollectCtx) == 104, "CollectCtx");
+_Static_assert(offsetof(CollectCtx, free_chunks) == 96, "CollectCtx.free_chunks");
+_Static_assert(offsetof(CollectCtx, rshift) == 88, "CollectCtx.rshift");
 _Static_assert(offsetof(CollectCtx, claim_limit) == 56, "CollectCtx.claim_limit");
 _Static_assert(sizeof(Win) == 16, "Win");
 _Static_assert(sizeof(Ev) == 16, "Ev");
@@ -238,29 +272,27 @@ int evx_split_line(const char *p, size_t len, uint32_t nfields, Slice *out);
 /* 1 = valid F1/F2/F3 timestamp (*out = epoch ms), 0 = bad */
 int evx_parse_ts(const char *p, size_t len, int64_t *out);
 
-/* Parse the event rows in [begin, end) (no header). Returns Cand count. */
-/* Optional dedup-partition output of the parser (one per parse task). */
-typedef struct {
-    uint32_t *hist;      /*  0  rows per partition */
-    uint64_t *ent;       /*  8  compact reference per Cand */
-    uint16_t *pid;       /* 16  partition id per Cand */
-    uint32_t shift;      /* 24  partition = eid_h32 >> shift */
-    uint32_t pad;
-} PartOut;
+/* Parse the event rows in [begin, end) (no header); every Cand goes into its
+   dedup partition's open chunk in heads[] (this worker's PartHead[P]).
+   Returns the Cand count. */
 uint64_t evx_parse_events(const ParseCtx *ctx, const char *begin,
-                          const char *end, Cand *out, PartOut *po);   /* po may be NULL */
-void evx_partition(const uint64_t *ent, const uint16_t *pid, uint64_t n,
-                   uint64_t *cursor, uint64_t *entries);
-void evx_dedup_local(uint64_t *table, uint64_t tsize, const uint64_t *entries, uint64_t n);
-/* table has `size` slots (any size < 2^32; index = (eid_h32 * size) >> 32) */
+                          const char *end, PartHead *heads);
 const LookupEntry *evx_lookup(const LookupEntry *slots, uint64_t mask, uint64_t k0, uint64_t k1);
-void evx_dedup_insert(uint64_t *table, uint64_t size, Cand *c, uint64_t n);
-/* Returns the Win count, or UINT64_MAX when the person table passed
-   claim_limit (the caller enlarges it and reruns the whole phase). */
-uint64_t evx_collect(const CollectCtx *ctx, uint64_t slot_begin,
-                     uint64_t slot_end, Win *out, uint64_t *occupied);
-void evx_scatter(const Win *w, uint64_t n, const uint32_t *remap,
-                 uint64_t *cursor, Ev *dst);
+/* Dedup one chunk list of one partition into a private table (zeroed by the
+   caller before the partition's first list); marks losing copies dead. */
+void evx_dedup_part(uint64_t *table, uint64_t tsize, const char *arena,
+                    uint32_t first_chunk, uint32_t pbits);
+/* Walks the Cands of nchunks consecutive chunks; every live, valid one gets
+   its person resolved, interned and counted, and is emitted as a Win into
+   the worker's chunk list of its person range. Returns the Win count, or
+   UINT64_MAX when the person table passed claim_limit. */
+uint64_t evx_collect(const CollectCtx *ctx, char *chunks, uint64_t nchunks);
+/* Events per dense person of one worker's Win list of one range (cnt[k]++). */
+void evx_count_range(const char *warena, uint32_t first_chunk, const uint32_t *remap,
+                     uint64_t *cnt);
+/* Places one worker's Win chunk list of one person range into Ev order. */
+void evx_group_range(const char *warena, uint32_t first_chunk, const uint32_t *remap,
+                     uint64_t *cursor, Ev *dst);
 uint64_t evx_sessionize(SessCtx *ctx, uint64_t pbegin, uint64_t pend, Row *out);
 
 

@@ -1,15 +1,9 @@
 # evx_dedup.s - global event_id dedup, winner collection, person grouping.
 # (GNU as, Intel syntax)
 #
-# Dedup table: open addressing over an EXACT number of 8-byte slots (about
-#   1.5x candidates, not rounded to a power of two): the home slot is
-#   (eid_h32 * size) >> 32, a multiply instead of a mask. A slot holds
-#   (eid_h32 & 0xFFFF) << 48 | Cand*. x86-64 user pointers fit in 47 bits, so
-#   the top 16 bits carry a hash tag taken from the LOW hash bits (the index
-#   uses the high ones), and most probe mismatches are rejected from the slot
-#   word alone. Insert and replace are single `lock cmpxchg` operations, so all
-#   workers insert concurrently without locks. A slot only ever changes from 0
-#   to a key, or between copies of the same key, so there is no ABA hazard.
+# Dedup: the parser writes every Cand into its event_id-hash partition
+#   (4 KB chunks, see evx_parse.s); evx_dedup_part dedups one partition at a
+#   time in a private, cache-resident table and marks every losing copy dead.
 #
 # Person table: 16-byte slots holding the canonical name as a Key16, claimed
 #   with `lock cmpxchg16b`; a match is two word compares, no pointer chase.
@@ -23,148 +17,27 @@
         .text
 
         .set    PTRMASK, 0x0000FFFFFFFFFFFF
+        .set    WCHUNK_WINS, 255        # Win chunk: 16-byte header + 255 Wins
         .set    CAND,    56
 
 # ---------------------------------------------------------------------------
-# void evx_dedup_insert(uint64_t *table /*rdi*/, uint64_t size /*rsi*/,
-#                       Cand *c /*rdx*/, uint64_t n /*rcx*/)
-# Keeps, per event_id, the Cand with the smallest ingest (ties keep the
-# resident copy: equal-ingest copies are identical by the rules).
-# Software prefetch: the slot of the candidate 8 ahead is prefetched with
-# prefetchw (we are about to CAS it) to overlap the random DRAM misses.
+# void evx_dedup_part(uint64_t *table /*rdi*/, uint64_t tsize /*rsi*/,
+#                     const char *arena /*rdx*/, uint32_t first /*ecx*/,
+#                     uint32_t pbits /*r8d*/)
+# Dedup of one worker's chunk list of ONE partition into a table private to
+# the calling worker (zeroed by the caller for the first list of the
+# partition, sized ~1.5x its rows so it stays in L1/L2). Plain loads and
+# stores: no lock prefix, no fences, no coherence traffic. Slots hold Cand*.
+# Home slot = ((eid_h32 << pbits) mod 2^32 * tsize) >> 32: the hash bits
+# below the partition bits. Per event_id the smallest ingest stays; ties keep
+# the resident copy (equal-ingest copies are identical). The losing copy is
+# marked dead: user.k1 = 0, ts_off = -1.
+# Chunk: [0] u32 count, [4] u32 next chunk (0xFFFFFFFF = end), [8] Cands.
 # ---------------------------------------------------------------------------
-        .globl  evx_dedup_insert
-        .type   evx_dedup_insert, @function
+        .globl  evx_dedup_part
+        .type   evx_dedup_part, @function
         .p2align 5
-evx_dedup_insert:
-        push    rbx
-        push    rbp
-        push    r12
-        push    r13
-        push    r14
-        push    r15
-        mov     rbx, rdi                # table
-        mov     r12, rsi                # size
-        mov     r13, rdx                # cursor
-        imul    rcx, rcx, CAND
-        lea     r14, [rdx + rcx]        # end
-        movabs  rbp, PTRMASK
-.Ldi_next:
-        cmp     r13, r14
-        jae     .Ldi_done
-        lea     rax, [r13 + 8*CAND]     # 8 candidates ahead
-        cmp     rax, r14
-        jae     .Ldi_nopf
-        mov     eax, dword ptr [rax + 52]
-        imul    rax, r12
-        shr     rax, 32
-        prefetchw [rbx + rax*8]
-.Ldi_nopf:
-        mov     eax, dword ptr [r13 + 52]   # eid_h32
-        mov     r15, rax
-        imul    r15, r12
-        shr     r15, 32                 # home slot
-        movzx   edx, ax
-        shl     rdx, 48
-        or      rdx, r13                # tagged new value
-.Ldi_probe:
-        mov     rax, qword ptr [rbx + r15*8]
-        test    rax, rax
-        jnz     .Ldi_occ
-        lock cmpxchg qword ptr [rbx + r15*8], rdx
-        jz      .Ldi_adv                # claimed an empty slot
-        # lost the race: rax = what is there now
-.Ldi_occ:
-        mov     r8, rax
-        xor     r8, rdx
-        shr     r8, 48
-        jnz     .Ldi_pnext              # tag differs: different id
-        mov     r9, rax
-        and     r9, rbp                 # resident Cand
-        mov     r10, qword ptr [r13 + 8]
-        cmp     qword ptr [r9 + 8], r10 # k1: length + bytes 8..14 (or long tag)
-        jne     .Ldi_pnext
-        mov     r8, rax                 # keep slot value (keq keeps r8)
-        push    rdx
-        push    rcx
-        mov     rdi, qword ptr [r9]
-        mov     rsi, r10
-        mov     rdx, qword ptr [r13]
-        mov     rcx, r10
-        call    evx_keq                 # short key: one word compare
-        pop     rcx
-        pop     rdx
-        test    eax, eax
-        mov     rax, r8
-        jz      .Ldi_pnext
-.Ldi_same:
-        # same event_id: replace only with a strictly smaller ingest
-        mov     r9, rax
-        and     r9, rbp
-        mov     r8, qword ptr [r13 + 16]
-        cmp     r8, qword ptr [r9 + 16]
-        jge     .Ldi_adv
-        lock cmpxchg qword ptr [rbx + r15*8], rdx
-        jz      .Ldi_adv
-        jmp     .Ldi_same               # rax = newer resident of same id
-.Ldi_pnext:
-        inc     r15
-        cmp     r15, r12
-        jb      .Ldi_probe
-        xor     r15d, r15d
-        jmp     .Ldi_probe
-.Ldi_adv:
-        add     r13, CAND
-        jmp     .Ldi_next
-.Ldi_done:
-        pop     r15
-        pop     r14
-        pop     r13
-        pop     r12
-        pop     rbp
-        pop     rbx
-        ret
-        .size   evx_dedup_insert, .-evx_dedup_insert
-
-# ---------------------------------------------------------------------------
-# void evx_partition(const uint64_t *ent /*rdi*/, const uint16_t *pid /*rsi*/,
-#                    uint64_t n /*rdx*/, uint64_t *cursor /*rcx*/, uint64_t *entries /*r8*/)
-# Counting-sort placement of the parser's compact dedup references
-# ((eid_h32 & 0xFFFF) << 48 | Cand*) into partition-major order. Reads 10
-# bytes per row instead of the 56-byte candidates.
-# ---------------------------------------------------------------------------
-        .globl  evx_partition
-        .type   evx_partition, @function
-        .p2align 5
-evx_partition:
-        lea     r10, [rdi + rdx*8]      # end
-.Lpt_loop:
-        cmp     rdi, r10
-        jae     .Lpt_done
-        movzx   eax, word ptr [rsi]
-        mov     r9, qword ptr [rcx + rax*8]
-        inc     qword ptr [rcx + rax*8]
-        mov     r11, qword ptr [rdi]
-        mov     qword ptr [r8 + r9*8], r11
-        add     rdi, 8
-        add     rsi, 2
-        jmp     .Lpt_loop
-.Lpt_done:
-        ret
-        .size   evx_partition, .-evx_partition
-
-# ---------------------------------------------------------------------------
-# void evx_dedup_local(uint64_t *table /*rdi*/, uint64_t tsize /*rsi*/,
-#                      const uint64_t *entries /*rdx*/, uint64_t n /*rcx*/)
-# Dedup of ONE partition into a zeroed table private to the calling worker
-# (sized to stay in L1/L2): plain loads and stores, no lock prefix, so no
-# full fences and no coherence traffic. Home slot = (tag16 * tsize) >> 16;
-# the smallest ingest wins, ties keep the resident copy.
-# ---------------------------------------------------------------------------
-        .globl  evx_dedup_local
-        .type   evx_dedup_local, @function
-        .p2align 5
-evx_dedup_local:
+evx_dedup_part:
         push    rbx
         push    rbp
         push    r12
@@ -173,60 +46,90 @@ evx_dedup_local:
         push    r15
         mov     rbx, rdi                # table
         mov     r12, rsi                # tsize
-        mov     r13, rdx                # entry cursor
-        lea     r14, [rdx + rcx*8]      # end
-        movabs  rbp, PTRMASK
-.Ldl_next:
-        cmp     r13, r14
-        jae     .Ldl_done
-        mov     rdx, qword ptr [r13]    # new entry
-        add     r13, 8
-        mov     r15, rdx
-        shr     r15, 48
-        imul    r15, r12
-        shr     r15, 16                 # home slot
-.Ldl_probe:
-        mov     rax, qword ptr [rbx + r15*8]
-        test    rax, rax
-        jnz     .Ldl_occ
-        mov     qword ptr [rbx + r15*8], rdx
-        jmp     .Ldl_next
-.Ldl_occ:
-        mov     r8, rax
-        xor     r8, rdx
-        shr     r8, 48
-        jnz     .Ldl_pnext              # tag differs
-        mov     r9, rax
-        and     r9, rbp                 # resident Cand
-        mov     r10, rdx
-        and     r10, rbp                # new Cand
-        mov     r11, qword ptr [r10 + 8]
-        cmp     qword ptr [r9 + 8], r11
-        jne     .Ldl_pnext
-        push    rdx
+        mov     r13, rdx                # arena
+        mov     r14d, ecx               # chunk index
+        mov     ebp, r8d                # pbits
+.Ldp_chunk:
+        cmp     r14d, -1
+        je      .Ldp_done
+        mov     r15, r14
+        shl     r15, 12
+        add     r15, r13                # chunk
+        mov     eax, dword ptr [r15 + 4]
+        mov     r14d, eax               # next
+        cmp     eax, -1
+        je      .Ldp_nopf
+        shl     rax, 12
+        prefetcht0 [r13 + rax]          # next chunk's header + first Cand
+.Ldp_nopf:
+        mov     r10d, dword ptr [r15]   # count
+        imul    r10, r10, CAND
+        lea     r11, [r15 + 8]
+        add     r10, r11                # Cand end
+.Ldp_next:
+        cmp     r11, r10
+        jae     .Ldp_chunk
+        mov     rdx, r11                # new Cand
+        add     r11, CAND
+        mov     eax, dword ptr [rdx + 52]
+        mov     ecx, ebp
+        shl     eax, cl
+        imul    rax, r12
+        shr     rax, 32                 # home slot
+.Ldp_probe:
+        mov     r9, qword ptr [rbx + rax*8]
+        test    r9, r9
+        jnz     .Ldp_occ
+        mov     qword ptr [rbx + rax*8], rdx
+        jmp     .Ldp_next
+.Ldp_occ:
+        mov     r8, qword ptr [rdx + 8]
+        cmp     qword ptr [r9 + 8], r8  # k1: length + bytes 8..14 (or long tag)
+        jne     .Ldp_pnext
+        mov     rcx, r8
+        shr     rcx, 56
+        cmp     ecx, 0xFF
+        je      .Ldp_long
+        mov     rcx, qword ptr [rdx]
+        cmp     qword ptr [r9], rcx     # short key: k0 decides
+        jne     .Ldp_pnext
+.Ldp_same:
+        mov     rcx, qword ptr [rdx + 16]
+        cmp     rcx, qword ptr [r9 + 16]
+        jge     .Ldp_lose
+        mov     qword ptr [rbx + rax*8], rdx
+        mov     qword ptr [r9 + 32], 0  # the replaced copy is dead
+        mov     qword ptr [r9 + 40], -1
+        jmp     .Ldp_next
+.Ldp_lose:
+        mov     qword ptr [rdx + 32], 0 # this copy is dead
+        mov     qword ptr [rdx + 40], -1
+        jmp     .Ldp_next
+.Ldp_long:
         push    rax
+        push    rdx
+        push    r10
+        push    r11
+        shr     r8, 32
+        and     r8d, 0xFFFFFF
         mov     rdi, qword ptr [r9]
-        mov     rsi, r11
-        mov     rdx, qword ptr [r10]
-        mov     rcx, r11
-        call    evx_keq                 # keeps r9, r10
-        mov     r8d, eax
-        pop     rax
+        mov     rsi, qword ptr [rdx]
+        mov     rdx, r8
+        call    evx_memeq               # keeps every GPR but rax / r11
+        mov     ecx, eax
+        pop     r11
+        pop     r10
         pop     rdx
-        test    r8d, r8d
-        jz      .Ldl_pnext
-        mov     r8, qword ptr [r10 + 16]
-        cmp     r8, qword ptr [r9 + 16]
-        jge     .Ldl_next               # resident copy has smaller/equal ingest
-        mov     qword ptr [rbx + r15*8], rdx
-        jmp     .Ldl_next
-.Ldl_pnext:
-        inc     r15
-        cmp     r15, r12
-        jb      .Ldl_probe
-        xor     r15d, r15d
-        jmp     .Ldl_probe
-.Ldl_done:
+        pop     rax
+        test    ecx, ecx
+        jnz     .Ldp_same
+.Ldp_pnext:
+        inc     rax
+        cmp     rax, r12
+        jb      .Ldp_probe
+        xor     eax, eax
+        jmp     .Ldp_probe
+.Ldp_done:
         pop     r15
         pop     r14
         pop     r13
@@ -234,27 +137,31 @@ evx_dedup_local:
         pop     rbp
         pop     rbx
         ret
-        .size   evx_dedup_local, .-evx_dedup_local
+        .size   evx_dedup_part, .-evx_dedup_part
 
 # ---------------------------------------------------------------------------
-# uint64_t evx_collect(const CollectCtx *ctx /*rdi*/, uint64_t slot_begin /*rsi*/,
-#                      uint64_t slot_end /*rdx*/, Win *out /*rcx*/,
-#                      uint64_t *occupied /*r8*/)
-# Walks dedup slots [begin, end) and counts occupied slots (= unique event
-# ids) into *occupied. Every winner that passed validation gets its person
+# uint64_t evx_collect(const CollectCtx *ctx /*rdi*/, char *chunks /*rsi*/,
+#                      uint64_t nchunks /*rdx*/)
+# Walks the Cands of nchunks consecutive arena chunks SEQUENTIALLY (dedup
+# marked every losing copy dead, so the live ones are exactly the winners). Every winner that passed validation gets its person
 # resolved (link table, else the raw id), interned in the person table,
 # counted (`lock inc`) and emitted as a 16-byte Win. Returns the Win count, or
-# UINT64_MAX on person-table overflow.
+# UINT64_MAX on person-table overflow. Each Win goes into the calling
+# worker's open 4 KB Win chunk (16-byte header + 255 Wins) of its person
+# range (slot >> rshift; ranges are contiguous in dense-id order), so the
+# grouping pass can run one range at a time in cache, without atomics.
+# ctx is per worker (wheads is the worker's WinHead[R]).
 #
 # Software-pipelined in batches of up to 64 winners, so the random misses of
 # many events are in flight together instead of one dependent chain per event:
-#   stage 1  scan slots, prefetch each winner's Cand
+#   stage 1  scan Cands (sequential; hardware prefetch), keep the live+valid
 #   stage 2  read the user key, prefetch its link-table entry
-#   stage 3  resolve the person key, prefetch the person slot and its counter
-#   stage 4  intern (CAS claim / compare), count, emit
+#   stage 3  resolve the person key, prefetch the person slot
+#   stage 4  intern (CAS claim / compare), emit (no per-person counter: the
+#            counts are built range-locally after P4, without atomics)
 #
-# Frame: [0] slot idx, [8] slot end, [16] out base, [24] occupied count,
-#   [32] occupied ptr, [40] batch size, [48] saved rbx, [56] loop index,
+# Frame: [0] Cand cursor, [8] arena end, [16] out base, [24] chunk's Cand end,
+#   [32] next chunk, [40] batch size, [48] saved rbx, [56] loop index,
 #   [64 + 8i] Cand*, [576 + 8i] key k0, [1088 + 8i] key k1, [1600 + 8i] slot idx
 # ---------------------------------------------------------------------------
 .ifndef COLLECT_BATCH
@@ -265,7 +172,10 @@ evx_dedup_local:
         .set    B_K0,   B_C + 8*BATCH
         .set    B_K1,   B_K0 + 8*BATCH
         .set    B_H,    B_K1 + 8*BATCH
-        .set    CFRAME, B_H + 8*BATCH + 8       # keeps rsp 16-byte aligned at calls
+        .set    B_PN,   B_H + 8*BATCH           # consumed Cand chunks pending recycling
+        .set    B_PEND, B_PN + 8                # up to PEND_MAX chunk pointers
+        .set    PEND_MAX, 8
+        .set    CFRAME, B_PEND + 8*PEND_MAX + 8 # keeps rsp 16-byte aligned at calls
 
         .globl  evx_collect
         .type   evx_collect, @function
@@ -279,44 +189,78 @@ evx_collect:
         push    r15
         sub     rsp, CFRAME
         mov     rbp, rdi                    # ctx
-        mov     rbx, qword ptr [rdi]        # dedup table
         mov     r12, qword ptr [rdi + 8]    # person table
         mov     r13, qword ptr [rdi + 16]   # person mask
         mov     r14, qword ptr [rdi + 24]   # counts
-        mov     r15, rcx                    # out cursor
-        mov     qword ptr [rsp], rsi
-        mov     qword ptr [rsp + 8], rdx
-        mov     qword ptr [rsp + 16], rcx
+        xor     r15d, r15d                  # Wins emitted
+        shl     rdx, 12
+        add     rdx, rsi
+        mov     qword ptr [rsp + 8], rdx    # end of the chunk range
+        mov     qword ptr [rsp + 32], rsi   # next chunk
+        mov     qword ptr [rsp], 0          # cursor = chunk end: load a chunk
         mov     qword ptr [rsp + 24], 0
-        mov     qword ptr [rsp + 32], r8
+        mov     qword ptr [rsp + 16], 0     # current Cand chunk (none yet)
+        mov     qword ptr [rsp + B_PN], 0
 
 .Lco_batch:
-        # ---- stage 1: gather up to 64 winners, prefetch their Cands --------
+        # ---- stage 1: gather up to 64 live, valid Cands (sequential) -------
         xor     ecx, ecx                    # n
         mov     rax, qword ptr [rsp]
-        mov     rdx, qword ptr [rsp + 8]
-        movabs  r8, PTRMASK
+        mov     rdx, qword ptr [rsp + 24]
 .Lco_s1:
         cmp     ecx, BATCH
         jae     .Lco_s1_done
         cmp     rax, rdx
-        jae     .Lco_s1_done
-        mov     r9, qword ptr [rbx + rax*8]
-        inc     rax
-        test    r9, r9
-        jz      .Lco_s1
-        inc     qword ptr [rsp + 24]
-        and     r9, r8
-        prefetcht0 [r9 + 24]
-        prefetcht0 [r9 + 51]
+        jb      .Lco_s1_have
+        mov     r10, qword ptr [rsp + 32]   # next chunk
+        cmp     r10, qword ptr [rsp + 8]
+        jae     .Lco_s1_done                # range exhausted
+        mov     r11, qword ptr [rsp + 16]   # the chunk being left
+        test    r11, r11
+        jz      .Lco_s1_load
+        mov     r8, qword ptr [rsp + B_PN]
+        cmp     r8, PEND_MAX
+        jb      .Lco_s1_push
+        test    ecx, ecx
+        jnz     .Lco_s1_done                # pending list full: run this batch
+        # nothing gathered yet, so every pending chunk is consumed: free now
+        mov     r9, qword ptr [rbp + 96]
+.Lco_s1_fl:
+        dec     r8
+        mov     r10, qword ptr [rsp + B_PEND + r8*8]
+        mov     qword ptr [r10], r9
+        mov     r9, r10
+        test    r8, r8
+        jnz     .Lco_s1_fl
+        mov     qword ptr [rbp + 96], r9
+        mov     qword ptr [rsp + B_PN], 0
+        mov     r10, qword ptr [rsp + 32]   # reload the next chunk
+.Lco_s1_push:
+        mov     qword ptr [rsp + B_PEND + r8*8], r11
+        inc     qword ptr [rsp + B_PN]
+.Lco_s1_load:
+        mov     qword ptr [rsp + 16], r10
+        mov     r11d, dword ptr [r10]       # count
+        imul    r11, r11, CAND
+        lea     rax, [r10 + 8]
+        lea     rdx, [rax + r11]
+        add     r10, 4096
+        mov     qword ptr [rsp + 32], r10
+        jmp     .Lco_s1
+.Lco_s1_have:
+        mov     r9, rax
+        add     rax, CAND
+        cmp     qword ptr [r9 + 32], 0      # invalid or dead copy
+        je      .Lco_s1
         mov     qword ptr [rsp + B_C + rcx*8], r9
         inc     ecx
         jmp     .Lco_s1
 .Lco_s1_done:
         mov     qword ptr [rsp], rax
+        mov     qword ptr [rsp + 24], rdx
         mov     qword ptr [rsp + 40], rcx
         test    ecx, ecx
-        jz      .Lco_done
+        jz      .Lco_last
 
         # ---- stage 2: user key; prefetch its link entry (or person slot) ---
         mov     qword ptr [rsp + 56], 0
@@ -377,7 +321,6 @@ evx_collect:
         mov     rcx, qword ptr [rsp + 56]
         and     rax, r13
         mov     qword ptr [rsp + B_H + rcx*8], rax
-        prefetchw [r14 + rax*4]
         shl     rax, 4
         prefetchw [r12 + rax]
 .Lco_s3_next:
@@ -390,7 +333,7 @@ evx_collect:
 .Lco_s4:
         mov     rcx, qword ptr [rsp + 56]
         cmp     rcx, qword ptr [rsp + 40]
-        jae     .Lco_batch
+        jae     .Lco_recycle
         cmp     qword ptr [rsp + B_C + rcx*8], 0
         je      .Lco_s4_next
         mov     rsi, qword ptr [rsp + B_K0 + rcx*8]     # person key k0
@@ -438,31 +381,84 @@ evx_collect:
         cmp     rcx, qword ptr [rbp + 56]
         ja      .Lco_overflow
 .Lco_found:
-        lock inc dword ptr [r14 + r9*4]
         mov     rcx, qword ptr [rsp + 56]
         mov     rcx, qword ptr [rsp + B_C + rcx*8]
+        # emit into this worker's open Win chunk of the slot's person range
+        mov     eax, dword ptr [rbp + 88]   # rshift
+        shrx    r8, r9, rax                 # range
+        shl     r8, 5
+        add     r8, qword ptr [rbp + 80]    # its WinHead
+        mov     r10, qword ptr [r8]         # cur
+        cmp     r10, qword ptr [r8 + 8]     # end (0/0 = no chunk yet)
+        jb      .Lco_wslot
+        mov     rdx, qword ptr [r8 + 8]
+        test    rdx, rdx
+        jz      .Lco_wfirst
+        mov     dword ptr [rdx - 4096], WCHUNK_WINS   # the old chunk is full
+.Lco_wfirst:
+        mov     r10, qword ptr [rbp + 96]   # recycled Cand chunk (cache-warm)?
+        test    r10, r10
+        jz      .Lco_wfresh
+        mov     rax, qword ptr [r10]
+        mov     qword ptr [rbp + 96], rax   # pop
+        mov     rdx, r10
+        sub     rdx, qword ptr [rbp + 64]
+        shr     rdx, 12                     # its chunk index
+        jmp     .Lco_wlink
+.Lco_wfresh:
+        mov     rax, qword ptr [rbp + 72]   # &arena_next
+        mov     edx, 1
+        lock xadd qword ptr [rax], rdx      # new chunk index
+        mov     r10, rdx
+        shl     r10, 12
+        add     r10, qword ptr [rbp + 64]   # chunk
+.Lco_wlink:
+        mov     eax, dword ptr [r8 + 16]
+        mov     dword ptr [r10 + 4], eax    # next = old list head
+        mov     dword ptr [r8 + 16], edx    # list head = new chunk
+        lea     rax, [r10 + 4096]
+        mov     qword ptr [r8 + 8], rax
+        add     r10, 16
+.Lco_wslot:
+        lea     rax, [r10 + 16]
+        mov     qword ptr [r8], rax
+        inc     dword ptr [r8 + 20]         # Wins of this range (this worker)
         mov     rax, qword ptr [rcx + 40]   # ts_off
-        mov     qword ptr [r15], rax
-        mov     dword ptr [r15 + 8], r9d
+        mov     qword ptr [r10], rax
+        mov     dword ptr [r10 + 8], r9d
         mov     eax, dword ptr [rcx + 48]   # price_cat
-        mov     dword ptr [r15 + 12], eax
-        add     r15, 16
+        mov     dword ptr [r10 + 12], eax
+        inc     r15
 .Lco_s4_next:
         inc     qword ptr [rsp + 56]
         jmp     .Lco_s4
 
+        # ---- after stage 4: the pending Cand chunks are fully consumed ------
+.Lco_recycle:
+        lea     rax, [rip + .Lco_batch]
+        jmp     .Lco_flush
+.Lco_last:
+        lea     rax, [rip + .Lco_done]
+.Lco_flush:
+        mov     rcx, qword ptr [rsp + B_PN]
+        mov     rdx, qword ptr [rbp + 96]
+.Lco_fl:
+        test    rcx, rcx
+        jz      .Lco_fl_done
+        dec     rcx
+        mov     r8, qword ptr [rsp + B_PEND + rcx*8]
+        mov     qword ptr [r8], rdx         # push on the worker's free list
+        mov     rdx, r8
+        jmp     .Lco_fl
+.Lco_fl_done:
+        mov     qword ptr [rbp + 96], rdx
+        mov     qword ptr [rsp + B_PN], 0
+        jmp     rax
+
 .Lco_overflow:
         mov     r15, -1
 .Lco_done:
-        mov     rax, qword ptr [rsp + 32]
-        mov     rcx, qword ptr [rsp + 24]
-        mov     qword ptr [rax], rcx
         mov     rax, r15
-        cmp     r15, -1
-        je      .Lco_ret
-        sub     rax, qword ptr [rsp + 16]
-        shr     rax, 4
-.Lco_ret:
         add     rsp, CFRAME
         pop     r15
         pop     r14
@@ -474,126 +470,86 @@ evx_collect:
         .size   evx_collect, .-evx_collect
 
 # ---------------------------------------------------------------------------
-# void evx_scatter(const Win *w /*rdi*/, uint64_t n /*rsi*/, const uint32_t *remap /*rdx*/,
-#                  uint64_t *cursor /*rcx*/, Ev *dst /*r8*/)
-# Counting-sort scatter: person slot -> dense person id k = remap[pid]; each
-# event goes to `lock xadd cursor[k], 1`, which makes every person's events
-# one contiguous range of the Ev array.
+# void evx_count_range(const char *warena /*rdi*/, uint32_t first /*esi*/,
+#                      const uint32_t *remap /*rdx*/, uint64_t *cnt /*rcx*/)
+# Events per dense person for one worker's Win list of one person range:
+# cnt[remap[slot]]++ (the range owns those counters; plain increments).
 # ---------------------------------------------------------------------------
-        .globl  evx_scatter
-        .type   evx_scatter, @function
+        .globl  evx_count_range
+        .type   evx_count_range, @function
         .p2align 5
-evx_scatter:
-.ifndef SCATTER_SERIAL
-        # Batched: 16 records at a time. (1) prefetch each record's remap
-        # entry, (2) remap + prefetchw cursor line, (3) lock xadd + prefetchw
-        # destination, (4) store. The serial version waits on every miss.
-        push    rbx
-        push    rbp
-        push    r12
-        push    r13
-        sub     rsp, 136                # [0..127] 16 positions/ids, [128] pad
-        mov     r12, rdi                # cursor into Win[]
-        shl     rsi, 4
-        lea     r13, [rdi + rsi]        # end
-        mov     rbx, rdx                # remap
-        mov     rbp, rcx                # cursor[]
-.Lsb_batch:
-        mov     rax, r13
-        sub     rax, r12
-        shr     rax, 4
-        cmp     rax, 16
-        jb      .Lsb_tail
-        xor     ecx, ecx
-.Lsb_p1:
-        mov     rdx, rcx
-        shl     rdx, 4
-        mov     eax, dword ptr [r12 + rdx + 8]              # person slot
-        prefetcht0 [rbx + rax*4]
-        inc     ecx
-        cmp     ecx, 16
-        jb      .Lsb_p1
-        xor     ecx, ecx
-.Lsb_p2:
-        mov     rdx, rcx
-        shl     rdx, 4
-        mov     eax, dword ptr [r12 + rdx + 8]
-        mov     eax, dword ptr [rbx + rax*4]                # dense id
-        mov     qword ptr [rsp + rcx*8], rax
-        prefetchw [rbp + rax*8]
-        inc     ecx
-        cmp     ecx, 16
-        jb      .Lsb_p2
-        xor     ecx, ecx
-.Lsb_p3:
-        mov     rax, qword ptr [rsp + rcx*8]
-        mov     r9d, 1
-        lock xadd qword ptr [rbp + rax*8], r9
-        mov     qword ptr [rsp + rcx*8], r9                 # destination index
-        shl     r9, 4
-        prefetchw [r8 + r9]
-        inc     ecx
-        cmp     ecx, 16
-        jb      .Lsb_p3
-        xor     ecx, ecx
-.Lsb_p4:
-        mov     r9, qword ptr [rsp + rcx*8]
-        shl     r9, 4
-        mov     rdx, rcx
-        shl     rdx, 4
-        mov     r10, qword ptr [r12 + rdx]
-        mov     qword ptr [r8 + r9], r10
-        mov     r10d, dword ptr [r12 + rdx + 12]
-        mov     dword ptr [r8 + r9 + 8], r10d
-        mov     dword ptr [r8 + r9 + 12], 0
-        inc     ecx
-        cmp     ecx, 16
-        jb      .Lsb_p4
-        add     r12, 256
-        jmp     .Lsb_batch
-.Lsb_tail:
-        cmp     r12, r13
-        jae     .Lsb_done
-        mov     eax, dword ptr [r12 + 8]
-        mov     eax, dword ptr [rbx + rax*4]
-        mov     r9d, 1
-        lock xadd qword ptr [rbp + rax*8], r9
-        shl     r9, 4
-        mov     r10, qword ptr [r12]
-        mov     qword ptr [r8 + r9], r10
-        mov     r10d, dword ptr [r12 + 12]
-        mov     dword ptr [r8 + r9 + 8], r10d
-        mov     dword ptr [r8 + r9 + 12], 0
-        add     r12, 16
-        jmp     .Lsb_tail
-.Lsb_done:
-        add     rsp, 136
-        pop     r13
-        pop     r12
-        pop     rbp
-        pop     rbx
+evx_count_range:
+.Lcr_chunk:
+        cmp     esi, -1
+        je      .Lcr_done
+        mov     r9, rsi
+        shl     r9, 12
+        add     r9, rdi                 # chunk
+        mov     esi, dword ptr [r9 + 4] # next
+        mov     r10d, dword ptr [r9]    # count
+        shl     r10, 4
+        lea     r11, [r9 + 16]
+        add     r10, r11                # Win end
+.Lcr_next:
+        cmp     r11, r10
+        jae     .Lcr_chunk
+        mov     eax, dword ptr [r11 + 8]        # person slot
+        mov     eax, dword ptr [rdx + rax*4]    # dense id
+        inc     qword ptr [rcx + rax*8]
+        add     r11, 16
+        jmp     .Lcr_next
+.Lcr_done:
         ret
-.else
-        shl     rsi, 4
-        add     rsi, rdi                    # end
-.Lsc_loop:
-        cmp     rdi, rsi
-        jae     .Lsc_done
-        mov     eax, dword ptr [rdi + 8]    # person slot
-        mov     eax, dword ptr [rdx + rax*4]    # dense person id
-        mov     r9d, 1
-        lock xadd qword ptr [rcx + rax*8], r9
+        .size   evx_count_range, .-evx_count_range
+
+# ---------------------------------------------------------------------------
+# void evx_group_range(const char *warena /*rdi*/, uint32_t first /*esi*/,
+#                      const uint32_t *remap /*rdx*/, uint64_t *cursor /*rcx*/,
+#                      Ev *dst /*r8*/)
+# Counting-sort placement of one worker's Win chunk list of ONE person range:
+# k = remap[slot], dst[cursor[k]++] = event. The range owns its persons'
+# cursors and Ev slice, so plain increments suffice, and the cursors, the
+# remap slice and the destination all stay in L1/L2.
+# Win chunk: [0] u32 count, [4] u32 next (0xFFFFFFFF = end), [16] Wins.
+# ---------------------------------------------------------------------------
+        .globl  evx_group_range
+        .type   evx_group_range, @function
+        .p2align 5
+evx_group_range:
+.Lgr_chunk:
+        cmp     esi, -1
+        je      .Lgr_done
+        mov     r9, rsi
+        shl     r9, 12
+        add     r9, rdi                 # chunk
+        mov     esi, dword ptr [r9 + 4] # next
+        mov     r10d, dword ptr [r9]    # count
+        shl     r10, 4
+        lea     r11, [r9 + 16]
+        add     r10, r11                # Win end
+        cmp     esi, -1
+        je      .Lgr_next
+        mov     eax, esi
+        shl     rax, 12
+        prefetcht0 [rdi + rax]          # next chunk's header
+.Lgr_next:
+        cmp     r11, r10
+        jae     .Lgr_chunk
+        mov     eax, dword ptr [r11 + 8]        # person slot
+        mov     eax, dword ptr [rdx + rax*4]    # dense id
+        mov     r9, qword ptr [rcx + rax*8]
+        lea     rax, [rcx + rax*8]
+        inc     qword ptr [rax]
         shl     r9, 4
-        mov     r10, qword ptr [rdi]
-        mov     qword ptr [r8 + r9], r10
-        mov     r10d, dword ptr [rdi + 12]
-        mov     dword ptr [r8 + r9 + 8], r10d
-        mov     dword ptr [r8 + r9 + 12], 0
-        add     rdi, 16
-        jmp     .Lsc_loop
-.Lsc_done:
+        add     r9, r8
+        mov     rax, qword ptr [r11]            # Ev: ts_off, price_cat, pad 0
+        mov     qword ptr [r9], rax
+        mov     eax, dword ptr [r11 + 12]
+        mov     qword ptr [r9 + 8], rax
+        add     r11, 16
+        jmp     .Lgr_next
+.Lgr_done:
         ret
-.endif
-        .size   evx_scatter, .-evx_scatter
+        .size   evx_group_range, .-evx_group_range
 
         .section .note.GNU-stack,"",@progbits
