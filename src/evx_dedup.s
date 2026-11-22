@@ -68,7 +68,7 @@ evx_eid_eq:
 
 # ---------------------------------------------------------------------------
 # uint64_t evx_dedup_emit(DedupCtx *ctx /*rdi*/, uint32_t part /*esi*/)
-# The table (ctx->table, tsize + 32 zeroed slots) holds tagged Rec pointers:
+# The table (ctx->table, tsize + 64 zeroed slots) holds tagged Rec pointers:
 # Rec* | hash bits 24..39 << 48, so most probe mismatches need no Rec load.
 # Home slot = ((h32 << pbits) mod 2^32 * tsize) >> 32 (the hash bits below
 # the partition bits).
@@ -87,6 +87,12 @@ evx_eid_eq:
         .set    D_FREE,  64
         .set    D_SLAB,  72
         .set    DFRAME,  40             # == 8 mod 16: calls aligned
+.ifndef EM_PF1
+        .set    EM_PF1, 48              # table is zeroed 64 slots past tsize
+.endif
+.ifndef EM_PF2
+        .set    EM_PF2, 24
+.endif
 
         .globl  evx_dedup_emit
         .type   evx_dedup_emit, @function
@@ -204,18 +210,18 @@ evx_dedup_emit:
         jmp     .Lin_w
 
         # ---- emit: walk the table ---------------------------------------------
-        # lookahead: Rec of slot i+16 prefetched; remap entry of slot i+8
+        # lookahead: Rec of slot i+EM_PF1 prefetched; remap entry of slot i+EM_PF2
 .Lemit:
         xor     r14d, r14d
         mov     r13, qword ptr [rbp + D_REMAP]
 .Lem:
         cmp     r14, r12
         jae     .Lrecycle
-        mov     rcx, qword ptr [rbx + r14*8 + 128]
+        mov     rcx, qword ptr [rbx + r14*8 + 8*EM_PF1]
         shl     rcx, 16
         shr     rcx, 16
         prefetcht0 [rcx]
-        mov     rcx, qword ptr [rbx + r14*8 + 64]
+        mov     rcx, qword ptr [rbx + r14*8 + 8*EM_PF2]
         test    rcx, rcx
         jz      .Lem_nopf
         shl     rcx, 16

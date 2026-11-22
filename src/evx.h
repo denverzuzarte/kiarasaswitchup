@@ -130,7 +130,7 @@ typedef struct {
 
 /* Per-worker context for evx_dedup_emit (P2). */
 typedef struct {
-    uint64_t *table;              /*  0  private, zeroed by the caller: tsize + 32 */
+    uint64_t *table;              /*  0  private, zeroed by the caller: tsize + 64 */
     uint64_t tsize;               /*  8 */
     char *arena;                  /* 16 */
     const PartHead *heads;        /* 24  parse heads [nw][P] */

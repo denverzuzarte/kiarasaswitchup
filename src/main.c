@@ -377,7 +377,7 @@ static void job_dedup(void *arg, unsigned wid)
                  c = *(uint32_t *)(ps->arena + (size_t)c * CHUNK_BYTES + 4))
                 n += *(uint32_t *)(ps->arena + (size_t)c * CHUNK_BYTES);
         d->tsize = n + n / 2 + 16;
-        memset(d->table, 0, (d->tsize + 32) * sizeof *d->table);
+        memset(d->table, 0, (d->tsize + 64) * sizeof *d->table);
         evx_dedup_emit(d, (uint32_t)p);
     }
 }
@@ -709,8 +709,14 @@ int main(int argc, char **argv)
        arena. Worst case: every task's bytes / 8 rows, plus one partially
        filled open chunk per worker and partition, plus the fresh Win chunks
        of P2 (mostly recycled Rec chunks), plus a partial slab per worker. */
-    uint32_t pbits = 4;   /* <= 512 partitions: a worker's open chunk lines stay in L1/L2 */
-    while (pbits < 9 && ((uint64_t)1 << pbits) * 131072 < est_rows)
+    uint32_t pbits = 4;   /* <= 1024 partitions of >= 64K rows: dedup tables stay in L2 */
+#ifndef EVX_PROWS
+#define EVX_PROWS 65536
+#endif
+#ifndef EVX_PMAXB
+#define EVX_PMAXB 10
+#endif
+    while (pbits < EVX_PMAXB && ((uint64_t)1 << pbits) * EVX_PROWS < est_rows)
         pbits++;
     uint32_t P = 1u << pbits;
     const uint32_t RBITS = 8, R = 1u << RBITS;   /* person ranges of the Win store */
@@ -904,7 +910,7 @@ int main(int argc, char **argv)
         wheads[i] = (PartHead){NULL, NULL, CHUNK_NONE, 0, 0};
     for (unsigned w = 0; w < nw; w++) {
         /* scratch per worker: lazily committed, sized for any partition */
-        dtable[w] = big_alloc((ncand + ncand / 2 + 64) * sizeof(uint64_t));
+        dtable[w] = big_alloc((ncand + ncand / 2 + 128) * sizeof(uint64_t));
         if (!dtable[w]) {
             fprintf(stderr, "out of memory (dedup)\n");
             return 1;
@@ -918,7 +924,7 @@ int main(int argc, char **argv)
     atomic_init(&q.next, 0);
     pool_run(job_dedup, &q);
     for (unsigned w = 0; w < nw; w++)
-        big_free(dtable[w], (ncand + ncand / 2 + 64) * sizeof(uint64_t));
+        big_free(dtable[w], (ncand + ncand / 2 + 128) * sizeof(uint64_t));
     big_free(pslot, rsize * sizeof *pslot);
     /* close the open Win chunks */
     for (size_t i = 0; i < (size_t)nw * R; i++)

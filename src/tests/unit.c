@@ -59,6 +59,174 @@ static void split(const char *line, unsigned nf, int want_ok, const char *const 
                   "split '%s' field %u = '%.*s' want '%s'", line, i, (int)f[i].len, f[i].ptr, want[i]);
 }
 
+/* ---- round-7 pipeline: parse -> resolve -> dedup_emit on a tiny input */
+
+/* the C coordinator's slab allocator, minimal: chunks from one test arena */
+char *evx_chunk_alloc(Slab *s)
+{
+    if (s->cur >= s->end) {
+        uint64_t i = (*s->next)++;
+        if (i >= s->nslabs)
+            abort();
+        s->cur = s->arena + i * SLAB_BYTES;
+        s->end = s->cur + SLAB_BYTES;
+    }
+    char *c = s->cur;
+    s->cur += CHUNK_BYTES;
+    return c;
+}
+
+static void test_eid_eq(void)
+{
+    CHECK(evx_eid_eq("abc,x", "abc\",x") == 1, "eid quoted == unquoted");
+    CHECK(evx_eid_eq("abc,", "abcd,") == 0, "eid prefix differs");
+    CHECK(evx_eid_eq("abcd\"", "abc,") == 0, "eid longer differs");
+    CHECK(evx_eid_eq("e1,", "e2,") == 0, "eid byte differs");
+    CHECK(evx_eid_eq(",", "\"") == 1, "eid empty");
+}
+
+#define WS 1790812800000LL      /* 2026-10-01T00:00:00Z */
+
+static void test_pipeline(uint64_t rsize, uint64_t psize, int expect_overflow)
+{
+    static const char input[] =
+        "e1,u1,2026-10-03T10:00:00Z,2026-10-03T10:00:05Z,view,p1,\n"
+        "\"e1\",u2,2026-10-03T11:00:00Z,2026-10-03T10:00:01Z,cart,p1,\n"
+        "e2,u1,2026-10-03T12:00:00Z,2026-10-03T12:00:00Z,purchase,p9,0250\n"
+        "e3,u3,bad,2026-10-03T12:00:00Z,view,p1,\n"
+        "e3,u3,2026-10-03T12:00:00Z,2026-10-03T12:00:09Z,view,p1,\n"
+        "e4,,2026-10-03T12:00:00Z,2026-10-03T12:00:00Z,view,p1,\n"
+        ",u1,2026-10-03T12:00:00Z,2026-10-03T12:00:00Z,view,p1,\n"
+        "e5,u1,2026-10-03T12:00:00Z,2026-10-04T12:00:01Z,view,p1,\n"
+        "e6,u4,2026-10-03T12:00:00Z,2026-10-03T12:00:00Z,view,p1,\n"
+        "e6,u4,2026-10-03T12:00:00Z,2026-10-03T12:00:00Z,view,p1,";
+    const uint32_t pbits = 4, P = 1u << pbits, R = 256;
+    size_t nslabs = 4;
+    char *arena = aligned_alloc(4096, nslabs * SLAB_BYTES);
+    uint64_t next = 0, claimed = 0;
+    Slab slab = {.arena = arena, .next = &next, .nslabs = nslabs};
+    Key16 *raw = calloc(rsize, sizeof *raw);
+    PartHead heads[16];
+    for (uint32_t p = 0; p < P; p++)
+        heads[p] = (PartHead){NULL, NULL, CHUNK_NONE, 0, 0};
+    ParseCtx pc = {.window_start = WS, .window_end = WS + 10 * 86400000LL, .raw = raw,
+                   .raw_mask = rsize - 1, .unknown_cat = 7, .arena = arena,
+                   .raw_claimed = &claimed, .pshift = 32 - pbits, .ws_ms = WS,
+                   .raw_limit = rsize / 2};
+    /* page-end copy: no over-read */
+    char *buf = aligned_alloc(4096, 8192);
+    char *in = buf + 8192 - (sizeof input - 1);
+    memcpy(in, input, sizeof input - 1);
+    uint64_t n = evx_parse_events(&pc, in, in + sizeof input - 1, heads, &slab);
+    if (expect_overflow) {
+        CHECK(n == UINT64_MAX, "parse reports raw overflow (got %llu)", (unsigned long long)n);
+        free(raw); free(buf); free(arena);
+        return;
+    }
+    CHECK(n == 9, "parse Recs %llu want 9", (unsigned long long)n);
+    CHECK(claimed == 4, "raw ids claimed %llu want 4 (u1 u2 u3 u4)", (unsigned long long)claimed);
+    for (uint32_t p = 0; p < P; p++)
+        if (heads[p].end)
+            *(uint32_t *)(heads[p].end - CHUNK_BYTES) =
+                (uint32_t)(((char *)heads[p].cur - (heads[p].end - CHUNK_BYTES) - 32) / sizeof(Rec));
+    /* Rec fields of e2 (purchase): ingest field, ts_off, price_cat */
+    int seen_e2 = 0;
+    for (uint32_t p = 0; p < P; p++)
+        for (uint32_t c = heads[p].head; c != CHUNK_NONE; c = *(uint32_t *)(arena + (size_t)c * 4096 + 4)) {
+            const Rec *r = (const Rec *)(arena + (size_t)c * 4096 + 32);
+            uint32_t cnt = *(uint32_t *)(arena + (size_t)c * 4096);
+            for (uint32_t i = 0; i < cnt; i++, r++) {
+                const char *e = (const char *)(r->eptr & 0xFFFFFFFFFFFFull);
+                if (e[0] == 'e' && e[1] == '2') {
+                    seen_e2 = 1;
+                    CHECK((r->ki >> 24) == (uint64_t)KI_BIAS + (2 * 86400 + 12 * 3600),
+                          "e2 ingest field %llx", (unsigned long long)(r->ki >> 24));
+                    CHECK(r->ts_off == (2 * 86400 + 12 * 3600) * 1000LL, "e2 ts_off");
+                    CHECK(r->price_cat == (250u | 7u << 24), "e2 price_cat %x", r->price_cat);
+                    CHECK(r->rid != RID_NONE, "e2 valid");
+                }
+                if (e[0] == 'e' && (e[1] == '4' || e[1] == '5'))
+                    CHECK(r->rid == RID_NONE, "e%c invalid", e[1]);
+            }
+        }
+    CHECK(seen_e2, "e2 Rec present");
+
+    /* P1.5: no links: every raw id is its own person */
+    uint32_t *pslot = calloc(rsize, sizeof *pslot);
+    PersonSlot *persons = calloc(psize, sizeof *persons);
+    uint64_t pcl = 0;
+    ResolveCtx rc = {.raw = raw, .pslot = pslot, .persons = persons, .person_mask = psize - 1,
+                     .claimed = &pcl, .claim_limit = psize / 2};
+    uint64_t r1 = evx_resolve_raw(&rc, 0, rsize / 2), r2 = evx_resolve_raw(&rc, rsize / 2, rsize);
+    if (psize < 8) {
+        CHECK(r1 == UINT64_MAX || r2 == UINT64_MAX, "resolve reports person overflow");
+        goto out;
+    }
+    CHECK(r1 + r2 == 4 && pcl == 4, "resolve claims %llu", (unsigned long long)(r1 + r2));
+    /* dense id = person slot order; remap raw slot -> dense */
+    uint32_t *dense = calloc(psize, sizeof *dense), k = 0;
+    for (uint64_t s = 0; s < psize; s++)
+        if (persons[s].k1)
+            dense[s] = k++;
+    for (uint64_t s = 0; s < rsize; s++)
+        if (raw[s].k1) {
+            CHECK(persons[pslot[s]].k0 == raw[s].k0 && persons[pslot[s]].k1 == raw[s].k1,
+                  "resolve: person = raw id");
+            pslot[s] = dense[pslot[s]];
+        }
+
+    /* P2 */
+    PartHead wh[256];
+    for (uint32_t r = 0; r < R; r++)
+        wh[r] = (PartHead){NULL, NULL, CHUNK_NONE, 0, 0};
+    uint64_t *table = calloc(64 + 64, sizeof *table);
+    DedupCtx d = {.table = table, .arena = arena, .heads = heads, .nw = 1, .P = P,
+                  .pbits = pbits, .dshift = 0, .remap = pslot, .wheads = wh, .slab = &slab};
+    uint64_t wins = 0;
+    for (uint32_t p = 0; p < P; p++) {
+        d.tsize = 16 + p;           /* odd sizes: wrap-around probing */
+        memset(table, 0, (64 + 64) * sizeof *table);
+        wins += evx_dedup_emit(&d, p);
+    }
+    CHECK(wins == 3, "wins %llu want 3 (e1 e2 e6)", (unsigned long long)wins);
+    uint64_t total_cnt = 0, ts_sum = 0;
+    int e1_ok = 0;
+    for (uint32_t r = 0; r < R; r++) {
+        total_cnt += wh[r].count;
+        if (!wh[r].end)
+            continue;
+        uint32_t cnt0 = (uint32_t)(((char *)wh[r].cur - (wh[r].end - CHUNK_BYTES) - 16) / sizeof(Win));
+        *(uint32_t *)(wh[r].end - CHUNK_BYTES) = cnt0;
+        for (uint32_t c = wh[r].head; c != CHUNK_NONE; c = *(uint32_t *)(arena + (size_t)c * 4096 + 4)) {
+            const Win *w = (const Win *)(arena + (size_t)c * 4096 + 16);
+            uint32_t cnt = *(uint32_t *)(arena + (size_t)c * 4096);
+            for (uint32_t i = 0; i < cnt; i++) {
+                CHECK(w[i].pid == r, "win in its range");
+                ts_sum += (uint64_t)w[i].ts_off;
+                Key16 u2 = evx_key16("u2", 2);
+                if (w[i].ts_off == (2 * 86400 + 11 * 3600) * 1000LL) {
+                    /* e1: the earlier-ingested copy (u2, 11:00) wins */
+                    for (uint64_t s = 0; s < psize; s++)
+                        if (persons[s].k1 && dense[s] == w[i].pid)
+                            e1_ok = persons[s].k0 == u2.k0 && persons[s].k1 == u2.k1;
+                }
+            }
+        }
+    }
+    CHECK(total_cnt == 3, "range counts %llu", (unsigned long long)total_cnt);
+    CHECK(e1_ok, "e1 winner is the earliest ingest (u2)");
+    CHECK(ts_sum == (2 * 86400 + 11 * 3600) * 1000ULL + 2 * (2 * 86400 + 12 * 3600) * 1000ULL,
+          "win ts_off sum");
+    free(table);
+    free(dense);
+out:
+    free(pslot);
+    free(persons);
+    free(raw);
+    free(buf);
+    free(arena);
+}
+
 int main(void)
 {
     /* ---- timestamps: F1 / F2 / F3 */
@@ -218,6 +386,11 @@ int main(void)
         CHECK(evx_memcmp(a, 200, b, 200) < 0, "memcmp long lt");
         CHECK(evx_memcmp(a, 150, b, 120) > 0, "memcmp long prefix");
     }
+
+    test_eid_eq();
+    test_pipeline(1024, 1024, 0);
+    test_pipeline(4, 1024, 1);      /* EVX_RSIZE path: raw overflow */
+    test_pipeline(1024, 4, 0);      /* EVX_PSIZE path: person overflow */
 
     printf("%d/%d checks passed\n", total - fails, total);
     return fails != 0;

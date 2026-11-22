@@ -57,7 +57,9 @@
 .endif
         .set    RING,    PARSE_RING     # power of two
         .set    L_RING,  256            # RING x {Rec*, k0, k1, slot}
-        .set    FRAME,   L_RING + 32*RING + 8   # == 8 mod 16: calls aligned
+        .set    L_LC,    L_RING + 32*RING # raw claims not yet added to the shared count
+        .set    LC_BATCH, 64            # shared count updated once per 64 claims
+        .set    FRAME,   L_LC + 8       # == 8 mod 16: calls aligned
 
         .globl  evx_parse_events
         .type   evx_parse_events, @function
@@ -75,6 +77,7 @@ evx_parse_events:
         mov     qword ptr [rsp + L_CNT], 0
         mov     qword ptr [rsp + L_RN], 0
         mov     qword ptr [rsp + L_RI], 0
+        mov     qword ptr [rsp + L_LC], 0
         mov     r12, rdi                # ctx
         mov     r13, rsi                # cursor (line start)
         mov     r14, rdx                # end
@@ -434,7 +437,7 @@ evx_parse_events:
         # drain the ring, oldest first
         mov     rax, qword ptr [rsp + L_RN]
         test    rax, rax
-        jz      .Lret
+        jz      .Lflush
         dec     rax
         mov     qword ptr [rsp + L_RN], rax
         mov     rcx, qword ptr [rsp + L_RI]
@@ -447,6 +450,16 @@ evx_parse_events:
         test    eax, eax
         jnz     .Loverflow
         jmp     .Ldone
+.Lflush:
+        mov     rcx, qword ptr [rsp + L_LC]     # flush the local claim count
+        test    rcx, rcx
+        jz      .Lret
+        mov     rax, qword ptr [r12 + 64]
+        mov     rdx, rcx
+        lock xadd qword ptr [rax], rcx
+        add     rcx, rdx
+        cmp     rcx, qword ptr [r12 + 88]
+        jbe     .Lret
 .Loverflow:
         mov     qword ptr [rsp + L_CNT], -1
 .Lret:
@@ -485,10 +498,19 @@ evx_parse_events:
         xor     edx, edx
         lock cmpxchg16b xmmword ptr [rdi]
         jnz     .Li_probe                       # lost the race: re-read the slot
+        # claims are counted locally and added to the shared count in batches
+        # (one contended lock xadd per LC_BATCH claims); the limit is half the
+        # table, so the slack of nw * LC_BATCH claims stays far from full
+        mov     rax, qword ptr [rsp + 8 + L_LC]  # (+8: our return address)
+        inc     rax
+        mov     qword ptr [rsp + 8 + L_LC], rax
+        cmp     rax, LC_BATCH
+        jb      .Li_found
+        mov     qword ptr [rsp + 8 + L_LC], 0
+        mov     rcx, rax
         mov     rax, qword ptr [r12 + 64]       # &raw_claimed
-        mov     ecx, 1
         lock xadd qword ptr [rax], rcx
-        inc     rcx
+        add     rcx, LC_BATCH
         cmp     rcx, qword ptr [r12 + 88]       # raw_limit
         ja      .Li_over
         jmp     .Li_found
