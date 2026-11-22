@@ -20,14 +20,22 @@ These are my working instructions for building and verifying the rewrite, one ph
 ## Data flow
 
 ```
-P0  C     manifest, products (cat ids in byte order), links → DSU → link LookupTable
-P1  asm   evx_parse_events  per newline-aligned byte range  → Cand[] (64 B)   [parallel, dynamic queue]
-P2  asm   evx_dedup_insert  per Cand sub-range → global CAS table of Cand*   [parallel]
-P3  asm   evx_collect       per dedup-slot range → Win[] (16 B) + person CAS table + lock-inc counts [parallel]
-P4  C     prefix sum of counts → offsets/cursors, max person size
-P5  asm   evx_scatter       per Win range → Ev[] grouped by person (lock xadd cursor) [parallel]
-P6  asm   evx_sessionize    per person-slot block → Row[] (32 B)              [parallel, dynamic queue]
-P7  C     Parquet writer → $OUTPUT_DIR/user_daily/part-00000.parquet
+coordinator                                   workers
+-----------                                   -------
+P0  manifest, products, campaigns, links plan
+    map + plan event files, pool_init
+    pool_run(job_parse) ───────────────────►  P0b link files: parse + intern (all workers)
+                                              P0c last link task's worker: union-find + smallest names
+                                              P1  evx_parse_events → Cand[] (56 B, dense arena) [dynamic queue]
+    pool_start(job_dedup) ─────────────────►  P2  evx_dedup_insert → global CAS table; losers marked dead
+    map + plan click files (overlapped)
+    pool_wait, free the dedup table
+    pool_run(job_collect) ─────────────────►  P3  evx_collect: Cands in memory order → Win[] + persons
+P4  dense ids + prefix sums (parallel ranges)
+P5  evx_scatter      Ev[] grouped by person (lock xadd cursor)
+C1-C3 clicks: parse → prefix → group
+P6  evx_sessionize + evx_attribute per block → Row[] + campaign/day cells
+P7  Parquet built in RAM from the rows (row groups on all workers, pwrite at final offsets)
 ```
 
 Every arrow is a phase barrier (pool barrier). No structure is read in a phase while another phase can still write it.

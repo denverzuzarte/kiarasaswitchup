@@ -58,8 +58,9 @@ typedef struct {
 /*
  * One structurally valid event row with a non-empty event_id. 56 bytes.
  * Validation (incl. the late rule) is evaluated once at parse time; an invalid
- * row has user.k1 == 0 but still competes in dedup. The person is resolved
- * later, in evx_collect, and only for winning copies.
+ * row has user.k1 == 0 but still competes in dedup. Dedup also zeroes user.k1
+ * of every losing copy, so after P2 user.k1 != 0 means "live and valid". The
+ * person is resolved later, in evx_collect, which walks the Cands in order.
  */
 typedef struct {
     Key16 eid;            /*  0 */
@@ -75,7 +76,7 @@ typedef Key16 PersonSlot;
 
 /* Context for evx_collect. */
 typedef struct {
-    const uint64_t *dedup;        /*  0  slots: tag16 << 48 | Cand*  */
+    const void *unused;           /*  0 */
     PersonSlot *persons;          /*  8 */
     uint64_t person_mask;         /* 16 */
     uint32_t *counts;             /* 24  events per person slot */
@@ -252,8 +253,8 @@ const LookupEntry *evx_lookup(const LookupEntry *slots, uint64_t mask, uint64_t 
 void evx_dedup_insert(uint64_t *table, uint64_t size, Cand *c, uint64_t n);
 /* Returns the Win count, or UINT64_MAX when the person table passed
    claim_limit (the caller enlarges it and reruns the whole phase). */
-uint64_t evx_collect(const CollectCtx *ctx, uint64_t slot_begin,
-                     uint64_t slot_end, Win *out, uint64_t *occupied);
+uint64_t evx_collect(const CollectCtx *ctx, const Cand *begin, const Cand *end,
+                     Win *out, uint64_t *live);
 void evx_scatter(const Win *w, uint64_t n, const uint32_t *remap,
                  uint64_t *cursor, Ev *dst);
 uint64_t evx_sessionize(SessCtx *ctx, uint64_t pbegin, uint64_t pend, Row *out);

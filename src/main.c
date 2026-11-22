@@ -52,7 +52,7 @@ int map_file(const char *path, Mapped *m)
             close(fd);
             return -1;
         }
-        madvise(p, (size_t)st.st_size, MADV_SEQUENTIAL | MADV_WILLNEED);
+        madvise(p, (size_t)st.st_size, MADV_WILLNEED);   /* advice values are not flags */
         m->data = p;
         m->size = (size_t)st.st_size;
     }
@@ -221,13 +221,21 @@ static int pool_init(unsigned n)
     return 0;
 }
 
-/* Run fn on every worker and wait: one phase barrier. */
-static void pool_run(JobFn fn, void *arg)
+/* Start fn on every worker; the coordinator may do serial work, then
+   pool_wait. pool_run = start + wait: one phase barrier. */
+static void pool_start(JobFn fn, void *arg)
 {
     pool.fn = fn;
     pool.arg = arg;
     pthread_barrier_wait(&pool.start);
-    pthread_barrier_wait(&pool.done);
+}
+
+static void pool_wait(void) { pthread_barrier_wait(&pool.done); }
+
+static void pool_run(JobFn fn, void *arg)
+{
+    pool_start(fn, arg);
+    pool_wait();
 }
 
 static void pool_shutdown(void)
@@ -252,7 +260,7 @@ typedef struct {
 } DedupTask;
 
 typedef struct {
-    uint64_t slot_begin, slot_end;
+    const Cand *begin, *end;          /* candidate range (<= 65536) */
     Win *out;
     uint64_t count;
     uint64_t occupied;
@@ -279,35 +287,36 @@ typedef struct {
     Arena *arena;        /* compact per-task output (collect, sessionize) */
 } Queue;
 
-/* Links are only needed from P3 on, so worker 0 runs the (integer-only)
-   union-find + smallest-name pass while the other workers start parsing
-   events; it joins the parse queue after.
-   Still exactly the pool's threads: no extra thread, no oversubscription. */
-
+/* P0b + P1 in one phase: every worker first takes link-file tasks (parse +
+   intern), then event parse tasks. The worker that completes the last link
+   task runs the (integer-only) union-find + smallest-name pass, then joins
+   the event parse. Links are only needed from P3 on, so nothing waits for
+   them; still exactly the pool's threads. */
 typedef struct {
     Dict *dict;
     LinkBuild *lb;
+    size_t ntasks;
+    _Atomic size_t next, done;
     int rc;
 } LinkJob;
-
-static void job_links(void *arg, unsigned wid)
-{
-    (void)wid;
-    Queue *q = arg;
-    LinkBuild *lb = (LinkBuild *)q->ctx;
-    size_t i;
-    while ((i = atomic_fetch_add_explicit(&q->next, 1, memory_order_relaxed)) < q->ntasks) {
-        links_parse_task(lb, i);
-    }
-}
 
 static void job_parse(void *arg, unsigned wid)
 {
     Queue *q = arg;
     ParseTask *t = q->tasks;
     LinkJob *lj = q->ctx2;
-    if (wid == 0 && lj)
-        lj->rc = links_finish(lj->lb, lj->dict);
+    if (lj->ntasks == 0) {
+        if (wid == 0)
+            lj->rc = links_finish(lj->lb, lj->dict);
+    } else {
+        size_t k;
+        while ((k = atomic_fetch_add_explicit(&lj->next, 1, memory_order_relaxed)) < lj->ntasks) {
+            links_parse_task(lj->lb, k);
+            /* acq_rel RMW chain: the last one sees every task's writes */
+            if (atomic_fetch_add_explicit(&lj->done, 1, memory_order_acq_rel) + 1 == lj->ntasks)
+                lj->rc = links_finish(lj->lb, lj->dict);
+        }
+    }
     size_t i;
     while ((i = atomic_fetch_add_explicit(&q->next, 1, memory_order_relaxed)) < q->ntasks) {
         t[i].out = arena_take(q->arena, wid, (uint64_t)(t[i].end - t[i].begin) / 8 + 1);
@@ -337,9 +346,8 @@ static void job_collect(void *arg, unsigned wid)
     while ((i = atomic_fetch_add_explicit(&q->next, 1, memory_order_relaxed)) < q->ntasks) {
         if (atomic_load_explicit(overflow, memory_order_relaxed))
             break;                      /* the phase will be rerun anyway */
-        t[i].out = arena_take(q->arena, wid, t[i].slot_end - t[i].slot_begin);
-        t[i].count = evx_collect(q->ctx, t[i].slot_begin, t[i].slot_end, t[i].out,
-                                 &t[i].occupied);
+        t[i].out = arena_take(q->arena, wid, (uint64_t)(t[i].end - t[i].begin));
+        t[i].count = evx_collect(q->ctx, t[i].begin, t[i].end, t[i].out, &t[i].occupied);
         if (t[i].count == UINT64_MAX)
             atomic_store(overflow, 1);
         else
@@ -634,15 +642,11 @@ int main(int argc, char **argv)
         fprintf(stderr, "thread pool init failed\n");
         return 1;
     }
-    /* P0b: link files parsed and interned by all workers */
+    /* P0b: link files are parsed and interned by all workers at the start
+       of the event parse phase (job_parse) */
     LinkBuild *lbuild = NULL;
     if (links_plan(data_dir, nw, &lbuild) != 0)
         return 1;
-    {
-        Queue lq = {.ntasks = links_ntasks(lbuild), .ctx = lbuild};
-        atomic_init(&lq.next, 0);
-        pool_run(job_links, &lq);
-    }
 
     /* ---- event files -> newline-aligned byte-range tasks ----------------- */
     char evdir[4096], path[8192];
@@ -715,7 +719,10 @@ int main(int argc, char **argv)
         .prod_mask = dict.prod_mask,
         .unknown_cat = dict.unknown_cat,
     };
-    LinkJob ljob = {.dict = &dict, .lb = lbuild};
+    static LinkJob ljob;
+    ljob.dict = &dict;
+    ljob.lb = lbuild;
+    ljob.ntasks = links_ntasks(lbuild);
     Queue q = {.ntasks = nptasks, .tasks = ptasks, .ctx = &pctx, .ctx2 = &ljob, .arena = &carena};
     atomic_init(&q.next, 0);
     pool_run(job_parse, &q);
@@ -733,10 +740,11 @@ int main(int argc, char **argv)
         return 1;
     }
     uint64_t *dedup = big_alloc(dsize * sizeof(uint64_t));
+    DedupTask *dtasks = NULL;
+    size_t ndt = 0;
     {
         size_t dt_cap = nptasks + ncand / 65536 + 16;
-        DedupTask *dtasks = calloc(dt_cap, sizeof *dtasks);
-        size_t ndt = 0;
+        dtasks = calloc(dt_cap, sizeof *dtasks);
         if (!dedup || !dtasks) {
             fprintf(stderr, "out of memory (dedup)\n");
             return 1;
@@ -748,9 +756,62 @@ int main(int argc, char **argv)
             }
         q = (Queue){.ntasks = ndt, .tasks = dtasks, .ctx = &dsize, .ctx2 = dedup};
         atomic_init(&q.next, 0);
-        pool_run(job_dedup, &q);
-        free(dtasks);
+        pool_start(job_dedup, &q);
     }
+    /* coordinator, while the workers dedup: map and plan the click files */
+    const int64_t W7 = 604800000;
+    char ckdir[4096];
+    snprintf(ckdir, sizeof ckdir, "%s/clicks", data_dir);
+    Mapped *cfiles = NULL;
+    size_t click_bytes = 0;
+    int ncfiles = map_dir(ckdir, &cfiles, &click_bytes);
+    if (ncfiles < 0)
+        return 1;
+    size_t cchunk = click_bytes / ((size_t)nw * 16) + 1;
+    if (cchunk < ((size_t)1 << 20))
+        cchunk = (size_t)1 << 20;
+    ClickTask *ktasks = calloc((size_t)ncfiles + click_bytes / cchunk + 16, sizeof *ktasks);
+    size_t nkt = 0, kcap = 0;
+    for (int i = 0; i < ncfiles; i++) {
+        if (!cfiles[i].data)
+            continue;
+        const char *b = cfiles[i].data, *e = b + cfiles[i].size;
+        const char *nl = memchr(b, '\n', cfiles[i].size);
+        if (!nl)
+            continue;
+        for (const char *p = nl + 1; p < e;) {
+            const char *q2 = p + cchunk < e ? p + cchunk : e;
+            if (q2 < e) {
+                const char *n2 = memchr(q2, '\n', (size_t)(e - q2));
+                q2 = n2 ? n2 + 1 : e;
+            }
+            ktasks[nkt].begin = p;
+            ktasks[nkt].end = q2;
+            /* a click row that survives is >= 7 bytes ("c,u,k,t") */
+            kcap += (size_t)(q2 - p) / 7 + 1;
+            nkt++;
+            p = q2;
+        }
+    }
+    if (kcap >= ((uint64_t)1 << 32)) {
+        fprintf(stderr, "too many click rows for the 32-bit click index\n");
+        return 1;
+    }
+    ClickCand *kc = big_alloc((kcap ? kcap : 1) * sizeof(ClickCand));
+    if (!kc || !ktasks) {
+        fprintf(stderr, "out of memory (clicks)\n");
+        return 1;
+    }
+    {
+        size_t off = 0;
+        for (size_t i = 0; i < nkt; i++) {
+            ktasks[i].out = kc + off;
+            off += (size_t)(ktasks[i].end - ktasks[i].begin) / 7 + 1;
+        }
+    }
+    pool_wait();
+    /* the losers are marked dead in the candidates: the table is done */
+    big_free(dedup, dsize * sizeof(uint64_t));
 
     /* ---- P3: collect valid winners, resolve + intern persons, count ---------
      * The person table starts at ~1/16 of the candidates (people are a few %
@@ -767,7 +828,7 @@ int main(int argc, char **argv)
         psize = pmax;
     const uint64_t CSLOTS = 65536;
     static Arena warena;          /* collect output: dense Win runs per task */
-    size_t nct = (size_t)((dsize + CSLOTS - 1) / CSLOTS);
+    size_t nct = ndt;             /* the dedup ranges again: <= CSLOTS candidates */
     CollectTask *ctasks = calloc(nct, sizeof *ctasks);
     if (arena_init(&warena, sizeof(Win), ncand + 1, CSLOTS, 16 * CSLOTS, nw) != 0 || !ctasks) {
         fprintf(stderr, "out of memory (collect)\n");
@@ -784,8 +845,8 @@ int main(int argc, char **argv)
         }
         arena_reset(&warena);
         for (size_t i = 0; i < nct; i++) {
-            ctasks[i].slot_begin = i * CSLOTS;
-            ctasks[i].slot_end = (i + 1) * CSLOTS < dsize ? (i + 1) * CSLOTS : dsize;
+            ctasks[i].begin = dtasks[i].c;
+            ctasks[i].end = dtasks[i].c + dtasks[i].n;
             ctasks[i].out = NULL;
             ctasks[i].count = 0;
             ctasks[i].occupied = 0;
@@ -793,7 +854,7 @@ int main(int argc, char **argv)
         uint64_t claimed = 0;
         _Atomic int overflow = 0;
         CollectCtx cctx = {
-            .dedup = dedup, .persons = persons, .person_mask = psize - 1, .counts = counts,
+            .persons = persons, .person_mask = psize - 1, .counts = counts,
             .link_slots = dict.link_slots, .link_mask = dict.link_mask,
             .link_filter = dict.link_filter, .link_fshift = dict.link_fshift,
             .claimed = &claimed, .claim_limit = psize / 2,
@@ -843,7 +904,6 @@ int main(int argc, char **argv)
     offsets[npersons] = nvalid;
     /* names now live in pnames (pointing into the input mappings): the
        candidate store, dedup table and person table are no longer needed */
-    big_free(dedup, dsize * sizeof(uint64_t));
     /* the candidate arena stays mapped: its first pages are already
        faulted in, and the grouped events (P5) are written over them */
     /* the person table and counts[] (now slot -> dense remap) stay alive
@@ -866,56 +926,10 @@ int main(int argc, char **argv)
      * Every failing row is dropped at parse (copies of a click are identical,
      * so no click dedup is needed); clicks of people without surviving events
      * are dropped too (they have no sessions to credit or assist). */
-    const int64_t W7 = 604800000;
-    char ckdir[4096];
-    snprintf(ckdir, sizeof ckdir, "%s/clicks", data_dir);
-    Mapped *cfiles = NULL;
-    size_t click_bytes = 0;
-    int ncfiles = map_dir(ckdir, &cfiles, &click_bytes);
-    if (ncfiles < 0)
-        return 1;
-    size_t cchunk = click_bytes / ((size_t)nw * 16) + 1;
-    if (cchunk < ((size_t)1 << 20))
-        cchunk = (size_t)1 << 20;
-    ClickTask *ktasks = calloc((size_t)ncfiles + click_bytes / cchunk + 16, sizeof *ktasks);
-    size_t nkt = 0, kcap = 0;
-    for (int i = 0; i < ncfiles; i++) {
-        if (!cfiles[i].data)
-            continue;
-        const char *b = cfiles[i].data, *e = b + cfiles[i].size;
-        const char *nl = memchr(b, '\n', cfiles[i].size);
-        if (!nl)
-            continue;
-        for (const char *p = nl + 1; p < e;) {
-            const char *q2 = p + cchunk < e ? p + cchunk : e;
-            if (q2 < e) {
-                const char *n2 = memchr(q2, '\n', (size_t)(e - q2));
-                q2 = n2 ? n2 + 1 : e;
-            }
-            ktasks[nkt].begin = p;
-            ktasks[nkt].end = q2;
-            /* a click row that survives is >= 7 bytes ("c,u,k,t") */
-            kcap += (size_t)(q2 - p) / 7 + 1;
-            nkt++;
-            p = q2;
-        }
-    }
-    if (kcap >= ((uint64_t)1 << 32)) {
-        fprintf(stderr, "too many click rows for the 32-bit click index\n");
-        return 1;
-    }
-    ClickCand *kc = big_alloc((kcap ? kcap : 1) * sizeof(ClickCand));
     uint32_t *ccount = big_alloc((npersons ? npersons : 1) * sizeof(uint32_t));
-    if (!kc || !ccount || !ktasks) {
+    if (!ccount) {
         fprintf(stderr, "out of memory (clicks)\n");
         return 1;
-    }
-    {
-        size_t off = 0;
-        for (size_t i = 0; i < nkt; i++) {
-            ktasks[i].out = kc + off;
-            off += (size_t)(ktasks[i].end - ktasks[i].begin) / 7 + 1;
-        }
     }
     ClickParseCtx kctx = {
         .cw_start = dict.window_start - W7,

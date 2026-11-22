@@ -22,17 +22,17 @@ t = time.monotonic()
 subprocess.run([sys.argv[1]], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, check=True)
 w = (time.monotonic() - t) * 1000
 u = resource.getrusage(resource.RUSAGE_CHILDREN)
-print("%d %d %d" % (w, (u.ru_utime + u.ru_stime) * 1000, u.ru_majflt))' "build/bench/$r")
+print("%d %d %d %d" % (w, (u.ru_utime + u.ru_stime) * 1000, u.ru_majflt, u.ru_maxrss // 1024))' "build/bench/$r")
         echo "$r $line" >> "$res"
-        echo "run $i $r $line" | awk '{printf "run %s %-10s wall %6d ms  cpu %6d ms  majflt %d\n", $2, $3, $4, $5, $6}'
+        echo "run $i $r $line" | awk '{printf "run %s %-10s wall %6d ms  cpu %6d ms  majflt %d  rss %d MiB\n", $2, $3, $4, $5, $6, $7}'
     done
     i=$((i + 1))
 done
-echo "--- $data, $runs runs, NCPU=$cpus: wall ms min / median / max | cpu ms median | majflt median"
+echo "--- $data, $runs runs, NCPU=$cpus: wall ms min / median / max | cpu ms median | majflt median | peak RSS MiB"
 for r in "$@"; do
     grep "^$r " "$res" | sort -k2 -n | awk -v r="$r" \
-        '{w[NR]=$2; c[NR]=$3; m[NR]=$4} END {
+        '{w[NR]=$2; c[NR]=$3; m[NR]=$4; if ($5 > rss) rss = $5} END {
             n = asort(c, cs); asort(m, ms);
-            printf "%-10s %6d / %6d / %6d | %6d | %d\n", r, w[1], w[int((NR+1)/2)], w[NR], cs[int((n+1)/2)], ms[int((n+1)/2)]}'
+            printf "%-10s %6d / %6d / %6d | %6d | %d | %d\n", r, w[1], w[int((NR+1)/2)], w[NR], cs[int((n+1)/2)], ms[int((n+1)/2)], rss}'
 done
 rm -rf build/bench/out

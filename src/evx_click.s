@@ -391,17 +391,28 @@ evx_parse_clicks:
         mov     rdx, qword ptr [rsp + K_END]
 .Lk_f_cut:
         mov     rax, rdx
-        sub     rax, rcx
+        sub     rax, rcx                # len
+        # branchless unwrap (quoting is data-random: a branch mispredicts):
+        # wrapped = len >= 2 && first == '"' && last == '"'; short fields
+        # read two zero bytes instead (never past the field's line)
+        lea     rdi, [rdx - 1]
         mov     rsi, rcx
+        lea     r8, [rip + evx_noquote]
         cmp     rax, 2
-        jb      .Lk_f_store
-        cmp     byte ptr [rcx], 0x22
-        jne     .Lk_f_store
-        cmp     byte ptr [rdx - 1], 0x22
-        jne     .Lk_f_store
-        inc     rsi
-        sub     rax, 2
-        inc     r11d
+        cmovb   rdi, r8
+        cmovb   rsi, r8
+        movzx   r8d, byte ptr [rsi]
+        movzx   edi, byte ptr [rdi]
+        xor     r8d, 0x22
+        xor     edi, 0x22
+        or      r8d, edi                # 0 iff both ends are quotes
+        cmp     r8d, 1
+        sbb     r8d, r8d                # -1 iff wrapped
+        neg     r8d                     # wrapped: 1 / 0
+        lea     rsi, [rcx + r8]
+        sub     rax, r8
+        sub     rax, r8
+        add     r11d, r8d
 .Lk_f_store:
         mov     r8d, r9d
         shl     r8d, 4

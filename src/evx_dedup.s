@@ -98,15 +98,22 @@ evx_dedup_insert:
         mov     rax, r8
         jz      .Ldi_pnext
 .Ldi_same:
-        # same event_id: replace only with a strictly smaller ingest
+        # same event_id: replace only with a strictly smaller ingest. The
+        # losing copy is marked dead (user.k1 = 0) while it is in cache, so
+        # evx_collect can walk the candidates sequentially and skip it.
         mov     r9, rax
         and     r9, rbp
         mov     r8, qword ptr [r13 + 16]
         cmp     r8, qword ptr [r9 + 16]
-        jge     .Ldi_adv
+        jge     .Ldi_lose
         lock cmpxchg qword ptr [rbx + r15*8], rdx
-        jz      .Ldi_adv
+        jz      .Ldi_won
         jmp     .Ldi_same               # rax = newer resident of same id
+.Ldi_lose:
+        mov     qword ptr [r13 + 32], 0 # the new copy loses
+        jmp     .Ldi_adv
+.Ldi_won:
+        mov     qword ptr [r9 + 32], 0  # the displaced resident loses
 .Ldi_pnext:
         inc     r15
         cmp     r15, r12
@@ -127,23 +134,23 @@ evx_dedup_insert:
         .size   evx_dedup_insert, .-evx_dedup_insert
 
 # ---------------------------------------------------------------------------
-# uint64_t evx_collect(const CollectCtx *ctx /*rdi*/, uint64_t slot_begin /*rsi*/,
-#                      uint64_t slot_end /*rdx*/, Win *out /*rcx*/,
-#                      uint64_t *occupied /*r8*/)
-# Walks dedup slots [begin, end) and counts occupied slots (= unique event
-# ids) into *occupied. Every winner that passed validation gets its person
-# resolved (link table, else the raw id), interned in the person table,
-# counted (`lock inc`) and emitted as a 16-byte Win. Returns the Win count, or
-# UINT64_MAX on person-table overflow.
+# uint64_t evx_collect(const CollectCtx *ctx /*rdi*/, const Cand *begin /*rsi*/,
+#                      const Cand *end /*rdx*/, Win *out /*rcx*/,
+#                      uint64_t *live /*r8*/)
+# Walks the candidates [begin, end) in memory order. Every live (dedup
+# winner) and valid one (user.k1 != 0; dedup zeroes it in every losing copy)
+# gets its person resolved (link table, else the raw id), interned in the
+# person table, counted (`lock inc`) and emitted as a 16-byte Win; *live =
+# their number. Returns the Win count, or UINT64_MAX on person-table overflow.
 #
 # Software-pipelined in batches of up to 64 winners, so the random misses of
 # many events are in flight together instead of one dependent chain per event:
-#   stage 1  scan slots, prefetch each winner's Cand
+#   stage 1  next live, valid candidates (sequential stream)
 #   stage 2  read the user key, prefetch its link-table entry
 #   stage 3  resolve the person key, prefetch the person slot and its counter
 #   stage 4  intern (CAS claim / compare), count, emit
 #
-# Frame: [0] slot idx, [8] slot end, [16] out base, [24] occupied count,
+# Frame: [0] Cand cursor, [8] Cand end, [16] out base, [24] live count,
 #   [32] occupied ptr, [40] batch size, [48] saved rbx, [56] loop index,
 #   [64 + 8i] Cand*, [576 + 8i] key k0, [1088 + 8i] key k1, [1600 + 8i] slot idx
 # ---------------------------------------------------------------------------
@@ -166,7 +173,6 @@ evx_collect:
         push    r15
         sub     rsp, CFRAME
         mov     rbp, rdi                    # ctx
-        mov     rbx, qword ptr [rdi]        # dedup table
         mov     r12, qword ptr [rdi + 8]    # person table
         mov     r13, qword ptr [rdi + 16]   # person mask
         mov     r14, qword ptr [rdi + 24]   # counts
@@ -178,24 +184,23 @@ evx_collect:
         mov     qword ptr [rsp + 32], r8
 
 .Lco_batch:
-        # ---- stage 1: gather up to 64 winners, prefetch their Cands --------
+        # ---- stage 1: next up to 64 live, valid candidates (sequential) ----
+        # dedup marked every losing copy dead (user.k1 = 0), so the
+        # candidates are walked in memory order: no dedup-table scan and no
+        # random Cand reads; the hardware prefetcher streams them.
         xor     ecx, ecx                    # n
         mov     rax, qword ptr [rsp]
         mov     rdx, qword ptr [rsp + 8]
-        movabs  r8, PTRMASK
 .Lco_s1:
         cmp     ecx, BATCH
         jae     .Lco_s1_done
         cmp     rax, rdx
         jae     .Lco_s1_done
-        mov     r9, qword ptr [rbx + rax*8]
-        inc     rax
-        test    r9, r9
-        jz      .Lco_s1
+        mov     r9, rax
+        add     rax, CAND
+        cmp     qword ptr [r9 + 32], 0      # dead or invalid
+        je      .Lco_s1
         inc     qword ptr [rsp + 24]
-        and     r9, r8
-        prefetcht0 [r9 + 24]
-        prefetcht0 [r9 + 51]
         mov     qword ptr [rsp + B_C + rcx*8], r9
         inc     ecx
         jmp     .Lco_s1

@@ -38,10 +38,10 @@ The C coordinator lives in `main.c` (with `dict.c` and `parquet.c`). It runs a p
 
 | Phase | Code | Work |
 |---|---|---|
-| P0 | `dict.c` | manifest window, products → category IDs **in byte order** (the tie-break is the smallest ID), links → DSU → `LookupEntry` table raw ID → canonical (smallest) name |
-| P1 | `evx_parse_events` | newline-aligned byte ranges → 56-byte `Cand` (dense, per-worker arena chunks) per structurally valid row with a non-empty `event_id`; **all validation is computed here as a flag**, but the row still competes in dedup |
-| P2 | `evx_dedup_insert` | lock-free global CAS table of `Cand*` (16-bit tag in the top bits); the smallest `ingest` wins |
-| P3 | `evx_collect` | walk winners, drop invalid ones, `evx_canon` (links), intern the name in the person table (16-byte `cmpxchg16b` slots, sized ~1/16 of candidates, rerun ×8 on >50% load), `lock inc` counts |
+| P0 | `dict.c` | manifest window, products → category IDs **in byte order** (the tie-break is the smallest ID), link planning. The link files are parsed and interned at the start of the P1 job by all workers; the worker finishing the last link task runs DSU → `LookupEntry` table raw ID → canonical (smallest) name while the others parse events |
+| P1 | `evx_parse_events` | no link lookup; newline-aligned byte ranges → 56-byte `Cand` (dense, per-worker arena chunks) per structurally valid row with a non-empty `event_id`; **all validation is computed here as a flag**, but the row still competes in dedup |
+| P2 | `evx_dedup_insert` | lock-free global CAS table of `Cand*` (16-bit tag in the top bits); the smallest `ingest` wins and every losing copy is marked dead (`user.k1 = 0`). The coordinator maps and plans the click files meanwhile (`pool_start`/`pool_wait`) |
+| P3 | `evx_collect` | walk the candidates in memory order, skip dead/invalid ones, `evx_canon` (links), intern the name in the person table (16-byte `cmpxchg16b` slots, sized ~1/16 of candidates, rerun ×8 on >50% load), `lock inc` counts |
 | P4 | `main.c` | compact slots → dense person IDs (`counts[]` reused as the remap), prefix-sum offsets, extract names, free big buffers |
 | P5 | `evx_scatter` | `lock xadd` cursors → each person's events contiguous (`Ev`, 16 B) |
 | C1 | `evx_parse_clicks` | parse + validate + drop (no click dedup: copies are identical); `evx_canon` → person-table probe → dense ID; `lock inc` click counts |

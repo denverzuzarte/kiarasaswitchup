@@ -628,3 +628,10 @@ evx_parse_ts:
         .byte 31,28,31,30,31,30,31,31,30,31,30,31
 
         .section .note.GNU-stack,"",@progbits
+
+# two zero bytes: the branchless quote unwrap of a field shorter than 2
+# bytes reads its first/last byte here (evx_parse.s, evx_click.s)
+        .section .rodata
+        .globl  evx_noquote
+evx_noquote:
+        .byte   0, 0

@@ -141,6 +141,23 @@ Link union-find (worker 0, 180–190 ms) is now nearly as long as the event pars
 - Removed: the profiler (`prof.c`, `EVX_PROFILE`), all stats output and the invariant sums, the partitioned dedup (`evx_partition`, `evx_dedup_local`, the parser's `PartOut` path), the sequential `load_links`, and the `COLLECT_BATCH` / `SCATTER_SERIAL` / `LINK_IDBLOCK` / `NO_HUGEPAGE` / `INPUT_POPULATE` switches with the `variant` / `profile` targets. The parser frame keeps its size, so call alignment is unchanged.
 - Parquet: before, the coordinator gathered every row into six column arrays on one thread, and then encoded and `write()`-ed them serially. Now each row group (a run of consecutive session tasks, about nrows / 4nw rows, at least 64K) is encoded by one worker straight from its tasks' `Row` arrays. `pq_layout` fixes the offsets and writes the magic and footer, and the workers `pwrite` their groups at their final offsets. The pool stays alive through P7. A `MAP_SHARED` mapping of the ftruncate-sized file was A/B tested: same wall time (867 vs 868 ms median at 20M), but about 500 major faults on the file holes, so `pwrite` was kept.
 
+## 6g. Round 5: perf-guided (cycles, branch misses, cache misses per function)
+
+`perf record -e cycles:u,branch-misses:u,cache-misses:u` at 20M events / 5M clicks, shares per function (cycles / branch misses / cache misses) before this round: dedup 22 / 9 / 16 %, collect 16 / 16 / **34** %, scatter 9 / 0 / **23** %, parse 14 / **23** / 1 %, parse_ts 5 / 12 / 1 %, attribute 4 / 12 / 1 %.
+
+- **Dedup marks losers dead; collect walks candidates in memory order.** When `evx_dedup_insert` compares two copies of an event_id, both are in cache. The loser (the new copy on `>=` ingest, or the displaced resident after a successful replace) gets `user.k1 = 0`. After P2, `user.k1 != 0` means "live and valid". Before, `evx_collect` scanned the 1.5×-candidate dedup table and chased each winner pointer into a random 56-byte `Cand`, which usually spans two lines and was prefetched as two lines. Now stage 1 streams the dense candidate arena, so the hardware prefetcher covers it, and the dedup table is freed right after P2. Collect fell from 16.2 to 12.9 % of cycles and from 34 to 26 % of cache misses. Wall time: 885 → 858 ms median.
+- **Branchless quote unwrap** (`evx_parse_events` and `evx_parse_clicks` field loops). The test "field wrapped in quotes?" (len ≥ 2, first = last = `"`) was two data-dependent branches per field. In this messy CSV the quoting is random, and they were the top two branch-miss sites in parse (about 17 % of its misses). It is now `cmovb` (fields shorter than 2 point at two zero bytes, `evx_noquote`, so nothing is read past the field), xor/or, `cmp 1; sbb; neg` → 0/1, and arithmetic. Wall time: 852 → 845 ms median.
+- **Phase reorder (links spec):** the link-file parse + intern tasks run at the start of the P1 job instead of in a phase of their own. The worker completing the last link task (an `acq_rel` counter) runs the union-find. The coordinator maps and plans the click files during P2 (`pool_start`/`pool_wait`). The `madvise(MADV_SEQUENTIAL | MADV_WILLNEED)` call was a bitwise OR of two enumerated values (2 | 3 = 3), so it is now plain `MADV_WILLNEED`. Wall time: 885 → 852 ms median, measured together with an earlier quiet-host bench (most of the gain is the removed barrier).
+
+| 20M / 5M, 8 interleaved runs | main | after round 5 |
+|---|---|---|
+| wall median | 885 ms | 845 ms |
+| CPU (user+sys) median | 6.66 s | 6.33 s |
+| 60M / 15M, wall min (4 runs; disk-bound host) | 3979 ms | 3773 ms |
+| 60M peak RSS | 11350 MiB | 11347 MiB |
+
+Not done, measured: the epoch-ms (F3) digit loop and the F1/F2/F3 length dispatch account for about 12 % of branch misses, but at about 1 mispredict per F3 row they are worth roughly 3 ms. Dedup (24 % of cycles, `lock cmpxchg`-bound) needs a partitioned design.
+
 ## 7. OS and memory (C side, in support of the asm)
 
 - **Lazily committed** `MAP_NORESERVE` anonymous buffers sized by worst-case bounds (≥ 8 bytes per candidate row). Untouched pages cost nothing, so no growth or realloc logic is needed in asm.
