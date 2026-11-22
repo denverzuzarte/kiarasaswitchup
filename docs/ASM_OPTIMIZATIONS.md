@@ -158,6 +158,21 @@ Link union-find (worker 0, 180–190 ms) is now nearly as long as the event pars
 
 Not done, measured: the epoch-ms (F3) digit loop and the F1/F2/F3 length dispatch account for about 12 % of branch misses, but at about 1 mispredict per F3 row they are worth roughly 3 ms. Dedup (24 % of cycles, `lock cmpxchg`-bound) needs a partitioned design.
 
+## 6h. Idle spots (perf per-thread timeline)
+
+A `perf record -F 20000 -e cycles:u` timeline in 5 ms bins at 20M showed about 180 ms of 8-core time with workers idle or in the kernel. That includes a ~13 ms single-threaded start (products, link line count), about 10 ms at each first-touch phase switch, and ~20 ms of serialized `pwrite`s at the end. Outside the process, the container adds ~170 ms of startup and ~45 ms of teardown, and process exit costs ~42 ms (mapping teardown).
+
+- **Parquet layout fixed up front.** A parallel size pass computes every column chunk's exact page-body size, including the RLE definition-level runs; `pq_presize` adds the header size and `pq_encode_done` verifies it. Then `pq_layout` writes the footer, and each worker `pwrite`s a row group as soon as it is encoded, so the kernel-serialized writes overlap the encoding of other groups. The coordinator builds and writes `campaign_daily` meanwhile (`pool_start`/`pool_wait`).
+- **Parallel start.** `links_map` (coordinator), then a `job_startup` phase: products on worker 0, campaigns on worker 1, and `links_count` on every worker for one slice of the concatenated link bytes. The coordinator maps and plans the event files meanwhile, then `links_plan` allocates.
+- **Tried and reverted: `pread` of every parse task into a huge-page anonymous buffer** (to avoid the file-mapping page tables and their teardown at exit). 20M wall went from 866 to 1401 ms and CPU from 6.5 to 10.4 s: the kernel zeroes the fresh 1.8 GB buffer and then copies the whole input into it, which costs far more than the file faults it saves.
+
+| 20M / 5M, 10 interleaved runs (min / median) | wall |
+|---|---|
+| before | 868 / 873 ms |
+| + Parquet presized layout | 861 / 868 ms |
+| + parallel start | 857 / 866 ms |
+| + pread input (reverted) | 1330 / 1401 ms |
+
 ## 7. OS and memory (C side, in support of the asm)
 
 - **Lazily committed** `MAP_NORESERVE` anonymous buffers sized by worst-case bounds (≥ 8 bytes per candidate row). Untouched pages cost nothing, so no growth or realloc logic is needed in asm.
