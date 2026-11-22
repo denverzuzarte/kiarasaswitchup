@@ -481,6 +481,18 @@ static uint32_t link_intern(LinkBuild *lb, const char *p, uint32_t len)
     }
 }
 
+/* Start of the first line at or after byte offset o of a file (header skipped
+   for o == 0): the position after the first '\n' at index >= max(o-1, 0). */
+static const char *line_start_after(const char *fb, const char *fe, const char *o)
+{
+    const char *from = o > fb ? o - 1 : fb;
+    if (from >= fe)
+        return fe;
+    const char *nl = memchr(from, '\n', (size_t)(fe - from));
+    return nl ? nl + 1 : fe;
+}
+
+/* Coordinator part: list + mmap + raw byte-range tasks only (no content scan). */
 int links_plan(const char *data_dir, unsigned workers, LinkBuild **out)
 {
     char dir[4096], path[8192];
@@ -494,47 +506,62 @@ int links_plan(const char *data_dir, unsigned workers, LinkBuild **out)
         nf = 0;
     lb->files = calloc((size_t)(nf ? nf : 1), sizeof(Mapped));
     lb->nfiles = nf;
-    size_t bytes = 0, lines = 0;
+    size_t bytes = 0;
     for (int i = 0; i < nf; i++) {
         snprintf(path, sizeof path, "%s/%s", dir, names[i]);
         free(names[i]);
         if (map_file(path, &lb->files[i]) != 0)
             return -1;
         bytes += lb->files[i].size;
-        /* lines = newlines (+1 for an unterminated last line); a plain
-           byte loop, vectorised by the compiler, instead of a memchr per line */
-        const unsigned char *p = (const unsigned char *)lb->files[i].data;
-        size_t n = lb->files[i].size, nl = 0;
-        for (size_t j = 0; j < n; j++)
-            nl += p[j] == '\n';
-        lines += nl + (n && p[n - 1] != '\n');
     }
     free(names);
     size_t chunk = bytes / ((size_t)workers * 8) + 1;
     if (chunk < ((size_t)1 << 18))
         chunk = (size_t)1 << 18;
     lb->tasks = calloc((size_t)nf + bytes / chunk + 16, sizeof(LinkTask));
-    size_t pair_off = 0;
     for (int i = 0; i < nf; i++) {
         const char *b = lb->files[i].data, *e = b + lb->files[i].size;
         if (!b)
             continue;
-        const char *nl = memchr(b, '\n', lb->files[i].size);
-        if (!nl)
-            continue;                        /* header only */
-        for (const char *p = nl + 1; p < e;) {
-            const char *q = p + chunk < e ? p + chunk : e;
-            if (q < e) {
-                const char *n2 = memchr(q, '\n', (size_t)(e - q));
-                q = n2 ? n2 + 1 : e;
-            }
+        for (const char *p = b; p < e; p += chunk) {
             LinkTask *t = &lb->tasks[lb->ntasks++];
             t->begin = p;
-            t->end = q;
-            t->pair_off = pair_off;
-            pair_off += (size_t)(q - p) / 4 + 1;    /* a kept line is >= 4 bytes */
-            p = q;
+            t->end = p + chunk < e ? p + chunk : e;
+            t->fbeg = b;
+            t->fend = e;
         }
+    }
+    *out = lb;
+    return 0;
+}
+
+/* Parallel: align the task to line starts and count its lines (an upper
+   bound of its pairs). npairs is scratch for the line count until prepare. */
+void links_scan_task(LinkBuild *lb, size_t ti)
+{
+    LinkTask *t = &lb->tasks[ti];
+    const char *b = line_start_after(t->fbeg, t->fend, t->begin);
+    const char *e = t->end >= t->fend ? t->fend : line_start_after(t->fbeg, t->fend, t->end);
+    if (e < b)
+        e = b;
+    t->begin = b;
+    t->end = e;
+    size_t nl = 0;
+    for (const char *p = b; p < e; p++)
+        nl += *p == '\n';
+    t->npairs = nl + (e > b && e[-1] != '\n');
+}
+
+/* After the scan barrier: size the pair store, id space and table. */
+int links_prepare(LinkBuild *lb, unsigned workers)
+{
+    size_t pair_off = 0, lines = 0;
+    for (size_t i = 0; i < lb->ntasks; i++) {
+        LinkTask *t = &lb->tasks[i];
+        t->pair_off = pair_off;
+        pair_off += t->npairs;
+        lines += t->npairs;
+        t->npairs = 0;
     }
     lb->pairs = big_alloc((pair_off ? pair_off : 1) * sizeof *lb->pairs);
     uint64_t size = table_size_for(lines * 2 + 1);   /* <= 2 ids per line, load <= 0.5 */
@@ -548,7 +575,6 @@ int links_plan(const char *data_dir, unsigned workers, LinkBuild **out)
     if (idcap >= UINT32_MAX)
         return -1;
     lb->mask = size - 1;
-    *out = lb;
     return 0;
 }
 

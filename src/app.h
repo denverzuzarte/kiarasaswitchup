@@ -63,10 +63,13 @@ int load_campaigns(const char *data_dir, Dict *d);
 typedef struct {
     const char *begin, *end;
     uint64_t pair_off, npairs;
+    const char *fbeg, *fend;    /* file bounds (begin/end are raw until scanned) */
 } LinkTask;
 typedef struct LinkBuild LinkBuild;
 int links_plan(const char *data_dir, unsigned workers, LinkBuild **out);
 size_t links_ntasks(const LinkBuild *lb);
+void links_scan_task(LinkBuild *lb, size_t task);
+int links_prepare(LinkBuild *lb, unsigned workers);
 uint64_t links_task_pairs(const LinkBuild *lb, size_t task);
 void links_parse_task(LinkBuild *lb, size_t task);
 int links_finish(LinkBuild *lb, Dict *d);

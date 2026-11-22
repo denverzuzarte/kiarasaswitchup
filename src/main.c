@@ -282,6 +282,16 @@ static void job_links(void *arg, unsigned wid)
     }
 }
 
+static void job_links_scan(void *arg, unsigned wid)
+{
+    (void)wid;
+    Queue *q = arg;
+    LinkBuild *lb = (LinkBuild *)q->ctx;
+    size_t i;
+    while ((i = atomic_fetch_add_explicit(&q->next, 1, memory_order_relaxed)) < q->ntasks)
+        links_scan_task(lb, i);
+}
+
 /* Chunk arena slabs (called from the asm when a worker needs a 4 KB chunk):
    a worker cuts chunks from its own 2 MB slab, so the shared counter is
    touched once per 512 chunks, and the slab is pre-faulted in one call. */
@@ -721,21 +731,16 @@ int main(int argc, char **argv)
         fprintf(stderr, "thread pool init failed\n");
         return 1;
     }
-    /* P0b: link files parsed and interned by all workers */
+    /* P0b: link files: mmap + raw byte ranges on the coordinator, then the
+       workers align + count lines (scan), then parse. The coordinator plans
+       the event files during the scan and loads products/campaigns and maps
+       the click files during the parse. */
     LinkBuild *lbuild = NULL;
     if (links_plan(data_dir, nw, &lbuild) != 0)
         return 1;
-    {
-        Queue lq = {.ntasks = links_ntasks(lbuild), .ctx = lbuild};
-        atomic_init(&lq.next, 0);
-        /* the coordinator loads products and campaigns while the workers
-           parse the link files (both are needed only from P1 on) */
-        pool_start(job_links, &lq);
-        int rc = load_products(data_dir, &dict) || load_campaigns(data_dir, &dict);
-        pool_wait();
-        if (rc)
-            return 1;
-    }
+    Queue lq = {.ntasks = links_ntasks(lbuild), .ctx = lbuild};
+    atomic_init(&lq.next, 0);
+    pool_start(job_links_scan, &lq);
 
     /* ---- event files -> newline-aligned byte-range tasks ----------------- */
     char evdir[4096], path[8192];
@@ -794,6 +799,21 @@ int main(int argc, char **argv)
             p = q;
         }
     }
+    pool_wait();
+    if (links_prepare(lbuild, nw) != 0)
+        return 1;
+    atomic_store(&lq.next, 0);
+    pool_start(job_links, &lq);
+    int rc = load_products(data_dir, &dict) || load_campaigns(data_dir, &dict);
+    char ckdir[4096];
+    snprintf(ckdir, sizeof ckdir, "%s/clicks", data_dir);
+    Mapped *cfiles = NULL;
+    size_t click_bytes = 0;
+    int ncfiles = map_dir(ckdir, &cfiles, &click_bytes);   /* early readahead */
+    pool_wait();
+    if (rc)
+        return 1;
+
     /* Partitioned Rec store: P dedup partitions (from the row estimate; any
        count is correct), 4 KB chunks cut from per-worker 2 MB slabs of one
        arena. Worst case: every task's bytes / 8 rows, plus one partially
@@ -1067,11 +1087,6 @@ int main(int argc, char **argv)
      * so no click dedup is needed); clicks of people without surviving events
      * are dropped too (they have no sessions to credit or assist). */
     const int64_t W7 = 604800000;
-    char ckdir[4096];
-    snprintf(ckdir, sizeof ckdir, "%s/clicks", data_dir);
-    Mapped *cfiles = NULL;
-    size_t click_bytes = 0;
-    int ncfiles = map_dir(ckdir, &cfiles, &click_bytes);
     if (ncfiles < 0)
         return 1;
     size_t cchunk = click_bytes / ((size_t)nw * 16) + 1;
