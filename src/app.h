@@ -77,7 +77,7 @@ int bytes_cmp(const char *a, size_t al, const char *b, size_t bl);
 /* In-memory Parquet builder (parquet.c). Usage:
  *   f = pq_begin(ngroups, rows per group, ncols, defs)
  *   per group (any thread): pq_col(f, g, c) + pq_put_* for every row, pq_encode_done(f, g)
- *   pq_layout(f, path)          offsets, footer, ftruncate + shared mapping
+ *   pq_layout(f, path)          offsets, magic + footer written
  *   per group (any thread): pq_copy(f, g)
  *   pq_close(f) */
 typedef enum { COL_STR, COL_STR_OPT, COL_DATE, COL_I64 } ColKind;

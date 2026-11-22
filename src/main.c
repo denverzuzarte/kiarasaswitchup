@@ -4,8 +4,8 @@
  * One process, a fixed pthread pool (NCPU workers), explicit phase barriers:
  *   P0 dictionaries -> P1 parse -> P2 dedup -> P3 collect -> P4 dense ids
  *   -> P5 group -> C1-C3 clicks -> P6 sessionize + attribute -> P7 Parquet
- *   (built in RAM from the rows on all workers, copied into a shared mapping
- *   of the output file). Nothing is printed unless something fails.
+ *   (built in RAM from the rows on all workers, each row group pwritten at
+ *   its final offset). Nothing is printed unless something fails.
  * All event semantics live in the assembly engine (src/evx_*.s); this file
  * only owns memory, files, scheduling and barriers.
  */
@@ -1068,7 +1068,7 @@ int main(int argc, char **argv)
     /* ---- P7: user_daily, built in RAM straight from the rows --------------
      * Row groups are runs of consecutive session tasks (~nrows / 4nw rows);
      * every group is encoded by one worker from its tasks' Row arrays, then
-     * the workers copy the groups into the shared mapping of the file. */
+     * the workers pwrite the groups at their final offsets. */
     uint64_t nrows = 0;
     for (size_t i = 0; i < nst; i++)
         nrows += stasks[i].count;

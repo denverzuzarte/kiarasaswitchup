@@ -13,7 +13,7 @@ These are my working instructions for building and verifying the rewrite, one ph
 | `src/evx_session.s` | asm | `evx_sessionize`: per-person ts sort, session split, day split, user/day aggregates, top category |
 | `src/main.c` | C | env, phases, pthread pool, task queues (silent unless an error occurs) |
 | `src/dict.c` | C | manifest, products + category ranking, links DSU → lookup tables |
-| `src/parquet.c` | C | In-RAM Parquet builder (PLAIN, uncompressed, Thrift-compact footer); groups encoded and copied in parallel into a shared file mapping |
+| `src/parquet.c` | C | In-RAM Parquet builder (PLAIN, uncompressed, Thrift-compact footer); groups encoded and pwritten at their offsets in parallel |
 | `src/tests/unit.c` | C | Unit tests of the asm primitives (`make unit`) |
 | `scripts/check_events.py` | Python | Fixture and dev-set checker for `user_daily` only |
 

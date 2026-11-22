@@ -8,10 +8,11 @@
  *
  * The file is built in RAM straight from the caller's rows: each row group is
  * encoded independently (pq_encode, any worker) into its own buffers through
- * the pq_put_* calls; pq_layout then fixes every offset, sizes the output
- * file with ftruncate and maps it shared; pq_copy (any worker) copies one
- * group's pages into the mapping; pq_close writes nothing more (the footer
- * is copied by pq_layout) and unmaps. No column arrays, no write() of data.
+ * the pq_put_* calls; pq_layout then fixes every offset and writes the magic
+ * and footer; pq_copy (any worker) pwrites one group's pages at their final
+ * offsets. No column arrays and no serial pass over the rows.
+ * (A MAP_SHARED mapping of the file was measured as fast, but it takes major
+ * faults on the file holes; pwrite does not.)
  *
  * Column kinds: COL_STR (BYTE_ARRAY, UTF8/STRING), COL_STR_OPT (same,
  * OPTIONAL with RLE definition levels), COL_DATE (INT32 DATE), COL_I64.
@@ -19,8 +20,8 @@
 #define _GNU_SOURCE
 
 #include <errno.h>
+#include <stdatomic.h>
 #include <fcntl.h>
-#include <sys/mman.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
@@ -163,9 +164,8 @@ struct PqFile {
     const PqColDef *defs;
     struct PqCol *chunk;     /* [ngroups * ncols] */
     Buf meta;
-    uint8_t *map;
-    size_t size;
-    int fd, failed;
+    int fd;
+    _Atomic int failed;
 };
 
 PqFile *pq_begin(size_t ngroups, const size_t *group_rows, int ncols, const PqColDef *defs)
@@ -351,7 +351,7 @@ static int pwrite_all(int fd, const void *p, size_t n, off_t off)
     return 0;
 }
 
-/* After every group is encoded: offsets, footer, sized + mapped file. */
+/* After every group is encoded: offsets, then magic + footer written. */
 int pq_layout(PqFile *f, const char *path)
 {
     int64_t pos = 4;
@@ -364,48 +364,30 @@ int pq_layout(PqFile *f, const char *path)
     build_footer(f);
     if (f->meta.oom)
         return -1;
-    f->size = (size_t)pos + f->meta.n;
-    f->fd = open(path, O_RDWR | O_CREAT | O_TRUNC, 0666);
+    f->fd = open(path, O_WRONLY | O_CREAT | O_TRUNC, 0666);
     if (f->fd < 0) {
         perror(path);
         return -1;
-    }
-    if (ftruncate(f->fd, (off_t)f->size) != 0) {
-        perror(path);
-        return -1;
-    }
-    void *m = mmap(NULL, f->size, PROT_READ | PROT_WRITE, MAP_SHARED, f->fd, 0);
-    f->map = m == MAP_FAILED ? NULL : m;    /* NULL: pq_copy falls back to pwrite */
-    if (f->map) {
-        memcpy(f->map, "PAR1", 4);
-        memcpy(f->map + pos, f->meta.p, f->meta.n);
-        return 0;
     }
     if (pwrite_all(f->fd, "PAR1", 4, 0) || pwrite_all(f->fd, f->meta.p, f->meta.n, pos))
         return -1;
     return 0;
 }
 
-/* Copy one row group's pages to the file (any worker, after pq_layout). */
+/* Write one row group's pages at their offsets (any worker, after pq_layout). */
 void pq_copy(PqFile *f, size_t group)
 {
     for (int col = 0; col < f->ncols; col++) {
         PqCol *c = pq_col(f, group, col);
-        if (f->map) {
-            memcpy(f->map + c->offset, c->hdr.p, c->hdr.n);
-            memcpy(f->map + c->offset + c->hdr.n, c->body.p, c->body.n);
-        } else if (pwrite_all(f->fd, c->hdr.p, c->hdr.n, c->offset) ||
-                   pwrite_all(f->fd, c->body.p, c->body.n, c->offset + (off_t)c->hdr.n)) {
-            f->failed = 1;
-        }
+        if (pwrite_all(f->fd, c->hdr.p, c->hdr.n, c->offset) ||
+            pwrite_all(f->fd, c->body.p, c->body.n, c->offset + (off_t)c->hdr.n))
+            atomic_store(&f->failed, 1);
     }
 }
 
 int pq_close(PqFile *f)
 {
-    int rc = f->failed ? -1 : 0;
-    if (f->map)
-        munmap(f->map, f->size);
+    int rc = atomic_load(&f->failed) ? -1 : 0;
     if (f->fd >= 0 && close(f->fd) != 0)
         rc = -1;
     if (rc)
