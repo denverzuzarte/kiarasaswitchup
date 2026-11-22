@@ -1,8 +1,9 @@
 # evx_parse.s - batch event-row parser (GNU as, Intel syntax).
 #
 # uint64_t evx_parse_events(const ParseCtx *ctx /*rdi*/, const char *begin /*rsi*/,
-#                           const char *end /*rdx*/, PartHead *heads /*rcx*/)
-#   returns the number of Cands written
+#                           const char *end /*rdx*/, PartHead *heads /*rcx*/,
+#                           Slab *slab /*r8*/)
+#   returns the number of Recs written, or UINT64_MAX on raw-ID table overflow
 #
 # One call per newline-aligned byte range (no header). For every line:
 #   1. 64-byte blocks: newline / comma / quote k-masks in one pass. The newline
@@ -11,29 +12,25 @@
 #      block is a fault-suppressing masked load, so nothing past `end` is read.
 #   2. Exactly 6 commas, quote count == 2 * wrapped fields, else malformed.
 #   3. Empty event_id -> dropped (before dedup).
-#   4. Every other row becomes a 56-byte Cand with event_id and user_id as
-#      inline 16-byte keys (built while the line is in L1). All validation (user, ts, window,
-#      type, product, price, late rule) is evaluated here, once, as a flag; the
-#      row still competes in dedup whatever the flag says (rules: dedup first).
-#   4b. The Cand goes straight into its dedup partition (eid_h32 >> pshift):
-#      the calling worker's open 4 KB chunk of that partition (8-byte header
-#      + 73 Cands). A full chunk gets count 73 and a new chunk is bump-
-#      allocated from the shared arena (one lock xadd per 73 rows of a
-#      partition) and pushed on the worker's list for the partition. Dedup
-#      then runs per partition in a cache-resident private table, with no
-#      atomics and no second pass over the rows.
-#   5. Hash lookups (links, products) run only for rows that are still valid,
-#      and the product lookup only for purchases (only purchases need a
-#      category). The person is NOT resolved here: only dedup winners need
-#      it, so evx_collect does the link lookup (fewer lookups, smaller Cand).
+#   4. Every other row becomes a 32-byte Rec (see evx.h): ingest seconds and
+#      40 bits of the event_id hash, a pointer to the event_id bytes, ts_off,
+#      rid and price_cat. All validation (user, ts, window, type, product,
+#      price, late rule) is evaluated here, once; an invalid copy gets
+#      rid = RID_NONE and still competes in dedup (rules: dedup first).
+#   4b. The Rec goes straight into its dedup partition ((u32)h >> pshift):
+#      the calling worker's open 4 KB chunk of that partition (32-byte header
+#      + 127 Recs). A full chunk gets count 127; a new chunk comes from the
+#      worker's slab (evx_chunk_alloc, C) and is pushed on the worker's list.
+#   5. A valid copy interns its raw user_id in the raw-ID table (16-byte
+#      Key16 slots claimed with cmpxchg16b; the slot index is the rid). The
+#      probe is delayed through a ring of RING rows: the slot is prefetched
+#      when the row is parsed and probed RING rows later, so the table misses
+#      overlap with parsing. Links are NOT applied here: P1.5 resolves each
+#      distinct raw id once (evx_resolve_raw).
 #
 # Stack frame (rsp-relative):
 #    0 ..  55  comma pointers [7]
 #   64 .. 175  field slices [7] (ptr, len) x 16 bytes
-#  176         ts value
-#  184         ingest value
-#  192         line end
-#  200         price
 
         .intel_syntax noprefix
         .text
@@ -50,10 +47,17 @@
         .set    L_END,   192
         .set    L_PRICE, 200
         .set    L_HEADS, 208            # PartHead[P] of this worker
-        .set    L_CNT,   216            # Cands written
-        .set    L_K0,    224            # event_id key
-        .set    L_K1,    232
-        .set    FRAME,   248
+        .set    L_CNT,   216            # Recs written
+        .set    L_H,     224            # event_id hash
+        .set    L_SLAB,  232
+        .set    L_RN,    240            # entries in the ring
+        .set    L_RI,    248            # next ring position
+.ifndef PARSE_RING
+        .set    PARSE_RING, 16
+.endif
+        .set    RING,    PARSE_RING     # power of two
+        .set    L_RING,  256            # RING x {Rec*, k0, k1, slot}
+        .set    FRAME,   L_RING + 32*RING + 8   # == 8 mod 16: calls aligned
 
         .globl  evx_parse_events
         .type   evx_parse_events, @function
@@ -67,7 +71,10 @@ evx_parse_events:
         push    r15
         sub     rsp, FRAME
         mov     qword ptr [rsp + L_HEADS], rcx
+        mov     qword ptr [rsp + L_SLAB], r8
         mov     qword ptr [rsp + L_CNT], 0
+        mov     qword ptr [rsp + L_RN], 0
+        mov     qword ptr [rsp + L_RI], 0
         mov     r12, rdi                # ctx
         mov     r13, rsi                # cursor (line start)
         mov     r14, rdx                # end
@@ -202,12 +209,10 @@ evx_parse_events:
         jz      .Lline                  # empty event_id: dropped before dedup
         mov     rdi, qword ptr [rsp + F_EID]
         call    evx_key16                       # inline key from the hot line
-        mov     qword ptr [rsp + L_K0], rax
-        mov     qword ptr [rsp + L_K1], rdx
         mov     rdi, rax
         mov     rsi, rdx
         call    evx_khash                       # clobbers rax, r11
-        mov     r9d, eax                        # eid_h32
+        mov     qword ptr [rsp + L_H], rax
         mov     ecx, dword ptr [r12 + 72]       # pshift
         shr     eax, cl                         # partition
         shl     rax, 5
@@ -219,29 +224,39 @@ evx_parse_events:
         mov     rdx, qword ptr [r8 + 8]
         test    rdx, rdx
         jz      .Lfirst_chunk
-        mov     dword ptr [rdx - 4096], 73      # the old chunk is full
+        mov     dword ptr [rdx - 4096], 127     # the old chunk is full
 .Lfirst_chunk:
-        mov     rax, qword ptr [r12 + 64]       # &arena_next
-        mov     ecx, 1
-        lock xadd qword ptr [rax], rcx          # new chunk index
-        mov     r15, rcx
-        shl     r15, 12
-        add     r15, qword ptr [r12 + 56]       # chunk
+        push    r8
+        push    r8                              # keeps rsp 16-byte aligned
+        mov     rdi, qword ptr [rsp + 16 + L_SLAB]
+        call    evx_chunk_alloc                 # C: clobbers caller-saved + zmm
+        pop     r8
+        pop     r8
+        mov     ecx, 0x0A
+        vpbroadcastb zmm20, ecx
+        mov     ecx, 0x2C
+        vpbroadcastb zmm21, ecx
+        mov     ecx, 0x22
+        vpbroadcastb zmm22, ecx
+        mov     r15, rax
+        mov     rcx, rax
+        sub     rcx, qword ptr [r12 + 56]
+        shr     rcx, 12                         # chunk index
         mov     eax, dword ptr [r8 + 16]
         mov     dword ptr [r15 + 4], eax        # next = old list head
         mov     dword ptr [r8 + 16], ecx        # list head = new chunk
         lea     rax, [r15 + 4096]
         mov     qword ptr [r8 + 8], rax
-        add     r15, 8
+        add     r15, 32
 .Lhave_slot:
-        lea     rax, [r15 + 56]
+        lea     rax, [r15 + 32]
         mov     qword ptr [r8], rax
         inc     qword ptr [rsp + L_CNT]
-        mov     rax, qword ptr [rsp + L_K0]
-        mov     qword ptr [r15], rax
-        mov     rax, qword ptr [rsp + L_K1]
-        mov     qword ptr [r15 + 8], rax
-        mov     dword ptr [r15 + 52], r9d
+        mov     rax, qword ptr [rsp + L_H]
+        shr     rax, 24
+        shl     rax, 48                         # hash bits 24..39 on top
+        or      rax, qword ptr [rsp + F_EID]
+        mov     qword ptr [r15 + 8], rax        # eptr
 
         # ---- ingest_ts (always F1 per rules; defensive) --------------------
         mov     rdi, qword ptr [rsp + F_ING]
@@ -250,8 +265,26 @@ evx_parse_events:
         call    evx_parse_ts
         test    eax, eax
         jz      .Lbad_ingest
+        # ki = (floor((ingest - ws_ms) / 1000) + 2^39, clamped to 40 bits) << 24 | h24
         mov     rax, qword ptr [rsp + L_ING]
-        mov     qword ptr [r15 + 16], rax
+        sub     rax, qword ptr [r12 + 80]
+        movabs  rcx, -549755813888000           # -2^39 * 1000
+        cmp     rax, rcx
+        cmovl   rax, rcx
+        movabs  rcx, 549755811888000            # (2^39 - 2) * 1000
+        cmp     rax, rcx
+        cmovg   rax, rcx
+        movabs  rcx, 549755813888000
+        add     rax, rcx                        # >= 0
+        shr     rax, 3
+        movabs  rdx, 0x20C49BA5E353F7CF
+        mul     rdx
+        shr     rdx, 4                          # / 1000
+        shl     rdx, 24
+        mov     eax, dword ptr [rsp + L_H]
+        and     eax, 0xFFFFFF
+        or      rdx, rax
+        mov     qword ptr [r15], rdx            # ki
 
         # ---- validation of this copy (applied only if it wins dedup) -------
         cmp     qword ptr [rsp + F_USER + 8], 0
@@ -269,12 +302,12 @@ evx_parse_events:
         jl      .Linvalid
         cmp     rax, qword ptr [r12 + 8]        # ts < window_end
         jge     .Linvalid
-        mov     rdx, qword ptr [r15 + 16]
+        mov     rdx, qword ptr [rsp + L_ING]
         sub     rdx, rax
         cmp     rdx, 86400000                   # late: ingest - ts > 24 h
         jg      .Linvalid
         sub     rax, qword ptr [r12]
-        mov     qword ptr [r15 + 40], rax       # ts_off
+        mov     qword ptr [r15 + 16], rax       # ts_off
 
         # event_type: compare the whole value as one 4- or 8-byte integer
         mov     rdi, qword ptr [rsp + F_TYPE]
@@ -319,7 +352,7 @@ evx_parse_events:
 
         # category (only purchases need one)
         mov     eax, dword ptr [r12 + 48]       # unknown_cat
-        mov     dword ptr [r15 + 48], eax
+        mov     dword ptr [r15 + 28], eax
         cmp     qword ptr [r12 + 32], 0
         je      .Lcat_done
         mov     rdi, qword ptr [rsp + F_PROD]
@@ -333,37 +366,90 @@ evx_parse_events:
         test    rax, rax
         jz      .Lcat_done
         mov     eax, dword ptr [rax + 16]       # val.k0 = category id
-        mov     dword ptr [r15 + 48], eax
+        mov     dword ptr [r15 + 28], eax
 .Lcat_done:
-        mov     eax, dword ptr [r15 + 48]
+        mov     eax, dword ptr [r15 + 28]
         shl     eax, 24
         or      eax, dword ptr [rsp + L_PRICE]
-        mov     dword ptr [r15 + 48], eax
+        mov     dword ptr [r15 + 28], eax
         jmp     .Lvalid
 
 .Lnonpurchase:
-        mov     dword ptr [r15 + 48], 0
+        mov     dword ptr [r15 + 28], 0
 
-        # ---- valid: keep the raw user id; the person is resolved in collect,
-        #      for winning copies only -----------------------------------------
+        # ---- valid: queue the raw user id for interning (ring) --------------
 .Lvalid:
         mov     rdi, qword ptr [rsp + F_USER]
         mov     rsi, qword ptr [rsp + F_USER + 8]
         call    evx_key16                       # never null for a non-empty id
-        mov     qword ptr [r15 + 24], rax
-        mov     qword ptr [r15 + 32], rdx
-        jmp     .Lemit
+        mov     rcx, qword ptr [rsp + L_RI]
+        mov     rbx, rcx
+        shl     rbx, 5
+        lea     rbx, [rsp + L_RING + rbx]       # ring entry
+        mov     qword ptr [rbx], r15
+        mov     qword ptr [rbx + 8], rax
+        mov     qword ptr [rbx + 16], rdx
+        mov     rdi, rax
+        mov     rsi, rdx
+        call    evx_khash
+        and     rax, qword ptr [r12 + 24]       # raw mask
+        mov     qword ptr [rbx + 24], rax
+        shl     rax, 4
+        add     rax, qword ptr [r12 + 16]
+        prefetchw [rax]
+        mov     rcx, qword ptr [rsp + L_RI]
+        inc     rcx
+        and     rcx, RING - 1
+        mov     qword ptr [rsp + L_RI], rcx
+        mov     rax, qword ptr [rsp + L_RN]
+        inc     rax
+        cmp     rax, RING
+        jb      .Lring_keep
+        # ring full: intern the oldest entry (the next one to be overwritten)
+        dec     rax
+        mov     qword ptr [rsp + L_RN], rax
+        shl     rcx, 5
+        lea     rbx, [rsp + L_RING + rcx]
+        call    .Lintern
+        test    eax, eax
+        jnz     .Loverflow
+        jmp     .Lline
+.Lring_keep:
+        mov     qword ptr [rsp + L_RN], rax
+        jmp     .Lline
 
 .Lbad_ingest:
-        movabs  rax, 0x7FFFFFFFFFFFFFFF         # never beats a real copy
-        mov     qword ptr [r15 + 16], rax
+        movabs  rax, 0xFFFFFFFFFF000000         # never beats a real copy
+        mov     ecx, dword ptr [rsp + L_H]
+        and     ecx, 0xFFFFFF
+        or      rax, rcx
+        mov     qword ptr [r15], rax
 .Linvalid:
-        mov     qword ptr [r15 + 32], 0         # user.k1 == 0: invalid copy
-        mov     qword ptr [r15 + 40], 0         # live (dead is -1)
-.Lemit:
+        mov     dword ptr [r15 + 24], -1        # rid = RID_NONE: invalid copy
+        mov     qword ptr [r15 + 16], 0
+        mov     dword ptr [r15 + 28], 0
         jmp     .Lline
 
 .Ldone:
+        # drain the ring, oldest first
+        mov     rax, qword ptr [rsp + L_RN]
+        test    rax, rax
+        jz      .Lret
+        dec     rax
+        mov     qword ptr [rsp + L_RN], rax
+        mov     rcx, qword ptr [rsp + L_RI]
+        sub     rcx, rax
+        dec     rcx
+        and     rcx, RING - 1
+        shl     rcx, 5
+        lea     rbx, [rsp + L_RING + rcx]
+        call    .Lintern
+        test    eax, eax
+        jnz     .Loverflow
+        jmp     .Ldone
+.Loverflow:
+        mov     qword ptr [rsp + L_CNT], -1
+.Lret:
         mov     rax, qword ptr [rsp + L_CNT]
         add     rsp, FRAME
         pop     r15
@@ -372,6 +458,73 @@ evx_parse_events:
         pop     r12
         pop     rbp
         pop     rbx
+        ret
+
+# ---------------------------------------------------------------------------
+# local: intern the ring entry at rbx {Rec*, k0, k1, home slot} in the raw-ID
+# table and store the slot as the Rec's rid. eax = 0, or 1 on overflow.
+# Uses r12 (ctx). Clobbers rax, rcx, rdx, rsi, rdi, r8 - r11, rbx.
+# ---------------------------------------------------------------------------
+.Lintern:
+        mov     r8, qword ptr [rbx]             # Rec*
+        mov     rsi, qword ptr [rbx + 8]        # k0
+        mov     r10, qword ptr [rbx + 16]       # k1
+        mov     r9, qword ptr [rbx + 24]        # slot
+        mov     r11, qword ptr [r12 + 16]       # raw table
+.Li_probe:
+        mov     rdi, r9
+        shl     rdi, 4
+        add     rdi, r11
+        mov     rcx, qword ptr [rdi + 8]
+        test    rcx, rcx
+        jnz     .Li_cmp
+        # claim the empty slot: {0,0} -> {k0, k1}
+        mov     rbx, rsi
+        mov     rcx, r10
+        xor     eax, eax
+        xor     edx, edx
+        lock cmpxchg16b xmmword ptr [rdi]
+        jnz     .Li_probe                       # lost the race: re-read the slot
+        mov     rax, qword ptr [r12 + 64]       # &raw_claimed
+        mov     ecx, 1
+        lock xadd qword ptr [rax], rcx
+        inc     rcx
+        cmp     rcx, qword ptr [r12 + 88]       # raw_limit
+        ja      .Li_over
+        jmp     .Li_found
+.Li_cmp:
+        cmp     rcx, r10
+        jne     .Li_next
+        mov     rax, r10
+        shr     rax, 56
+        cmp     eax, 0xFF
+        je      .Li_long
+        cmp     qword ptr [rdi], rsi            # short key: k0 decides
+        je      .Li_found
+        jmp     .Li_next
+.Li_long:
+        push    rdi
+        push    rsi
+        mov     rdx, rsi
+        mov     rcx, r10
+        mov     rsi, r10
+        mov     rdi, qword ptr [rdi]
+        call    evx_keq                         # keeps every GPR but rax / r11
+        pop     rsi
+        pop     rdi
+        mov     r11, qword ptr [r12 + 16]
+        test    eax, eax
+        jnz     .Li_found
+.Li_next:
+        inc     r9
+        and     r9, qword ptr [r12 + 24]
+        jmp     .Li_probe
+.Li_found:
+        mov     dword ptr [r8 + 24], r9d        # rid
+        xor     eax, eax
+        ret
+.Li_over:
+        mov     eax, 1
         ret
         .size   evx_parse_events, .-evx_parse_events
 
