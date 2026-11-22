@@ -11,7 +11,7 @@ OBJS     := $(C_OBJS) $(ASM_OBJS)
 DEPS     := $(OBJS:.o=.d)
 
 CPPFLAGS ?=
-CFLAGS   ?= -O3 -march=cascadelake -mtune=cascadelake -fno-pie -fno-plt -Wall -Wextra -Wpedantic
+CFLAGS   ?= -O3 -march=cascadelake -mtune=cascadelake -mprefer-vector-width=256 -fno-pie -fno-plt -Wall -Wextra -Wpedantic
 ASFLAGS  ?= -O3 -march=cascadelake -mtune=cascadelake -fno-pie
 LDFLAGS  ?= -static -no-pie
 LDLIBS   ?= -pthread -lm
