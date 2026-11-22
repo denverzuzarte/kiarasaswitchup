@@ -34,7 +34,7 @@ space := $(empty) $(empty)
 
 export IMAGE CPUS MEM PLATFORM
 
-.PHONY: all build fixtures fixtures-native variant profile dev run-dev run-native fuzz-data check-reference check-dev check-dev-events clean clean-out clean-dataset unit check-fixtures
+.PHONY: all build fixtures fixtures-native variant profile bench dev run-dev run-native fuzz-data check-reference check-dev check-dev-events clean clean-out clean-dataset unit check-fixtures
 
 # Plain `make` builds the native executable. `make build` also builds its image.
 all: $(TARGET)
@@ -115,6 +115,13 @@ variant:
 BIN ?= ./$(TARGET)
 profile:
 	EVX_PROFILE=1 DATA_DIR=$(DEV) OUTPUT_DIR=out-prof NCPU=$(CPUS) $(BIN) 2>&1 | sed -n '/ms dict/p;/evx profile/,/^evx: page/p'
+
+# Interleaved wall-time comparison of committed binaries (git revisions):
+#   make bench DEV=dev20m REVS="1323748 main dopt" RUNS=5
+REVS ?= HEAD
+RUNS ?= 5
+bench:
+	scripts/bench.sh $(DEV) $(RUNS) $(CPUS) $(REVS)
 
 # Unit tests of the assembly primitives (not part of src/main).
 UNIT := src/tests/unit
