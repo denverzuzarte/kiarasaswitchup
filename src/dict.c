@@ -436,6 +436,8 @@ struct LinkBuild {
     uint32_t (*pairs)[2];       /* dense ids */
     LookupEntry *slots;
     uint64_t mask;
+    _Atomic uint64_t *filter;   /* linked-id bit filter (khash >> fshift) */
+    uint64_t fshift;
     _Atomic uint64_t lines, dropped;
     _Atomic uint32_t next_id;   /* dense id counter */
     uint32_t *dslot;            /* dense id -> slot */
@@ -447,7 +449,8 @@ struct LinkBuild {
 static uint32_t link_intern(LinkBuild *lb, const char *p, uint32_t len)
 {
     Key16 k = evx_key16(p, len);
-    uint64_t i = evx_khash(k.k0, k.k1) & lb->mask;
+    uint64_t h = evx_khash(k.k0, k.k1);
+    uint64_t i = h & lb->mask;
     for (;;) {
         _Atomic uint64_t *k1p = (_Atomic uint64_t *)&lb->slots[i].key.k1;
         uint64_t cur = atomic_load_explicit(k1p, memory_order_acquire);
@@ -468,6 +471,11 @@ static uint32_t link_intern(LinkBuild *lb, const char *p, uint32_t len)
                 lb->slots[i].val.k1 = id;            /* temporary: dense id */
                 lb->dslot[id] = (uint32_t)i;
                 lb->dkey[id] = k;
+                {
+                    uint64_t b = h >> lb->fshift;
+                    atomic_fetch_or_explicit(&lb->filter[b >> 6], 1ull << (b & 63),
+                                             memory_order_relaxed);
+                }
                 atomic_store_explicit(k1p, k.k1, memory_order_release);
                 return id;
             }
@@ -538,6 +546,17 @@ int links_plan(const char *data_dir, unsigned workers, LinkBuild **out)
     lb->pairs = big_alloc((pair_off ? pair_off : 1) * sizeof *lb->pairs);
     uint64_t size = table_size_for(lines * 2 + 1);   /* <= 2 ids per line, load <= 0.5 */
     lb->slots = big_alloc(size * sizeof(LookupEntry));
+    /* filter: 4 bits per table slot (>= 8 per id), so ~1 in 8 unlinked ids
+       still probes the table; it stays cache resident (2 MB at 20M events) */
+    {
+        uint64_t fbits = size * 4, lg = 0;
+        while (((uint64_t)1 << lg) < fbits)
+            lg++;
+        lb->fshift = 64 - lg;
+        lb->filter = big_alloc((fbits / 64 + 1) * sizeof(uint64_t));
+        if (!lb->filter)
+            return -1;
+    }
     /* id space: <= 2 ids per line plus one partly used block per thread */
     size_t idcap = lines * 2 + 1 + (size_t)(workers + 1) * ID_BLOCK;
     lb->dslot = big_alloc(idcap * sizeof *lb->dslot);
@@ -640,6 +659,8 @@ int links_finish(LinkBuild *lb, Dict *d)
     d->link_components = comps;
     d->link_slots = ids ? lb->slots : NULL;
     d->link_mask = ids ? lb->mask : 0;
+    d->link_filter = (uint64_t *)lb->filter;
+    d->link_fshift = lb->fshift;
     d->link_files = lb->files;
     d->nlink_files = lb->nfiles;
     return 0;

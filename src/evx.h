@@ -83,7 +83,9 @@ typedef struct {
     uint64_t link_mask;           /* 40 */
     uint64_t *claimed;            /* 48  shared count of claimed person slots */
     uint64_t claim_limit;         /* 56  > this many claims: table too small */
-} CollectCtx;                     /* 64 */
+    const uint64_t *link_filter;  /* 64  bit (khash >> link_fshift) set: id may be linked */
+    uint64_t link_fshift;         /* 72 */
+} CollectCtx;                     /* 80 */
 
 /* Valid dedup winner, before grouping. 16 bytes. */
 typedef struct {
@@ -136,7 +138,8 @@ _Static_assert(offsetof(Cand, ts_off) == 40, "Cand.ts_off");
 _Static_assert(offsetof(Cand, price_cat) == 48, "Cand.price_cat");
 _Static_assert(offsetof(Cand, eid_h32) == 52, "Cand.eid_h32");
 _Static_assert(sizeof(PersonSlot) == 16, "PersonSlot");
-_Static_assert(sizeof(CollectCtx) == 64, "CollectCtx");
+_Static_assert(sizeof(CollectCtx) == 80, "CollectCtx");
+_Static_assert(offsetof(CollectCtx, link_filter) == 64, "CollectCtx.link_filter");
 _Static_assert(offsetof(CollectCtx, claim_limit) == 56, "CollectCtx.claim_limit");
 _Static_assert(sizeof(Win) == 16, "Win");
 _Static_assert(sizeof(Ev) == 16, "Ev");
@@ -159,7 +162,9 @@ typedef struct {
     uint64_t person_mask;           /* 56 */
     const uint32_t *remap;          /* 64  person slot -> dense person id */
     uint32_t *ccount;               /* 72  clicks per dense person (lock inc) */
-} ClickParseCtx;                    /* 80 */
+    const uint64_t *link_filter;    /* 80  see CollectCtx */
+    uint64_t link_fshift;           /* 88 */
+} ClickParseCtx;                    /* 96 */
 
 /* A valid click of a person who has sessions. 32 bytes. */
 typedef struct {
@@ -216,7 +221,8 @@ typedef struct {
     uint32_t hist[8 * 256];    /* 112  radix histograms */
 } AttrCtx;
 
-_Static_assert(sizeof(ClickParseCtx) == 80, "ClickParseCtx");
+_Static_assert(sizeof(ClickParseCtx) == 96, "ClickParseCtx");
+_Static_assert(offsetof(ClickParseCtx, link_filter) == 80, "ClickParseCtx.link_filter");
 _Static_assert(sizeof(ClickCand) == 32, "ClickCand");
 _Static_assert(offsetof(ClickCand, cid) == 16, "ClickCand.cid");
 _Static_assert(sizeof(ClickEv) == 16, "ClickEv");

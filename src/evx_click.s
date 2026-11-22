@@ -462,6 +462,14 @@ evx_parse_clicks:
         mov     rdi, rax
         mov     rsi, rdx
         call    evx_khash
+        mov     r8, qword ptr [r12 + 88]        # linked-id filter
+        shrx    r8, rax, r8
+        mov     r9, r8
+        shr     r9, 6
+        mov     r10, qword ptr [r12 + 80]
+        mov     r9, qword ptr [r10 + r9*8]
+        bt      r9, r8
+        jnc     .Lk_nolinkpf                    # in no link line: no entry
         and     rax, qword ptr [r12 + 24]
         shl     rax, 5
         add     rax, qword ptr [r12 + 16]
@@ -509,6 +517,17 @@ evx_parse_clicks:
         jae     .Lk_fa_done
         mov     rdi, qword ptr [rbp + K_B0 + rcx*8]
         mov     rsi, qword ptr [rbp + K_B1 + rcx*8]
+        cmp     qword ptr [r12 + 16], 0
+        je      .Lk_fa_hash                     # no links: raw id is canonical
+        call    evx_khash                       # keeps rdi, rsi
+        mov     r8, qword ptr [r12 + 88]        # linked-id filter
+        shrx    r8, rax, r8
+        mov     r9, r8
+        shr     r9, 6
+        mov     r10, qword ptr [r12 + 80]
+        mov     r9, qword ptr [r10 + r9*8]
+        bt      r9, r8
+        jnc     .Lk_fa_hashed                   # unlinked: rax = its hash
         mov     rdx, qword ptr [r12 + 16]
         mov     rcx, qword ptr [r12 + 24]
         call    evx_canon
@@ -517,7 +536,9 @@ evx_parse_clicks:
         mov     qword ptr [rbp + K_B1 + rcx*8], rdx
         mov     rdi, rax
         mov     rsi, rdx
+.Lk_fa_hash:
         call    evx_khash
+.Lk_fa_hashed:
         mov     rcx, qword ptr [rbp + K_I]
         and     rax, qword ptr [r12 + 56]
         mov     qword ptr [rbp + K_BH + rcx*8], rax

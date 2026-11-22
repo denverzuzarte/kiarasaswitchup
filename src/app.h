@@ -40,6 +40,8 @@ typedef struct {
     /* links: raw id -> canonical (smallest) id of its DSU component */
     LookupEntry *link_slots;
     uint64_t link_mask;
+    uint64_t *link_filter;      /* one bit per khash >> link_fshift: a linked id */
+    uint64_t link_fshift;
     size_t link_ids, link_lines, link_dropped, link_components;
     Mapped *link_files;
     int nlink_files;

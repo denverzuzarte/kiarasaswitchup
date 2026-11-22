@@ -115,6 +115,27 @@ Cycles per item, summed over 8 threads (20M events / 5M clicks, and 60M / 15M):
 
 At 60M the wall times on this host are dominated by I/O: the 5.4 GB input doesn't stay in the 15 GB machine's page cache (major faults), so event parse waits on disk. The cycle counts are still valid.
 
+## 6e. Round 4: kernel page zeroing and link-table misses
+
+The per-phase `sys_ms` column (RUSAGE_THREAD) showed about 1.8 s of CPU spent in the kernel at 20M events, about 20% of all CPU. Most of it was first-touch zeroing of memory that was mapped worst-case-sized and written sparsely.
+
+- **Compact output arenas (`Arena` in `main.c`).** Parse (`Cand`), collect (`Win`) and sessionize (`Row`) each append into per-worker chunks taken from one shared array with a single `atomic_fetch_add`. Before, each task wrote at a position derived from its input (bytes/8 for parse, the dedup slot range for collect, `offsets[k]` for rows). With THP, the sparse writes touched (and zeroed) every 2 MB page: rows 626 MB for 70 MB used, wins 513 MB for 320 MB. Chunks are 8× the largest single task output, so an abandoned chunk tail is at most 1/8 and is never touched.
+- **Grouped events reuse the candidate pages.** With dense candidates, `Ev` (16 B × valid events) is written over the start of the dead candidate arena (56 B × candidates), which is already faulted in. `evx_scatter` writes all 16 bytes, including the pad.
+- **Linked-id bit filter (`evx_collect` stage 2, `evx_parse_clicks` line loop and flush stage A).** At 20M, 37% of events and 39% of clicks have a user_id that appears in no link line, yet each paid a probe of the 128 MB link table. `link_intern` sets bit `khash >> fshift` (4 bits per link-table slot, at least 8 per id, 2 MB at 20M). A clear bit proves the id is unlinked, so the id is its own canonical name. In collect, stage 3 (canon + rehash) is skipped and stage 2 prefetches the person slot and counter directly. In clicks, the prefetch of the link entry and the `evx_canon` call are skipped. A set bit still does the exact lookup, so false positives cost only the old path. The test is `shrx` + `shr 6` + load + `bt reg, reg` (no `bt mem, reg`, which is microcoded).
+- **Person table at ncand/16** (was /8). The overflow retry (>50% claims → ×8, rerun) keeps it safe. `EVX_PSIZE=1024` on a 400K-event seed retries twice and still matches the reference.
+- **Parallel P4 / C2.** The dense-id compaction and both prefix sums run as two passes on fixed per-worker ranges (count, serial prefix of 8 values, fill). Dense ids stay in slot order.
+
+| 20M events / 5M clicks, best of 4 | before | after |
+|---|---|---|
+| program total | 1.10–1.20 s | 0.97–0.99 s |
+| collect | 244 ms (389 cyc/item, sys 512 ms) | 178–190 ms (317 cyc/item, sys 270–300 ms) |
+| sessionize + attribute | 116 ms (sys 287 ms) | 63–68 ms (sys 30 ms) |
+| group events | 109 ms (sys 238 ms) | 79–82 ms (sys 103–110 ms) |
+| event parse | 213–261 ms (sys 738 ms) | 201–210 ms (sys 355–410 ms) |
+| click parse | 84 ms (584 cyc/item) | 75–79 ms (523 cyc/item) |
+
+Link union-find (worker 0, 180–190 ms) is now nearly as long as the event parse it overlaps (about 200 ms). It is the next critical path.
+
 ## 7. OS and memory (C side, in support of the asm)
 
 - **Lazily committed** `MAP_NORESERVE` anonymous buffers sized by worst-case bounds (≥ 8 bytes per candidate row). Untouched pages cost nothing, so no growth or realloc logic is needed in asm.

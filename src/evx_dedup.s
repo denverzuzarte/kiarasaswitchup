@@ -339,6 +339,17 @@ evx_collect:
         mov     rdx, qword ptr [rbp + 32]   # link slots
         test    rdx, rdx
         jz      .Lco_s2_nolink
+        # linked-id filter (cache resident): a clear bit means the id is in no
+        # link line, so it is its own canonical name and stage 3 skips it
+        mov     rsi, qword ptr [rbp + 72]
+        shrx    rsi, rax, rsi               # filter bit index
+        mov     rdi, rsi
+        shr     rdi, 6
+        mov     r11, qword ptr [rbp + 64]
+        mov     rdi, qword ptr [r11 + rdi*8]
+        bt      rdi, rsi
+        jnc     .Lco_s2_nolink
+        mov     qword ptr [rsp + B_H + rcx*8], -1   # unresolved: stage 3
         and     rax, qword ptr [rbp + 40]
         shl     rax, 5
         prefetcht0 [rdx + rax]
@@ -346,6 +357,7 @@ evx_collect:
 .Lco_s2_nolink:
         and     rax, r13                    # person key = raw id
         mov     qword ptr [rsp + B_H + rcx*8], rax
+        prefetchw [r14 + rax*4]
         shl     rax, 4
         prefetchw [r12 + rax]
 .Lco_s2_next:
@@ -363,6 +375,8 @@ evx_collect:
         jae     .Lco_s3_done
         cmp     qword ptr [rsp + B_C + rcx*8], 0
         je      .Lco_s3_next
+        cmp     qword ptr [rsp + B_H + rcx*8], -1
+        jne     .Lco_s3_next                # filtered out in stage 2: resolved
         mov     rdi, qword ptr [rsp + B_K0 + rcx*8]
         mov     rsi, qword ptr [rsp + B_K1 + rcx*8]
         mov     rdx, qword ptr [rbp + 32]
