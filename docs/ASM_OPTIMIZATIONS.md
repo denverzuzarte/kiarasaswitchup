@@ -239,3 +239,9 @@ The dictionary phase (products + links DSU, single-threaded C) is 10–115 ms an
 3. **Link union-find** (worker 0, 113 ms CPU, IPC 0.27): the final scatter into the 38 MB link table and the random smallest-name reads. Prefetching or a parallel scatter is worth about 7 ms of wall time.
 4. **`evx_parse_ts`** (7% of cycles): memoise the date part for consecutive rows of a file.
 5. 512-bit vs 256-bit blocks in the scanner (Cascade Lake AVX-512 license), to be A/B timed on the scorer.
+
+## Round 7 idle-spot fixes (branch r7-idle)
+
+Measured with exact `wait4` timing, 20M native, interleaved.
+
+- **C2 click prefix sum parallel** (`job_cprefix_sum` / `job_cprefix_write` in `main.c`): per-worker block sums and max, a serial pass over 8 block bases, then each worker writes its block's offsets and cursors. Median 625 -> 623 ms (about 2 ms, near the noise floor).

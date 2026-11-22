@@ -506,6 +506,47 @@ static void job_scatter_clicks(void *arg, unsigned wid)
     }
 }
 
+typedef struct {
+    const uint32_t *ccount;
+    uint64_t *coffsets, *ccursor;
+    uint64_t n;
+    unsigned nw;
+    struct { uint64_t v, mx, pad[6]; } sum[MAX_WORKERS];
+    uint64_t base[MAX_WORKERS];
+} CPrefixArgs;
+
+static void cprefix_range(const CPrefixArgs *a, unsigned wid, uint64_t *lo, uint64_t *hi)
+{
+    *lo = a->n * wid / a->nw;
+    *hi = a->n * (wid + 1) / a->nw;
+}
+
+static void job_cprefix_sum(void *arg, unsigned wid)
+{
+    CPrefixArgs *a = (CPrefixArgs *)((Queue *)arg)->ctx;
+    uint64_t lo, hi, s = 0, mx = 0;
+    cprefix_range(a, wid, &lo, &hi);
+    for (uint64_t k = lo; k < hi; k++) {
+        uint32_t c = a->ccount[k];
+        s += c;
+        mx = c > mx ? c : mx;
+    }
+    a->sum[wid].v = s;
+    a->sum[wid].mx = mx;
+}
+
+static void job_cprefix_write(void *arg, unsigned wid)
+{
+    CPrefixArgs *a = (CPrefixArgs *)((Queue *)arg)->ctx;
+    uint64_t lo, hi, run = a->base[wid];
+    cprefix_range(a, wid, &lo, &hi);
+    for (uint64_t k = lo; k < hi; k++) {
+        a->coffsets[k] = run;
+        a->ccursor[k] = run;
+        run += a->ccount[k];
+    }
+}
+
 static int64_t floor_div(int64_t a, int64_t b)
 {
     int64_t q = a / b;
@@ -929,14 +970,21 @@ int main(int argc, char **argv)
     }
     uint64_t maxc = 0;
     {
+        /* per-worker block sums, a tiny serial pass over the blocks, then
+           each worker writes its block's offsets */
+        CPrefixArgs cpa = {.ccount = ccount, .coffsets = coffsets, .ccursor = ccursor,
+                           .n = npersons, .nw = nw};
+        q = (Queue){.ctx = &cpa};
+        atomic_init(&q.next, 0);
+        pool_run(job_cprefix_sum, &q);
         uint64_t run = 0;
-        for (uint64_t k = 0; k < npersons; k++) {
-            coffsets[k] = run;
-            ccursor[k] = run;
-            run += ccount[k];
-            if (ccount[k] > maxc)
-                maxc = ccount[k];
+        for (unsigned w = 0; w < nw; w++) {
+            cpa.base[w] = run;
+            run += cpa.sum[w].v;
+            if (cpa.sum[w].mx > maxc)
+                maxc = cpa.sum[w].mx;
         }
+        pool_run(job_cprefix_write, &q);
         coffsets[npersons] = run;
     }
     big_free(ccount, (npersons ? npersons : 1) * sizeof(uint32_t));
